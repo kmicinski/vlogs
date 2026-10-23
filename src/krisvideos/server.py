@@ -207,6 +207,13 @@ def create_app(cfg: Config) -> FastAPI:
 
     app.mount("/static", StaticFiles(directory=WEB), name="static")
 
+    @app.middleware("http")
+    async def no_stale_static(request: Request, call_next):
+        resp = await call_next(request)
+        if request.url.path.startswith("/static/"):
+            resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
     @app.get("/media/{name}/{path:path}")
     def media_file(name: str, path: str, request: Request):
         d = project_dir(name)
@@ -673,9 +680,18 @@ def create_app(cfg: Config) -> FastAPI:
     return app
 
 
+PID_FILE = Path.home() / "Library" / "Application Support" / "krisvideos" / "server.pid"
+
+
 def serve(cfg: Config, port: int = 8765, open_browser: bool = False):
+    import os
     import uvicorn
     app = create_app(cfg)
+    try:  # the .app launcher uses this to restart a server running stale code
+        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
+        PID_FILE.write_text(f"{os.getpid()} {port}\n")
+    except OSError:
+        pass
     url = f"http://127.0.0.1:{port}"
     if open_browser:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

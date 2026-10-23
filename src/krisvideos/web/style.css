@@ -119,7 +119,7 @@ h3 { margin: 4px 0 10px; font-size: 13px; text-transform: uppercase; letter-spac
 
 #welcome { position: absolute; inset: 44px 0 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; }
 #modal { position: fixed; inset: 0; background: #0009; display: flex; align-items: center; justify-content: center; z-index: 10; }
-#modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; width: 440px; max-height: 85vh; overflow: auto; box-shadow: 0 20px 60px #000a; }
+#modal .box { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; width: min(92vw, 460px); max-height: 85vh; overflow: auto; box-shadow: 0 20px 60px #000a; }
 #modal h2 { margin: 0 0 12px; font-size: 16px; }
 #modal pre { white-space: pre-wrap; word-break: break-all; font-size: 11px; background: #0f0f13; padding: 10px; border-radius: 6px; max-height: 50vh; overflow: auto; }
 #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #2a2a33; border: 1px solid var(--line); padding: 8px 14px; border-radius: 8px; z-index: 20; box-shadow: 0 8px 30px #0008; }
@@ -133,7 +133,8 @@ kbd { background: #0f0f13; border: 1px solid var(--line); border-radius: 4px; pa
 .vo { position: absolute; top: 2px; height: 18px; border-radius: 4px; background: #c2652a; color: #fff; font-size: 10px; line-height: 18px; padding: 0 6px; white-space: nowrap; overflow: hidden; cursor: pointer; min-width: 10px; border: 1px solid transparent; }
 .vo.selected { border-color: #fff; box-shadow: 0 0 0 1px var(--accent); }
 /* record panel */
-#recBox { width: 640px; }
+#modal .box:has(#recBox) { width: min(94vw, 720px); }
+#recBox { width: 100%; }
 #recPreview { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 8px; object-fit: contain; transform: scaleX(-1); }
 #recPreview.nomirror { transform: none; }
 #recPreview.portrait { aspect-ratio: 9/16; max-height: 46vh; margin: 0 auto; display: block; width: auto; }
