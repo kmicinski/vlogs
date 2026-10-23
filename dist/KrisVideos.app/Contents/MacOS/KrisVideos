@@ -1,0 +1,22 @@
+#!/bin/bash
+# KrisVideos launcher: start the local server (if not already running) and open the GUI.
+REPO="/Users/kmicinski/projects/krisvideos"
+PORT=8765
+URL="http://127.0.0.1:$PORT"
+LOG="$HOME/Library/Logs/krisvideos.log"
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+alive() { curl -s --max-time 1 "$URL/api/settings" >/dev/null 2>&1; }
+
+if ! alive; then
+  cd "$REPO" || exit 1
+  if [ ! -x .venv/bin/vlog ]; then uv sync >>"$LOG" 2>&1; fi
+  nohup .venv/bin/vlog serve --port "$PORT" >>"$LOG" 2>&1 &
+  for _ in $(seq 1 60); do alive && break; sleep 0.25; done
+fi
+
+if [ -d "/Applications/Google Chrome.app" ]; then
+  open -na "Google Chrome" --args --app="$URL" --window-size=1500,950
+else
+  open "$URL"
+fi

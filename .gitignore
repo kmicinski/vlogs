@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+dist/KrisVideos.app/Contents/Resources/*.iconset
+.DS_Store

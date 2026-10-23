@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>KrisVideos</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header id="topbar">
+  <div class="brand"><span class="dot"></span>KrisVideos</div>
+  <select id="projectSelect" title="Project"></select>
+  <button id="newProjectBtn" class="btn">+ New</button>
+  <div class="spacer"></div>
+  <span id="immichStatus" class="status" title="Immich connection"><i></i>Immich</span>
+  <button id="settingsBtn" class="btn ghost" title="Settings">⚙︎</button>
+</header>
+
+<main id="app" class="hidden">
+  <aside id="library">
+    <div class="tabs">
+      <button data-tab="immich" class="tab active">Immich</button>
+      <button data-tab="clips" class="tab">Project clips</button>
+    </div>
+    <section id="tab-immich" class="tabpanel">
+      <div class="row">
+        <input type="date" id="immichDate">
+        <select id="immichDays"><option value="1">1 day</option><option value="2">2 days</option><option value="7">week</option></select>
+        <button id="immichLoad" class="btn small">Load</button>
+      </div>
+      <div class="row">
+        <button id="immichAddAll" class="btn small primary">Add all to timeline</button>
+        <button id="immichAddSel" class="btn small">Add selected</button>
+      </div>
+      <div id="immichList" class="cards"><div class="hint">Pick a date and press Load.</div></div>
+    </section>
+    <section id="tab-clips" class="tabpanel hidden">
+      <div class="row">
+        <button id="pickFiles" class="btn small">Import files…</button>
+        <button id="pickFolder" class="btn small">Folder…</button>
+      </div>
+      <div id="dropZone" class="drop">or drop videos here</div>
+      <div id="clipList" class="cards"></div>
+    </section>
+  </aside>
+
+  <section id="center">
+    <div id="playerWrap">
+      <div id="playerBox">
+        <video id="player" playsinline></video>
+        <div id="titlePreview" class="hidden"><div class="t"></div><div class="s"></div></div>
+        <div id="playerEmpty" class="hidden">No preview yet.<br><small>Press <b>Preview</b> (or ⌘⏎) to render one.</small></div>
+      </div>
+      <div id="playerBar">
+        <button id="playBtn" class="btn icon" title="Play/pause (space)">▶</button>
+        <span id="timeNow">0:00.0</span>
+        <div id="scrub"><div id="scrubRange"></div><div id="scrubFill"></div><input type="range" id="scrubInput" min="0" max="1000" value="0"></div>
+        <span id="timeTotal">0:00.0</span>
+        <div class="seg">
+          <button id="modeTimeline" class="tab active" title="Play the rendered preview">Timeline</button>
+          <button id="modeClip" class="tab" title="Scrub the selected clip's source">Clip</button>
+        </div>
+      </div>
+      <div id="actionBar">
+        <button id="setIn" class="btn small" title="Set clip in-point from player (I)">⟦ In</button>
+        <button id="setOut" class="btn small" title="Set clip out-point from player (O)">Out ⟧</button>
+        <button id="splitHere" class="btn small" title="Split clip at playhead (S)">Split</button>
+        <button id="titleHere" class="btn small" title="Cut to a title card at the playhead (T)">Cut to title here</button>
+        <span class="spacer"></span>
+        <span id="staleBadge" class="badge hidden">preview out of date</span>
+        <button id="previewBtn" class="btn primary" title="⌘⏎">Preview</button>
+        <button id="renderBtn" class="btn render" title="Render full quality">Render</button>
+      </div>
+      <div id="jobBar" class="hidden"><div class="bar"><div class="fill"></div></div><span class="msg"></span><button class="btn small ghost" id="jobCancel">✕</button></div>
+      <div id="renderDone" class="hidden"><span class="msg"></span><button id="revealBtn" class="btn small">Show in Finder</button><button id="openBtn" class="btn small">Open</button></div>
+    </div>
+
+    <div id="timelineWrap">
+      <div class="tlhead">
+        <span>Timeline</span><span id="tlMeta" class="muted"></span>
+        <span class="spacer"></span>
+        <button id="addTitleBtn" class="btn small">+ Title card</button>
+      </div>
+      <div id="timeline"><div id="playhead"></div></div>
+    </div>
+
+    <details id="script">
+      <summary>Script <span class="muted">project.yaml — edit by hand or ask Claude</span></summary>
+      <textarea id="yaml" spellcheck="false"></textarea>
+      <div class="row"><button id="yamlApply" class="btn small primary">Apply</button><button id="yamlRevert" class="btn small">Revert</button><span id="yamlMsg" class="muted"></span><span class="spacer"></span><button id="showCmd" class="btn small ghost">ffmpeg command</button></div>
+    </details>
+  </section>
+
+  <aside id="inspector">
+    <div id="segInspector"><div class="hint">Select something on the timeline.</div></div>
+    <hr>
+    <div id="projInspector"></div>
+  </aside>
+</main>
+
+<div id="welcome" class="hidden">
+  <h1>KrisVideos</h1>
+  <p>No vlog projects yet. Make one for today.</p>
+  <button id="welcomeNew" class="btn primary">Start today's vlog</button>
+</div>
+
+<div id="modal" class="hidden"><div class="box"><div id="modalBody"></div></div></div>
+<div id="toast" class="hidden"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
