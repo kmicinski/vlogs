@@ -108,12 +108,14 @@ def _key(*parts) -> str:
 
 
 def render_title_card(cache_dir: Path, w: int, h: int, text: str, subtitle: str, *,
-                      font: str, bg: str, fg: str, accent: str, date_line: str = "") -> Path:
-    """Full-frame opaque title card."""
+                      font: str, bg: str, fg: str, accent: str, date_line: str = "", layout: str = "center") -> Path:
+    """Full-frame opaque title card. layout: center | lower (left-aligned, lower third)."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    out = cache_dir / f"title_{_key('v2', w, h, text, subtitle, font, bg, fg, accent, date_line)}.png"
+    out = cache_dir / f"title_{_key('v3', w, h, text, subtitle, font, bg, fg, accent, date_line, layout)}.png"
     if out.exists():
         return out
+    if layout == "lower":
+        return _render_title_lower(out, w, h, text, subtitle, font=font, bg=bg, fg=fg, accent=accent)
     img = Image.new("RGBA", (w, h), _hex_to_rgba(bg))
     draw = ImageDraw.Draw(img)
     short = min(w, h)
@@ -147,6 +149,36 @@ def render_title_card(cache_dir: Path, w: int, h: int, text: str, subtitle: str,
         f = load_font(font, int(short * 0.03), "medium")
         tw = draw.textlength(date_line, font=f)
         draw.text(((w - tw) / 2, h - margin - f.size), date_line, font=f, fill=_hex_to_rgba(accent))
+    img.save(out)
+    return out
+
+
+def _render_title_lower(out: Path, w: int, h: int, text: str, subtitle: str, *, font, bg, fg, accent) -> Path:
+    img = Image.new("RGBA", (w, h), _hex_to_rgba(bg))
+    draw = ImageDraw.Draw(img)
+    short = min(w, h)
+    margin = int(short * 0.09)
+    max_w = w - 2 * margin
+    title_font, title_lines = _fit_font(draw, text, font, "bold", max_w, int(h * 0.4), int(short * 0.10))
+    tl_h = int(title_font.size * 1.15)
+    sub_font = sub_lines = None
+    sl_h = 0
+    if subtitle:
+        sub_font, sub_lines = _fit_font(draw, subtitle, font, "medium", max_w, int(h * 0.2), int(short * 0.042))
+        sl_h = int(sub_font.size * 1.3)
+    gap = int(short * 0.02) if subtitle else 0
+    block_h = len(title_lines) * tl_h + gap + (len(sub_lines) * sl_h if sub_lines else 0)
+    y = h - margin - int(h * 0.06) - block_h
+    rule_w = int(short * 0.07)
+    draw.rounded_rectangle([margin, y - int(short * 0.04), margin + rule_w, y - int(short * 0.04) + max(3, short // 300)], radius=3, fill=_hex_to_rgba(accent))
+    for line in title_lines:
+        draw.text((margin, y), line, font=title_font, fill=_hex_to_rgba(fg))
+        y += tl_h
+    y += gap
+    if sub_lines:
+        for line in sub_lines:
+            draw.text((margin, y), line, font=sub_font, fill=_hex_to_rgba(accent))
+            y += sl_h
     img.save(out)
     return out
 

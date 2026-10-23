@@ -81,10 +81,74 @@ class NewProject(BaseModel):
     name: str | None = None
     title: str | None = None
     opening: bool = True
+    pull_immich: bool = False
 
 
 class YamlIn(BaseModel):
     yaml: str
+
+
+class History:
+    """Undo/redo stacks of project.yaml text, persisted per project in cache/history.json."""
+    LIMIT = 100
+
+    def __init__(self):
+        self.mem: dict[str, dict] = {}
+
+    def _file(self, p: Project) -> Path:
+        return p.cache_dir / "history.json"
+
+    def get(self, p: Project) -> dict:
+        import json
+        h = self.mem.get(p.name)
+        if h is None:
+            h = {"undo": [], "redo": []}
+            f = self._file(p)
+            if f.exists():
+                try:
+                    h = json.loads(f.read_text())
+                except Exception:
+                    pass
+            self.mem[p.name] = h
+        return h
+
+    def _persist(self, p: Project) -> None:
+        import json
+        try:
+            p.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._file(p).write_text(json.dumps(self.mem[p.name]))
+        except OSError:
+            pass
+
+    def push(self, p: Project, before: str) -> None:
+        h = self.get(p)
+        if h["undo"] and h["undo"][-1] == before:
+            return
+        h["undo"].append(before)
+        del h["undo"][:-self.LIMIT]
+        h["redo"].clear()
+        self._persist(p)
+
+    def undo(self, p: Project) -> bool:
+        h = self.get(p)
+        if not h["undo"]:
+            return False
+        h["redo"].append(p.path.read_text())
+        p.path.write_text(h["undo"].pop())
+        self._persist(p)
+        return True
+
+    def redo(self, p: Project) -> bool:
+        h = self.get(p)
+        if not h["redo"]:
+            return False
+        h["undo"].append(p.path.read_text())
+        p.path.write_text(h["redo"].pop())
+        self._persist(p)
+        return True
+
+
+HISTORY = History()
 
 
 def _cached_lufs(p: Project, rel: str):
@@ -112,7 +176,16 @@ def create_app(cfg: Config) -> FastAPI:
         return d
 
     def load(name: str) -> Project:
-        return Project.load(project_dir(name))
+        p = Project.load(project_dir(name))
+        p.extra["__before"] = p.path.read_text()
+        return p
+
+    def commit(p: Project) -> None:
+        """Save the project, recording the previous text for undo."""
+        before = p.extra.pop("__before", None)
+        p.save()
+        if before is not None and before != p.path.read_text():
+            HISTORY.push(p, before)
 
     def immich():
         from .immich import Immich
@@ -125,6 +198,8 @@ def create_app(cfg: Config) -> FastAPI:
         return f"/media/{p.name}/{rel}"
 
     def project_json(p: Project) -> dict:
+        p.extra.pop("__before", None)
+        h = HISTORY.get(p)
         infos = {}
         for s in p.timeline:
             if s.kind == "clip" and s.src not in infos:
@@ -199,6 +274,8 @@ def create_app(cfg: Config) -> FastAPI:
             "final": {"url": media_url(p, f"out/{final.name}") + f"?v={int(final.stat().st_mtime)}", "path": str(final),
                       "stale": final.stat().st_mtime < ymtime, "size": final.stat().st_size} if final.exists() else None,
             "yaml": p.path.read_text(),
+            "can_undo": bool(h["undo"]), "can_redo": bool(h["redo"]),
+            "target_lufs": p.audio.target_lufs, "match_levels": p.audio.match_levels,
         }
 
     # ------------------------------------------------------------------ static
@@ -229,6 +306,38 @@ def create_app(cfg: Config) -> FastAPI:
         p = load(name)
         f = media.filmstrip(p, src, n=max(1, min(n, 60)), start=start, end=end, height=h)
         return FileResponse(f, headers={"Cache-Control": "max-age=3600"})
+
+    @app.get("/api/projects/{name}/music")
+    def music_file(name: str):
+        p = load(name)
+        f = p.resolve(p.music.file) if p.music.file else None
+        if not f or not f.exists():
+            raise HTTPException(404, "no music")
+        return FileResponse(f, headers={"Accept-Ranges": "bytes"})
+
+    @app.get("/api/projects/{name}/wave")
+    def wave(name: str, src: str, start: float = 0.0, end: float | None = None, w: int = 800, h: int = 40, color: str = "ffffff"):
+        p = load(name)
+        if src == "music":
+            if not p.music.file:
+                raise HTTPException(404, "no music")
+            src = str(p.resolve(p.music.file))
+        f = media.waveform(p, src, start=start, end=end, width=max(8, min(w, 4000)), height=max(4, min(h, 200)), color=color)
+        return FileResponse(f, headers={"Cache-Control": "max-age=3600"})
+
+    @app.post("/api/projects/{name}/undo")
+    def undo(name: str):
+        p = load(name)
+        if not HISTORY.undo(p):
+            raise HTTPException(400, "nothing to undo")
+        return project_json(Project.load(p.folder))
+
+    @app.post("/api/projects/{name}/redo")
+    def redo(name: str):
+        p = load(name)
+        if not HISTORY.redo(p):
+            raise HTTPException(400, "nothing to redo")
+        return project_json(Project.load(p.folder))
 
     # ------------------------------------------------------------------ settings
     @app.get("/api/settings")
@@ -293,7 +402,16 @@ def create_app(cfg: Config) -> FastAPI:
                 pretty = p.title
             p.add_title(body.title or pretty, cfg.default_title_subtitle, 3.0)
         p.save()
-        return project_json(p)
+        out = {"project": project_json(p), "job": None}
+        if body.pull_immich and cfg.immich_url and cfg.immich_api_key:
+            try:
+                day = dt.date.fromisoformat(name)
+            except ValueError:
+                day = dt.date.today()
+            vids = immich().videos_on(day)
+            if vids:
+                out["job"] = import_immich(name, {"assets": [{"id": v["id"], "filename": v["filename"]} for v in vids]})
+        return out
 
     @app.get("/api/projects/{name}")
     def get_project(name: str):
@@ -315,7 +433,7 @@ def create_app(cfg: Config) -> FastAPI:
             render.compute_layout(p)  # validates clips exist
         except Exception as e:
             raise HTTPException(400, f"invalid project: {e}")
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.patch("/api/projects/{name}")
@@ -335,7 +453,7 @@ def create_app(cfg: Config) -> FastAPI:
                     elif isinstance(cur, int):
                         v = int(v) if v not in (None, "") else None
                     setattr(obj, k, v)
-        p.save()
+        commit(p)
         return project_json(p)
 
     # ------------------------------------------------------------------ segments
@@ -350,7 +468,7 @@ def create_app(cfg: Config) -> FastAPI:
             if not p.resolve(src).exists():
                 raise HTTPException(400, f"missing {src}")
             p.add_clip(src, at=at)
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.patch("/api/projects/{name}/segments/{sid}")
@@ -374,16 +492,20 @@ def create_app(cfg: Config) -> FastAPI:
                 s.mute = bool(v)
             elif k == "fit":
                 s.fit = "cover" if v == "cover" else "contain"
+            elif k in ("bg", "fg"):
+                setattr(s, k, v or None)
+            elif k == "layout":
+                s.layout = "lower" if v == "lower" else "center"
             elif k in ("caption", "subtitle", "transition", "note"):
                 setattr(s, k, v if v != "" else ("" if k in ("subtitle", "note") else None))
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.delete("/api/projects/{name}/segments/{sid}")
     def delete_segment(name: str, sid: str):
         p = load(name)
         p.remove(sid)
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.post("/api/projects/{name}/reorder")
@@ -392,7 +514,7 @@ def create_app(cfg: Config) -> FastAPI:
         by_id = {s.id: s for s in p.timeline}
         ids = [i for i in body["ids"] if i in by_id]
         p.timeline = [by_id[i] for i in ids] + [s for s in p.timeline if s.id not in ids]
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.post("/api/projects/{name}/title-at")
@@ -400,7 +522,7 @@ def create_app(cfg: Config) -> FastAPI:
         p = load(name)
         title_at(p, float(body["time"]), body.get("text") or "Title", body.get("subtitle") or "",
                  float(body.get("duration") or 3))
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.post("/api/projects/{name}/split")
@@ -421,7 +543,7 @@ def create_app(cfg: Config) -> FastAPI:
         seg.out = cut
         seg.overlays = [o for o in seg.overlays if o.at < off]
         p.timeline.insert(pl.index + 1, tail)
-        p.save()
+        commit(p)
         return project_json(p)
 
     # ------------------------------------------------------------------ import
@@ -435,15 +557,17 @@ def create_app(cfg: Config) -> FastAPI:
                 files = sorted(f for f in src.iterdir() if is_video(f))
             else:
                 files = [src]
+            rels = []
             for f in files:
                 if not f.exists():
                     raise HTTPException(400, f"not found: {f}")
-                rel = media.import_file(p, f)
+                rels.append(media.import_file(p, f))
+            for rel in media.sort_by_capture_time(p, rels):
                 media.prepare_async(p, rel)
                 if body.get("add", True) and not any(s.src == rel for s in p.timeline):
                     p.add_clip(rel)
                 added.append(rel)
-        p.save()
+        commit(p)
         return {"added": added, "project": project_json(p)}
 
     @app.post("/api/projects/{name}/upload")
@@ -473,7 +597,7 @@ def create_app(cfg: Config) -> FastAPI:
             if add and not any(s.src == rel for s in p.timeline):
                 p.add_clip(rel)
             added.append(rel)
-        p.save()
+        commit(p)
         return {"added": added, "project": project_json(p)}
 
     @app.post("/api/projects/{name}/prepare")
@@ -511,7 +635,7 @@ def create_app(cfg: Config) -> FastAPI:
             rel = media.ingest_recording(p, part, m["kind"], m["id"], container=m.get("ext", "webm"))
         except Exception as e:
             raise HTTPException(500, f"could not convert recording: {e}")
-        p = Project.load(p.folder)
+        p = load(p.name)
         if m["kind"] == "voiceover":
             new_id = p.add_voiceover(rel, max(0.0, float(m.get("at") or 0))).id
         else:
@@ -519,7 +643,7 @@ def create_app(cfg: Config) -> FastAPI:
             if seg is not None and m.get("fit") in ("cover", "contain"):
                 seg.fit = m["fit"]
             new_id = seg.id if seg else None
-        p.save()
+        commit(p)
         part.unlink(missing_ok=True)
         (rec_dir(p) / f"{m['id']}.json").unlink(missing_ok=True)
         return {"added": rel, "id": new_id, "project": project_json(p)}
@@ -611,7 +735,7 @@ def create_app(cfg: Config) -> FastAPI:
             shutil.copy2(src, dst)
         media.measure_loudness(dst, p.cache_dir)
         p.add_voiceover(f"audio/{dst.name}", float(body.get("at", 0)))
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.patch("/api/projects/{name}/voiceovers/{vid}")
@@ -627,7 +751,7 @@ def create_app(cfg: Config) -> FastAPI:
         if "note" in body:
             v.note = str(body["note"])
         p.voiceovers.sort(key=lambda x: x.at)
-        p.save()
+        commit(p)
         return project_json(p)
 
     @app.delete("/api/projects/{name}/voiceovers/{vid}")
@@ -637,7 +761,7 @@ def create_app(cfg: Config) -> FastAPI:
         p.voiceovers = [x for x in p.voiceovers if x.id != vid]
         if remove_file:
             p.resolve(v.file).unlink(missing_ok=True)
-        p.save()
+        commit(p)
         return project_json(p)
 
     # ------------------------------------------------------------------ immich
@@ -689,7 +813,7 @@ def create_app(cfg: Config) -> FastAPI:
                 pp = Project.load(p.folder)   # reload: UI may have changed things meanwhile
                 if add and not any(s.src == rel for s in pp.timeline):
                     pp.add_clip(rel)
-                    pp.save()
+                    pp.save()  # background import: not an undo step
             job.message = "done"
 
         return _run_job(job, work).to_dict()

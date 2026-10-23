@@ -109,6 +109,9 @@ class Segment:
     text: str = ""
     subtitle: str = ""
     duration: float = 3.0
+    bg: str | None = None           # per-title overrides of style.title_bg / title_fg
+    fg: str | None = None
+    layout: str = "center"          # center | lower (lower-third style, left aligned)
     # shared
     transition: str | None = None   # transition INTO this segment: cut | fade | dip (None = project default)
     transition_duration: float | None = None
@@ -131,6 +134,9 @@ class Segment:
             seg = cls(kind="title", text=str(d.get("title") or ""))
             seg.subtitle = str(d.get("subtitle") or "")
             seg.duration = float(parse_time(d.get("duration", 3)))
+            seg.bg = d.get("bg") or None
+            seg.fg = d.get("fg") or None
+            seg.layout = str(d.get("layout") or "center")
         else:
             raise ValueError(f"timeline entry #{idx} must have `clip:` or `title:`: {d}")
         seg.id = str(d.get("id") or f"s{idx+1}")
@@ -165,6 +171,12 @@ class Segment:
             if self.subtitle:
                 d["subtitle"] = self.subtitle
             d["duration"] = self.duration
+            if self.bg:
+                d["bg"] = self.bg
+            if self.fg:
+                d["fg"] = self.fg
+            if self.layout != "center":
+                d["layout"] = self.layout
         if self.transition:
             d["transition"] = self.transition
         if self.transition_duration is not None:
@@ -178,6 +190,7 @@ class Segment:
 @dataclass
 class Output:
     orientation: str = "auto"       # auto | portrait | landscape | square
+    resolution: int = 1080          # short side: 720 | 1080 | 2160
     width: int | None = None        # explicit override
     height: int | None = None
     fps: int = 30

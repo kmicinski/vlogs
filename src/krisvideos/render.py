@@ -111,6 +111,8 @@ def compute_layout(p: Project, infos: dict[str, MediaInfo] | None = None, scale:
         w, h = p.output.width, p.output.height
     else:
         w, h = CANVAS[orientation]
+        res = p.output.resolution if p.output.resolution in (720, 1080, 2160) else 1080
+        w, h = w * res / 1080, h * res / 1080
     w, h = _even(w * scale), _even(h * scale)
     placed: list[Placed] = []
     t = 0.0
@@ -215,13 +217,14 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         s, i = pl.seg, pl.index
         dur = pl.duration
         if s.kind == "title":
-            png = titles.render_title_card(p.cache_dir, W, H, s.text, s.subtitle, font=st.font, bg=st.title_bg,
-                                           fg=st.title_fg, accent=st.title_accent)
+            bg, fg = s.bg or st.title_bg, s.fg or st.title_fg
+            png = titles.render_title_card(p.cache_dir, W, H, s.text, s.subtitle, font=st.font, bg=bg,
+                                           fg=fg, accent=st.title_accent, layout=s.layout)
             k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", str(png)])
             tf = min(st.title_fade, dur / 3)
             fade = ""
             if tf > 0:
-                c = _hexcolor(st.title_bg)
+                c = _hexcolor(bg)
                 fade = f",fade=t=in:st=0:d={tf:.3f}:c={c},fade=t=out:st={dur - tf:.3f}:d={tf:.3f}:c={c}"
             filters.append(f"[{k}:v]format=yuv420p,setsar=1,fps={FPS},trim=duration={dur:.3f},setpts=PTS-STARTPTS{fade},settb=AVTB[v{i}]")
             filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
@@ -285,22 +288,34 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         v_labels.append(f"v{i}")
         a_labels.append(f"a{i}")
 
-    # join segments
-    V, A = v_labels[0], a_labels[0]
-    acc = layout.placed[0].duration
+    # join segments: runs of cut-joined segments go through ONE concat filter with video and
+    # audio together (ffmpeg pads the shorter stream per segment, keeping A/V in sync); runs are
+    # joined to each other with xfade / acrossfade.
+    groups: list[list[int]] = [[0]]
     for n, pl in enumerate(layout.placed[1:], start=1):
-        v, a = v_labels[n], a_labels[n]
         if pl.transition == "cut" or pl.transition_duration <= 0:
-            filters.append(f"[{V}][{v}]concat=n=2:v=1:a=0[V{n}]")
-            filters.append(f"[{A}][{a}]concat=n=2:v=0:a=1[A{n}]")
-            acc += pl.duration
+            groups[-1].append(n)
         else:
-            d = pl.transition_duration
-            kind = "fadeblack" if pl.transition == "dip" else "fade"
-            filters.append(f"[{V}][{v}]xfade=transition={kind}:duration={d:.3f}:offset={acc - d:.3f}[V{n}]")
-            filters.append(f"[{A}][{a}]acrossfade=d={d:.3f}:c1=tri:c2=tri[A{n}]")
-            acc += pl.duration - d
-        V, A = f"V{n}", f"A{n}"
+            groups.append([n])
+
+    def join_group(gi: int, idxs: list[int]) -> tuple[str, str]:
+        if len(idxs) == 1:
+            return v_labels[idxs[0]], a_labels[idxs[0]]
+        ins = "".join(f"[{v_labels[i]}][{a_labels[i]}]" for i in idxs)
+        filters.append(f"{ins}concat=n={len(idxs)}:v=1:a=1[gv{gi}][ga{gi}]")
+        return f"gv{gi}", f"ga{gi}"
+
+    V, A = join_group(0, groups[0])
+    acc = sum(layout.placed[i].duration for i in groups[0])
+    for gi, idxs in enumerate(groups[1:], start=1):
+        gv, ga = join_group(gi, idxs)
+        pl = layout.placed[idxs[0]]
+        d = pl.transition_duration
+        kind = "fadeblack" if pl.transition == "dip" else "fade"
+        filters.append(f"[{V}][{gv}]xfade=transition={kind}:duration={d:.3f}:offset={acc - d:.3f}[V{gi}]")
+        filters.append(f"[{A}][{ga}]acrossfade=d={d:.3f}:c1=tri:c2=tri[A{gi}]")
+        acc += sum(layout.placed[i].duration for i in idxs) - d
+        V, A = f"V{gi}", f"A{gi}"
     total = layout.total
 
     # global video fades

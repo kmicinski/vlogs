@@ -242,3 +242,44 @@ def filmstrip(p: Project, src_rel: str, n: int = 8, start: float = 0.0, end: flo
     if not out.exists():
         raise RuntimeError("filmstrip failed")
     return out
+
+
+# --------------------------------------------------------------------------- waveforms
+
+def waveform(p: Project, src_rel: str, start: float = 0.0, end: float | None = None, width: int = 800, height: int = 40,
+             color: str = "ffffff") -> Path:
+    """Transparent PNG of the audio envelope between start and end (seconds)."""
+    import hashlib
+    src = p.resolve(src_rel)
+    pr = proxy_path(p, src_rel)
+    use = pr if pr.exists() else src
+    info = probe(src, p.cache_dir)
+    end = info.duration if end is None else min(end, info.duration)
+    start = max(0.0, min(start, end))
+    dur = max(0.05, end - start)
+    key = hashlib.sha1(f"{src_rel}|{start:.2f}|{end:.2f}|{width}|{height}|{color}".encode()).hexdigest()[:16]
+    out = p.cache_dir / "waves" / f"{key}.png"
+    if out.exists():
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if not info.has_audio:
+        from PIL import Image
+        Image.new("RGBA", (width, height), (0, 0, 0, 0)).save(out)
+        return out
+    fc = f"aformat=channel_layouts=mono,showwavespic=s={width}x{height}:colors=#{color}:scale=sqrt:filter=peak"
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
+                        "-i", str(use), "-vn", "-filter_complex", fc, "-frames:v", "1", str(out)], capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        from PIL import Image
+        Image.new("RGBA", (width, height), (0, 0, 0, 0)).save(out)
+    return out
+
+
+def sort_by_capture_time(p: Project, rels: list[str]) -> list[str]:
+    def key(rel):
+        try:
+            info = probe(p.resolve(rel), p.cache_dir)
+            return (info.created or "", rel)
+        except Exception:
+            return ("", rel)
+    return sorted(rels, key=key)

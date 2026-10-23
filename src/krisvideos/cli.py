@@ -244,6 +244,13 @@ def cmd_voiceover(cfg, a):
     print("ok")
 
 
+def cmd_undo(cfg, a, redo=False):
+    from .server import HISTORY
+    p = _project(cfg, a.project)
+    ok = HISTORY.redo(p) if redo else HISTORY.undo(p)
+    print("ok" if ok else "nothing to " + ("redo" if redo else "undo"))
+
+
 def cmd_show(cfg, a):
     p = _project(cfg, a.project)
     layout = render.compute_layout(p)
@@ -324,6 +331,8 @@ def main(argv=None):
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("music"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_music)
     s = sub.add_parser("voiceover"); s.add_argument("project"); s.add_argument("file", help="audio file, or 'rm' with --at ID"); s.add_argument("--at", help="timeline time (or voiceover id with rm)"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_voiceover)
+    s = sub.add_parser("undo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_undo)
+    s = sub.add_parser("redo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=lambda c, a: cmd_undo(c, a, True))
     s = sub.add_parser("show"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_show)
     for name, mode in (("preview", "preview"), ("render", "final")):
         s = sub.add_parser(name); s.add_argument("project", nargs="?"); s.add_argument("--open", action="store_true"); s.add_argument("--dry-run", action="store_true")
