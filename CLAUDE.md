@@ -18,7 +18,12 @@ Projects live in `~/Vlogs/<name>/` (configurable: `vlog config`). Times in the Y
 *source-clip* seconds for `in`/`out`; `vlog title-at` takes *output-timeline* time.
 `in`/`out` accept `12.5` or `0:12.5`. Segment ids (`s3`) are stable; the GUI shows them in `vlog show`.
 
-Recording: the browser's MediaRecorder posts a webm/mp4 blob to `POST /record`;
+GUI player: `web/app.js` `VP` plays the timeline live from clip proxies (two `<video>` elements,
+master clock, title cards and captions drawn in HTML) and switches to `out/preview.mp4` when it is
+newer than project.yaml. Timeline blocks show per-range filmstrips from `GET /strip`.
+Recording: MediaRecorder chunks are POSTed to `record/start` → `record/{id}/chunk?seq=n` (appended
++ fsynced to `cache/recordings/<id>.part`) → `record/{id}/finish`; `GET /recordings` lists
+unfinished sessions for recovery. The legacy one-shot `POST /record` still exists;
 `media.ingest_recording` transcodes it to `clips/REC_*.mp4` or `audio/VO_*.m4a`. Voiceovers are
 `project.voiceovers` (output-timeline `at`), mixed in `render.py` after the segment join with
 sidechain ducking of clip audio; music ducking keys off that bus. Level matching uses cached

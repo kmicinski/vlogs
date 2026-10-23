@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import shutil
 import subprocess
 import threading
@@ -221,6 +222,13 @@ def create_app(cfg: Config) -> FastAPI:
         if not str(f).startswith(str(d)) or not f.exists():
             raise HTTPException(404)
         return FileResponse(f, headers={"Accept-Ranges": "bytes", "Cache-Control": "no-cache"})
+
+    @app.get("/api/projects/{name}/strip")
+    def filmstrip(name: str, src: str, n: int = 8, start: float = 0.0, end: float | None = None, h: int = 72):
+        """A horizontal strip of n frames from src between start and end (source seconds)."""
+        p = load(name)
+        f = media.filmstrip(p, src, n=max(1, min(n, 60)), start=start, end=end, height=h)
+        return FileResponse(f, headers={"Cache-Control": "max-age=3600"})
 
     # ------------------------------------------------------------------ settings
     @app.get("/api/settings")
@@ -477,39 +485,119 @@ def create_app(cfg: Config) -> FastAPI:
         return {"ok": True}
 
     # ------------------------------------------------------------------ recording / voiceovers
+    # Recordings stream in as chunks and are appended to disk immediately, so a crash mid-take
+    # loses at most the last chunk. cache/recordings/<id>.json is the manifest, <id>.part the data.
+    def rec_dir(p: Project) -> Path:
+        d = p.cache_dir / "recordings"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def rec_manifest(p: Project, rid: str) -> dict:
+        f = rec_dir(p) / f"{rid}.json"
+        if not f.exists():
+            raise HTTPException(404, "no such recording session")
+        import json
+        return json.loads(f.read_text())
+
+    def rec_save_manifest(p: Project, m: dict) -> None:
+        import json
+        (rec_dir(p) / f"{m['id']}.json").write_text(json.dumps(m))
+
+    def finalize_recording(p: Project, m: dict) -> dict:
+        part = rec_dir(p) / f"{m['id']}.part"
+        if not part.exists() or part.stat().st_size < 1000:
+            raise HTTPException(400, "recording is empty")
+        try:
+            rel = media.ingest_recording(p, part, m["kind"], m["id"], container=m.get("ext", "webm"))
+        except Exception as e:
+            raise HTTPException(500, f"could not convert recording: {e}")
+        p = Project.load(p.folder)
+        if m["kind"] == "voiceover":
+            new_id = p.add_voiceover(rel, max(0.0, float(m.get("at") or 0))).id
+        else:
+            seg = p.add_clip(rel) if m.get("add", True) else None
+            if seg is not None and m.get("fit") in ("cover", "contain"):
+                seg.fit = m["fit"]
+            new_id = seg.id if seg else None
+        p.save()
+        part.unlink(missing_ok=True)
+        (rec_dir(p) / f"{m['id']}.json").unlink(missing_ok=True)
+        return {"added": rel, "id": new_id, "project": project_json(p)}
+
+    @app.post("/api/projects/{name}/record/start")
+    def record_start(name: str, body: dict):
+        p = load(name)
+        rid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+        mime = str(body.get("mime") or "video/webm")
+        m = {"id": rid, "kind": body.get("kind", "clip"), "at": float(body.get("at") or 0), "fit": body.get("fit", ""),
+             "add": bool(body.get("add", True)), "mime": mime, "ext": "mp4" if "mp4" in mime else "webm",
+             "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0}
+        (rec_dir(p) / f"{rid}.part").write_bytes(b"")
+        rec_save_manifest(p, m)
+        return {"id": rid}
+
+    @app.post("/api/projects/{name}/record/{rid}/chunk")
+    async def record_chunk(name: str, rid: str, request: Request, seq: int = 0):
+        p = load(name)
+        m = rec_manifest(p, rid)
+        if seq != m["seq"]:
+            if seq < m["seq"]:
+                return {"bytes": m["bytes"], "seq": m["seq"], "dup": True}
+            raise HTTPException(409, f"expected chunk {m['seq']}, got {seq}")
+        data = await request.body()
+        with open(rec_dir(p) / f"{rid}.part", "ab") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        m["bytes"] += len(data)
+        m["seq"] = seq + 1
+        rec_save_manifest(p, m)
+        return {"bytes": m["bytes"], "seq": m["seq"]}
+
+    @app.post("/api/projects/{name}/record/{rid}/finish")
+    def record_finish(name: str, rid: str):
+        p = load(name)
+        return finalize_recording(p, rec_manifest(p, rid))
+
+    @app.get("/api/projects/{name}/recordings")
+    def recordings_pending(name: str):
+        """Unfinished recording sessions (e.g. after a crash) that can be recovered."""
+        import json
+        p = load(name)
+        out = []
+        for f in sorted(rec_dir(p).glob("*.json")):
+            try:
+                m = json.loads(f.read_text())
+            except Exception:
+                continue
+            part = rec_dir(p) / f"{m['id']}.part"
+            size = part.stat().st_size if part.exists() else 0
+            m["bytes"] = size
+            m["recoverable"] = size >= 1000
+            out.append(m)
+        return out
+
+    @app.delete("/api/projects/{name}/recordings/{rid}")
+    def recordings_discard(name: str, rid: str):
+        p = load(name)
+        (rec_dir(p) / f"{rid}.part").unlink(missing_ok=True)
+        (rec_dir(p) / f"{rid}.json").unlink(missing_ok=True)
+        return {"ok": True}
+
     @app.post("/api/projects/{name}/record")
     async def record(name: str, file: UploadFile = File(...), kind: str = Form("clip"), at: float = Form(0.0),
                      add: str = Form("true"), fit: str = Form("")):
-        """Receive a MediaRecorder blob, transcode it, and add it to the project."""
-        add = str(add).lower() in ("1", "true", "yes", "on")
+        """One-shot upload of a whole recording (fallback / CLI use)."""
         p = load(name)
-        p.ensure_dirs()
-        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-        ext = ".webm" if "webm" in (file.content_type or "") else ".mp4"
-        blob = p.cache_dir / f"rec_{stamp}{ext}"
-        with open(blob, "wb") as out:
+        rid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
+        mime = file.content_type or "video/webm"
+        m = {"id": rid, "kind": kind, "at": at, "fit": fit, "add": str(add).lower() in ("1", "true", "yes", "on"),
+             "mime": mime, "ext": "mp4" if "mp4" in mime else "webm", "started": dt.datetime.now().isoformat(timespec="seconds")}
+        with open(rec_dir(p) / f"{rid}.part", "wb") as out:
             while chunk := await file.read(1 << 20):
                 out.write(chunk)
-        if blob.stat().st_size < 1000:
-            blob.unlink()
-            raise HTTPException(400, "recording was empty")
-        try:
-            rel = media.ingest_recording(p, blob, kind, stamp)
-        except Exception as e:
-            raise HTTPException(500, f"could not convert recording: {e}")
-        finally:
-            blob.unlink(missing_ok=True)
-        p = Project.load(p.folder)
-        if kind == "voiceover":
-            vo = p.add_voiceover(rel, max(0.0, at))
-            new_id = vo.id
-        else:
-            seg = p.add_clip(rel) if add else None
-            if seg is not None and fit in ("cover", "contain"):
-                seg.fit = fit
-            new_id = seg.id if seg else None
-        p.save()
-        return {"added": rel, "id": new_id, "project": project_json(p)}
+        rec_save_manifest(p, m)
+        return finalize_recording(p, m)
 
     @app.post("/api/projects/{name}/voiceovers")
     def add_voiceover(name: str, body: dict):

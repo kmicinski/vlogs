@@ -168,27 +168,40 @@ def level_gain_db(lufs: float | None, target: float, limit: float = 12.0) -> flo
 
 # --------------------------------------------------------------------------- recordings
 
-def ingest_recording(p: Project, blob: Path, kind: str, stamp: str) -> str:
-    """Transcode a browser MediaRecorder blob (webm/mp4) into a proper project asset.
+# Input flags that let ffmpeg read a recording whose last chunk was cut off by a crash.
+_TOLERANT = ["-fflags", "+genpts+discardcorrupt+igndts", "-err_detect", "ignore_err"]
+
+
+def ingest_recording(p: Project, blob: Path, kind: str, stamp: str, container: str = "webm") -> str:
+    """Transcode a browser MediaRecorder stream (webm/mp4, possibly truncated) into a project asset.
     kind='clip' -> clips/REC_<stamp>.mp4 (H.264 + AAC); kind='voiceover' -> audio/VO_<stamp>.m4a.
     Returns the project-relative path."""
     p.ensure_dirs()
+    fmt = ["-f", "matroska" if container == "webm" else "mp4"]
     if kind == "voiceover":
         dst = p.audio_dir / f"VO_{stamp}.m4a"
-        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(blob), "-vn",
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *_TOLERANT, *fmt, "-i", str(blob), "-vn",
                "-af", "aresample=48000,highpass=f=70", "-c:a", "aac", "-b:a", "160k", "-ac", "1", "-movflags", "+faststart", str(dst)]
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr[-500:])
         rel = f"audio/{dst.name}"
         measure_loudness(dst, p.cache_dir)
         return rel
     dst = p.clips_dir / f"REC_{stamp}.mp4"
-    info = probe(blob)
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(blob),
+    try:
+        has_audio = probe(blob).has_audio
+    except Exception:
+        has_audio = True
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *_TOLERANT, *fmt, "-i", str(blob),
            "-vf", "scale='min(1920,iw)':-2,fps=30,format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "12M",
            "-profile:v", "high", "-color_primaries:v", "bt709", "-color_trc:v", "bt709", "-colorspace:v", "bt709"]
-    cmd += (["-af", "aresample=48000", "-c:a", "aac", "-b:a", "192k", "-ac", "2"] if info.has_audio else ["-an"])
+    cmd += (["-af", "aresample=48000", "-c:a", "aac", "-b:a", "192k", "-ac", "2"] if has_audio else ["-an"])
     cmd += ["-movflags", "+faststart", "-metadata", f"creation_time={stamp}", str(dst)]
     r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 and has_audio:  # audio track may be unusable in a truncated file; keep the video
+        cmd[cmd.index("-af"):cmd.index("-af") + 8] = ["-an"]
+        r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(r.stderr[-500:])
     rel = f"clips/{dst.name}"
@@ -196,3 +209,36 @@ def ingest_recording(p: Project, blob: Path, kind: str, stamp: str) -> str:
     prepare(p, rel)
     measure_loudness(dst, p.cache_dir)
     return rel
+
+
+# --------------------------------------------------------------------------- filmstrips
+
+def filmstrip(p: Project, src_rel: str, n: int = 8, start: float = 0.0, end: float | None = None, height: int = 72) -> Path:
+    """n evenly spaced frames between start and end tiled into one JPEG (from the proxy when available)."""
+    import hashlib
+    src = proxy_path(p, src_rel) if proxy_path(p, src_rel).exists() else p.resolve(src_rel)
+    info = probe(p.resolve(src_rel), p.cache_dir)
+    end = info.duration if end is None else min(end, info.duration)
+    start = max(0.0, min(start, end))
+    dur = max(0.05, end - start)
+    key = hashlib.sha1(f"{src_rel}|{n}|{start:.2f}|{end:.2f}|{height}|{src.stat().st_mtime}".encode()).hexdigest()[:16]
+    out = p.cache_dir / "strips" / f"{key}.jpg"
+    if out.exists():
+        return out
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fw = int(height * info.width / max(1, info.height)) if info.width and info.height else height
+    fw += fw % 2
+    # pick frame i at start + (i + 0.5) * dur / n
+    sel = "+".join(f"lt(prev_pts*TB,{start + (i + 0.5) * dur / n:.3f})*gte(pts*TB,{start + (i + 0.5) * dur / n:.3f})" for i in range(n))
+    vf = f"select='{sel}',scale={fw}:{height},tile={n}x1"
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{max(0.0, start - 0.5):.3f}", "-t", f"{dur + 1.5:.3f}",
+           "-i", str(src), "-vf", vf, "-frames:v", "1", "-fps_mode", "passthrough", "-q:v", "5", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        # fallback: evenly sampled by fps
+        vf = f"fps={n / dur:.6f},scale={fw}:{height},tile={n}x1"
+        subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-t", f"{dur:.3f}",
+                        "-i", str(src), "-vf", vf, "-frames:v", "1", "-q:v", "5", str(out)], capture_output=True)
+    if not out.exists():
+        raise RuntimeError("filmstrip failed")
+    return out

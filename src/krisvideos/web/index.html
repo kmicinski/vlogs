@@ -4,109 +4,75 @@
 <meta charset="utf-8">
 <title>KrisVideos</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light only">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header id="topbar">
-  <div class="brand"><span class="dot"></span>KrisVideos</div>
-  <select id="projectSelect" title="Project"></select>
-  <button id="newProjectBtn" class="btn">+ New</button>
-  <div class="spacer"></div>
-  <span id="immichStatus" class="status" title="Immich connection"><i></i>Immich</span>
-  <button id="settingsBtn" class="btn ghost" title="Settings">⚙︎</button>
+<header id="top">
+  <button id="projBtn" class="projbtn" title="Switch vlog"><span id="projTitle">KrisVideos</span><span class="chev">›</span></button>
+  <span id="projMeta" class="meta"></span>
+  <span class="spacer"></span>
+  <button id="addBtn" class="pill">+ Add</button>
+  <button id="scriptBtn" class="pill ghost" title="Edit the project script">Script</button>
+  <button id="renderPreviewBtn" class="pill ghost" title="Render an accurate preview with transitions, music and narration (⌘⏎)">Render preview</button>
+  <button id="exportBtn" class="pill primary" title="Export the finished video (⇧⌘⏎)">Export</button>
+  <button id="gearBtn" class="iconbtn" title="Settings">⚙︎</button>
 </header>
 
 <main id="app" class="hidden">
-  <aside id="library">
-    <div class="tabs">
-      <button data-tab="immich" class="tab active">Immich</button>
-      <button data-tab="clips" class="tab">Project clips</button>
+  <section id="stage">
+    <div id="playerBox">
+      <div id="canvas">
+        <video id="vA" playsinline preload="auto"></video>
+        <video id="vB" playsinline preload="auto" class="hidden"></video>
+        <div id="card" class="hidden"><div class="rule"></div><div class="t"></div><div class="s"></div></div>
+        <div id="capLayer"></div>
+        <div id="stageEmpty" class="hidden"></div>
+        <div id="modeChip"></div>
+      </div>
     </div>
-    <section id="tab-immich" class="tabpanel">
-      <div class="row">
-        <input type="date" id="immichDate">
-        <select id="immichDays"><option value="1">1 day</option><option value="2">2 days</option><option value="7">week</option></select>
-        <button id="immichLoad" class="btn small">Load</button>
-      </div>
-      <div class="row">
-        <button id="immichAddAll" class="btn small primary">Add all to timeline</button>
-        <button id="immichAddSel" class="btn small">Add selected</button>
-      </div>
-      <div id="immichList" class="cards"><div class="hint">Pick a date and press Load.</div></div>
-    </section>
-    <section id="tab-clips" class="tabpanel hidden">
-      <div class="row">
-        <button id="pickFiles" class="btn small">Import files…</button>
-        <button id="pickFolder" class="btn small">Folder…</button>
-      </div>
-      <div id="dropZone" class="drop">or drop videos here</div>
-      <div id="clipList" class="cards"></div>
-    </section>
-  </aside>
+    <div id="transport">
+      <button id="playBtn" class="playbtn" title="Play / pause (space)"><svg viewBox="0 0 16 16" width="16" height="16"><path id="playIcon" d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg></button>
+      <span id="tNow" class="tc">0:00.0</span>
+      <div id="scrubber"><div class="rail"></div><div class="fill"></div><div class="knob"></div></div>
+      <span id="tTotal" class="tc muted">0:00.0</span>
+    </div>
+    <div id="jobBar" class="hidden"><div class="bar"><div class="fill"></div></div><span class="msg"></span><button class="link" id="jobCancel">Cancel</button></div>
+    <div id="doneBar" class="hidden"><span class="msg"></span><button class="link" id="revealBtn">Show in Finder</button><button class="link" id="openBtn">Open</button><button class="link muted" id="doneClose">✕</button></div>
+    <div id="recoverBar" class="hidden"><span class="msg"></span><button class="link" id="recoverBtn">Recover</button><button class="link muted" id="discardBtn">Discard</button></div>
 
-  <section id="center">
-    <div id="playerWrap">
-      <div id="playerBox">
-        <video id="player" playsinline></video>
-        <div id="titlePreview" class="hidden"><div class="t"></div><div class="s"></div></div>
-        <div id="playerEmpty" class="hidden">No preview yet.<br><small>Press <b>Preview</b> (or ⌘⏎) to render one.</small></div>
-      </div>
-      <div id="playerBar">
-        <button id="playBtn" class="btn icon" title="Play/pause (space)">▶</button>
-        <span id="timeNow">0:00.0</span>
-        <div id="scrub"><div id="scrubRange"></div><div id="scrubFill"></div><input type="range" id="scrubInput" min="0" max="1000" value="0"></div>
-        <span id="timeTotal">0:00.0</span>
-        <div class="seg">
-          <button id="modeTimeline" class="tab active" title="Play the rendered preview">Timeline</button>
-          <button id="modeClip" class="tab" title="Scrub the selected clip's source">Clip</button>
-        </div>
-      </div>
-      <div id="actionBar">
-        <button id="setIn" class="btn small" title="Set clip in-point from player (I)">⟦ In</button>
-        <button id="setOut" class="btn small" title="Set clip out-point from player (O)">Out ⟧</button>
-        <button id="splitHere" class="btn small" title="Split clip at playhead (S)">Split</button>
-        <button id="titleHere" class="btn small" title="Cut to a title card at the playhead (T)">Cut to title here</button>
-        <button id="recordBtn" class="btn small rec" title="Record from camera / mic (R)">⏺ Record</button>
+    <div id="tlWrap">
+      <div id="ctx">
+        <button class="link" data-act="split" title="Split the clip at the playhead (S)">Split</button>
+        <button class="link" data-act="title" title="Cut to a title card here (T)">Cut to title</button>
+        <button class="link" data-act="trimStart" title="Trim the clip's start to the playhead (I)">Trim start</button>
+        <button class="link" data-act="trimEnd" title="Trim the clip's end to the playhead (O)">Trim end</button>
         <span class="spacer"></span>
-        <span id="staleBadge" class="badge hidden">preview out of date</span>
-        <button id="previewBtn" class="btn primary" title="⌘⏎">Preview</button>
-        <button id="renderBtn" class="btn render" title="Render full quality">Render</button>
+        <button class="link" data-act="addTitle">+ Title</button>
+        <button class="link" data-act="record">⏺ Record</button>
+        <button class="link" data-act="music">♫ Music</button>
       </div>
-      <div id="jobBar" class="hidden"><div class="bar"><div class="fill"></div></div><span class="msg"></span><button class="btn small ghost" id="jobCancel">✕</button></div>
-      <div id="renderDone" class="hidden"><span class="msg"></span><button id="revealBtn" class="btn small">Show in Finder</button><button id="openBtn" class="btn small">Open</button></div>
-    </div>
-
-    <div id="timelineWrap">
-      <div class="tlhead">
-        <span>Timeline</span><span id="tlMeta" class="muted"></span>
-        <span class="spacer"></span>
-        <button id="addTitleBtn" class="btn small">+ Title card</button>
+      <div id="tl">
+        <div id="ruler"></div>
+        <div id="track"><div id="tlEmpty" class="hidden">Add your first clips with <b>+ Add</b> above, or press <b>R</b> to record.</div></div>
+        <div id="lanes"></div>
+        <div id="playhead"><div class="head"></div></div>
       </div>
-      <div id="timeline"><div id="playhead"></div></div>
-      <div id="voLane" class="hidden"><span class="lanelbl">Narration</span><div id="voTrack"></div></div>
     </div>
-
-    <details id="script">
-      <summary>Script <span class="muted">project.yaml — edit by hand or ask Claude</span></summary>
-      <textarea id="yaml" spellcheck="false"></textarea>
-      <div class="row"><button id="yamlApply" class="btn small primary">Apply</button><button id="yamlRevert" class="btn small">Revert</button><span id="yamlMsg" class="muted"></span><span class="spacer"></span><button id="showCmd" class="btn small ghost">ffmpeg command</button></div>
-    </details>
   </section>
 
-  <aside id="inspector">
-    <div id="segInspector"><div class="hint">Select something on the timeline.</div></div>
-    <hr>
-    <div id="projInspector"></div>
-  </aside>
+  <aside id="inspector" class="hidden"><div id="inspBody"></div></aside>
 </main>
 
 <div id="welcome" class="hidden">
+  <div class="mark"></div>
   <h1>KrisVideos</h1>
-  <p>No vlog projects yet. Make one for today.</p>
-  <button id="welcomeNew" class="btn primary">Start today's vlog</button>
+  <p>Daily vlogs, out the door in minutes.</p>
+  <button id="welcomeNew" class="pill primary">Start today's vlog</button>
 </div>
 
-<div id="modal" class="hidden"><div class="box"><div id="modalBody"></div></div></div>
+<div id="sheet" class="hidden"><div class="sheetbox"><div id="sheetBody"></div></div></div>
+<div id="popover" class="hidden"></div>
 <div id="toast" class="hidden"></div>
 <script src="/static/app.js"></script>
 </body>

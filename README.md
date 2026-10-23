@@ -30,15 +30,21 @@ Immich URL + API key (Immich → Account settings → API keys), the vlogs folde
 
 ## Daily flow
 
-1. **New** → today's date. You get an opening title card automatically.
-2. **Immich tab** → Load → *Add all to timeline* (or drag individual clips in).
-3. Click clips to trim (Clip mode: scrub, press `I`/`O`), type captions, drag to reorder.
-4. Press **Preview** (⌘⏎). Scrub it; press `T` to *cut to a title card here*, `S` to split.
-5. Press **Render** → *Show in Finder* → AirDrop / iMessage.
+1. **Project name ▸ New vlog** (⌘N). You get an opening title card automatically.
+2. **+ Add ▸ From Immich** → pick the day → *Add all*.
+3. Scrub the timeline (drag the ruler or the bar under the player). The player plays the
+   timeline **live from proxies** so there is nothing to wait for. Press `T` to cut to a
+   title card at the playhead, `S` to split, `I`/`O` to trim to the playhead, or drag the
+   blue handles on a selected clip. Click a block for the inspector (captions, speed, fit…).
+4. **Render preview** (⌘⏎) when you want to hear the real mix and see transitions; the
+   player switches to it automatically while it's up to date.
+5. **Export** → *Show in Finder* → AirDrop / iMessage.
 
 ### Recording in the app
 Press **⏺ Record** (or `R`). Pick any camera and microphone the Mac sees (built-in, USB
-camera, capture card, audio interface). Two modes:
+camera, capture card, audio interface). Recordings stream to disk every half second while
+you record; if anything crashes mid-take, the app offers to **Recover** the partial take on
+the next launch. Two modes:
 
 - **Camera clip**: a talking-head segment that lands on the timeline like any other clip.
   "Crop to fill frame" (default for portrait vlogs) center-crops a 16:9 camera into 9:16.
@@ -50,8 +56,9 @@ Audio mixing: every clip and voiceover is measured (LUFS) on import and auto-gai
 a common level (*Match clip & voice levels*), music ducks under speech, and the final mix
 is loudness-normalized. Per-clip volume/mute and fit are in the inspector.
 
-Keyboard: `space` play · `I`/`O` in/out · `T` title at playhead · `S` split · `C` toggle
-Clip/Timeline · `⌫` delete · `↑↓` select · `←→` frame step · `⌘⏎` preview · `⇧⌘⏎` render.
+Keyboard: `space` play · `I`/`O` trim start/end to playhead · `T` title here · `S` split ·
+`R` record · `⌫` delete · `↑↓` select · `[` `]` reorder · `←→` frame step · `⌘⏎` render
+preview · `⇧⌘⏎` export.
 
 ## The script (`project.yaml`)
 
