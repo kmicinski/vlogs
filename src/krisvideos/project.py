@@ -65,6 +65,33 @@ class Overlay:
 
 
 @dataclass
+class Voiceover:
+    """An audio layer (narration) laid over the output timeline."""
+    file: str                       # project-relative (audio/VO_....m4a)
+    at: float = 0.0                 # output-timeline seconds
+    volume: float = 1.0
+    duck_clips: bool = True         # lower clip audio while this plays
+    id: str = ""
+    note: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict, idx: int) -> "Voiceover":
+        return cls(file=str(d["file"]), at=parse_time(d.get("at", 0)), volume=float(d.get("volume", 1.0)),
+                   duck_clips=bool(d.get("duck_clips", True)), id=str(d.get("id") or f"v{idx+1}"), note=str(d.get("note") or ""))
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {"file": self.file, "at": round(self.at, 3)}
+        if self.volume != 1.0:
+            d["volume"] = self.volume
+        if not self.duck_clips:
+            d["duck_clips"] = False
+        if self.note:
+            d["note"] = self.note
+        d["id"] = self.id
+        return d
+
+
+@dataclass
 class Segment:
     kind: str                       # "clip" | "title"
     id: str = ""
@@ -76,6 +103,7 @@ class Segment:
     mute: bool = False
     volume: float = 1.0
     caption: str | None = None      # convenience: a lower-third shown for the whole clip
+    fit: str = "contain"            # contain (letterbox) | cover (crop to fill the canvas)
     overlays: list[Overlay] = field(default_factory=list)
     # title fields
     text: str = ""
@@ -97,6 +125,7 @@ class Segment:
             seg.mute = bool(d.get("mute", False))
             seg.volume = float(d.get("volume", 1.0))
             seg.caption = d.get("caption")
+            seg.fit = str(d.get("fit") or "contain")
             seg.overlays = [Overlay.from_dict(o) for o in d.get("overlays", []) or []]
         elif "title" in d:
             seg = cls(kind="title", text=str(d.get("title") or ""))
@@ -127,6 +156,8 @@ class Segment:
                 d["volume"] = self.volume
             if self.caption:
                 d["caption"] = self.caption
+            if self.fit != "contain":
+                d["fit"] = self.fit
             if self.overlays:
                 d["overlays"] = [o.to_dict() for o in self.overlays]
         else:
@@ -182,6 +213,8 @@ class Music:
 @dataclass
 class Audio:
     normalize: bool = True          # loudness-normalize the final mix
+    match_levels: bool = True       # auto-gain each clip/voiceover toward the same loudness
+    target_lufs: float = -18.0
     master_volume: float = 1.0
 
 
@@ -196,6 +229,7 @@ class Project:
     music: Music = field(default_factory=Music)
     audio: Audio = field(default_factory=Audio)
     timeline: list[Segment] = field(default_factory=list)
+    voiceovers: list[Voiceover] = field(default_factory=list)
     extra: dict = field(default_factory=dict)    # unknown top-level keys, preserved
 
     # ------------------------------------------------------------------ paths
@@ -215,8 +249,12 @@ class Project:
     def out_dir(self) -> Path:
         return self.folder / "out"
 
+    @property
+    def audio_dir(self) -> Path:
+        return self.folder / "audio"
+
     def ensure_dirs(self) -> None:
-        for d in (self.folder, self.clips_dir, self.cache_dir, self.out_dir):
+        for d in (self.folder, self.clips_dir, self.cache_dir, self.out_dir, self.audio_dir):
             d.mkdir(parents=True, exist_ok=True)
 
     def resolve(self, rel: str) -> Path:
@@ -244,7 +282,7 @@ class Project:
     @classmethod
     def from_dict(cls, data: dict, folder: Path) -> "Project":
         folder = Path(folder)
-        known = {"title", "date", "output", "style", "music", "audio", "timeline"}
+        known = {"title", "date", "output", "style", "music", "audio", "timeline", "voiceovers"}
         p = cls(name=folder.name, folder=folder)
         p.title = str(data.get("title") or folder.name)
         p.date = str(data.get("date") or "")
@@ -253,6 +291,7 @@ class Project:
         p.music = _fill(Music, data.get("music"))
         p.audio = _fill(Audio, data.get("audio"))
         p.timeline = [Segment.from_dict(s, i) for i, s in enumerate(data.get("timeline") or [])]
+        p.voiceovers = [Voiceover.from_dict(v, i) for i, v in enumerate(data.get("voiceovers") or [])]
         p.extra = {k: v for k, v in data.items() if k not in known}
         p.renumber_ids()
         return p
@@ -270,6 +309,8 @@ class Project:
             d["audio"] = au
         d.update(self.extra)
         d["timeline"] = [s.to_dict() for s in self.timeline]
+        if self.voiceovers:
+            d["voiceovers"] = [v.to_dict() for v in self.voiceovers]
         return d
 
     def save(self) -> None:
@@ -291,6 +332,22 @@ class Project:
                     n += 1
                     s.id = f"s{n}"
             seen.add(s.id)
+
+    def add_voiceover(self, file: str, at: float, **kw) -> Voiceover:
+        ids = {v.id for v in self.voiceovers}
+        n = len(self.voiceovers) + 1
+        while f"v{n}" in ids:
+            n += 1
+        vo = Voiceover(file=file, at=at, id=f"v{n}", **kw)
+        self.voiceovers.append(vo)
+        self.voiceovers.sort(key=lambda v: v.at)
+        return vo
+
+    def voiceover(self, vid: str) -> Voiceover:
+        for v in self.voiceovers:
+            if v.id == vid:
+                return v
+        raise KeyError(vid)
 
     def index_of(self, seg_id: str) -> int:
         for i, s in enumerate(self.timeline):

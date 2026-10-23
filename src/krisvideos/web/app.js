@@ -60,7 +60,7 @@ async function openProject(name) {
 function setProject(p) {
   P = p;
   if (sel && !P.timeline.some(s => s.id === sel)) sel = null;
-  renderTimeline(); renderInspector(); renderProjectInspector(); renderClips(); renderPlayerSource();
+  renderTimeline(); renderVoLane(); if (!selVo || !(P.voiceovers || []).some(v => v.id === selVo)) { selVo = null; renderInspector(); } else renderVoInspector(P.voiceovers.find(v => v.id === selVo)); renderProjectInspector(); renderClips(); renderPlayerSource();
   if ($('#yaml').value !== P.yaml && (document.activeElement !== $('#yaml'))) $('#yaml').value = P.yaml;
   lastYaml = P.yaml;
   $('#staleBadge').classList.toggle('hidden', !(P.preview && P.preview.stale));
@@ -130,7 +130,7 @@ async function onDropOnBlock(e, targetId) {
 }
 
 function select(id) {
-  sel = id;
+  sel = id; selVo = null; $$('#voTrack .vo').forEach(b => b.classList.remove('selected'));
   $$('#timeline .block').forEach(b => b.classList.toggle('selected', b.dataset.id === id));
   renderInspector();
   const s = seg();
@@ -293,8 +293,9 @@ function renderInspector() {
       field('Duration (s)', `<input type="number" data-k="duration" step="0.5" min="0.5" value="${s.duration}">`);
   } else {
     const m = s.media || {};
-    html += `<h3>Clip</h3><div class="muted" style="margin-bottom:8px">${esc(s.clip)}${m.width ? ` · ${m.width}×${m.height}${m.hdr ? ' HDR' : ''} · ${fmt(m.duration)}` : ''}${s.missing ? ' · <b style="color:var(--danger)">file missing</b>' : ''}</div>` +
+    html += `<h3>Clip</h3><div class="muted" style="margin-bottom:8px">${esc(s.clip)}${m.width ? ` · ${m.width}×${m.height}${m.hdr ? ' HDR' : ''} · ${fmt(m.duration)}` : ''}${s.lufs != null ? ` · ${s.lufs.toFixed(1)} LUFS` : ''}${s.missing ? ' · <b style="color:var(--danger)">file missing</b>' : ''}</div>` +
       field('In / Out (source seconds)', `<div class="inline"><input type="text" data-k="in" value="${fmt(s.in || 0, 2)}"><span class="muted">→</span><input type="text" data-k="out" value="${s.out == null ? 'end' : fmt(s.out, 2)}"></div>`) +
+      field('Fit to frame', `<select data-k="fit"><option value="contain" ${s.fit !== 'cover' ? 'selected' : ''}>letterbox (show everything)</option><option value="cover" ${s.fit === 'cover' ? 'selected' : ''}>crop to fill</option></select>`) +
       field('Caption (lower third, whole clip)', `<input type="text" data-k="caption" value="${esc(s.caption || '')}" placeholder="e.g. coffee first">`) +
       `<div class="field"><label>Text overlays</label><div id="ovList"></div><button class="btn small" id="ovAdd">+ overlay</button></div>` +
       field('Speed', `<div class="inline"><input type="range" data-k="speed" min="0.25" max="4" step="0.25" value="${s.speed || 1}"><span id="speedLbl">${s.speed || 1}×</span></div>`) +
@@ -355,6 +356,7 @@ function renderProjectInspector() {
     field('Title colors', `<div class="inline"><input type="color" data-p="style.title_bg" value="${st.title_bg}" title="background"><input type="color" data-p="style.title_fg" value="${st.title_fg}" title="text"><input type="text" data-p="style.font" value="${esc(st.font)}" title="font family"></div>`) +
     field('Output', `<div class="inline"><select data-p="output.codec">${opt(['h264', 'hevc'], o.codec)}</select><select data-p="output.quality">${opt(['high', 'medium'], o.quality)}</select><select data-p="output.fps">${opt([24, 30, 60], o.fps)}</select></div>`) +
     `<div class="check"><input type="checkbox" id="normChk" ${a.normalize ? 'checked' : ''}><label for="normChk">Normalize loudness</label></div>` +
+    `<div class="check"><input type="checkbox" id="matchChk" ${a.match_levels ? 'checked' : ''}><label for="matchChk">Match clip & voice levels</label></div>` +
     `<div class="row"><button class="btn small ghost" id="openFolder">Open project folder</button><button class="btn small ghost danger" id="deleteProject">Delete project</button></div>`;
   $$('[data-p]', el).forEach(inp => {
     const path = inp.dataset.p.split('.');
@@ -367,6 +369,7 @@ function renderProjectInspector() {
   });
   if ($('#duckChk')) $('#duckChk').onchange = e => patchProject({ music: { duck: e.target.checked } });
   $('#normChk').onchange = e => patchProject({ audio: { normalize: e.target.checked } });
+  $('#matchChk').onchange = e => patchProject({ audio: { match_levels: e.target.checked } });
   $('#pickMusic').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'music' }); if (r.paths[0]) patchProject({ music: { file: r.paths[0] } }); });
   $('#openFolder').onclick = () => api('POST', '/api/open', { path: P.folder });
   $('#deleteProject').onclick = () => modal(`<h2>Delete “${esc(P.name)}”?</h2><p class="muted">The folder is moved to the Trash.</p><div class="row"><button class="btn danger" id="m_ok">Delete</button><button class="btn" id="m_cancel">Cancel</button></div>`, () => guard(async () => { await api('DELETE', `/api/projects/${P.name}`); closeModal(); localStorage.removeItem('kv.project'); P = null; await loadProjects(); }));
@@ -551,3 +554,164 @@ window.addEventListener('resize', () => P && renderTimeline());
 
 // ------------------------------------------------------------------ boot
 (async () => { await immichStatus(); await guard(loadProjects); })();
+
+// ================================================================== recording
+const REC = { stream: null, recorder: null, chunks: [], mode: 'clip', ctx: null, raf: 0, start: 0, playFrom: 0, timer: 0 };
+$('#recordBtn').onclick = openRecorder;
+document.addEventListener('keydown', e => { if (P && e.key === 'r' && !['INPUT', 'TEXTAREA', 'SELECT'].includes(e.target.tagName) && $('#modal').classList.contains('hidden')) openRecorder(); });
+
+function pickMime(kind) {
+  const cands = kind === 'voiceover'
+    ? ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
+    : ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
+  return cands.find(m => MediaRecorder.isTypeSupported(m)) || '';
+}
+
+async function openRecorder() {
+  if (!navigator.mediaDevices) return toast('Recording needs a secure context (localhost is fine)', true);
+  const portrait = P.layout && P.layout.orientation === 'portrait';
+  modal(`<div id="recBox">
+    <div class="row" style="justify-content:space-between"><h2 style="margin:0">Record</h2>
+      <div class="seg"><button class="tab active" data-rm="clip">Camera clip</button><button class="tab" data-rm="voiceover">Voiceover</button></div></div>
+    <video id="recPreview" autoplay muted playsinline class="${portrait ? 'portrait' : ''}"></video>
+    <div class="meter"><div class="lvl" id="recLvl"></div></div>
+    <div class="recgrid">
+      <div class="field"><label>Camera</label><select id="recCam"></select></div>
+      <div class="field"><label>Microphone</label><select id="recMic"></select></div>
+      <div class="field"><label>Quality</label><select id="recQ"><option value="1080">1080p</option><option value="720">720p</option><option value="2160">4K (if supported)</option></select></div>
+      <div class="field"><label>Options</label><div class="inline">
+        <label class="check" style="margin:0"><input type="checkbox" id="recMirror" checked> mirror preview</label>
+        <label class="check" style="margin:0"><input type="checkbox" id="recCover" ${portrait ? 'checked' : ''}> crop to fill frame</label></div></div>
+    </div>
+    <div id="recVoHint" class="muted hidden">The preview plays from <b id="recVoAt">${fmt(playheadTime())}</b> while you talk. Use headphones so the speakers don't bleed into the mic. Clip audio is ducked under your voice.</div>
+    <div class="recctl"><button class="recbtn" id="recGo" title="Start / stop"></button><span id="recTime">0:00.0</span><span id="recStatus" class="muted"></span><span class="spacer"></span><button class="btn" id="m_cancel">Close</button></div>
+  </div>`);
+  $('#m_cancel').onclick = closeRecorder;
+  $$('[data-rm]').forEach(b => b.onclick = () => { $$('[data-rm]').forEach(x => x.classList.toggle('active', x === b)); REC.mode = b.dataset.rm; applyRecMode(); startPreview(); });
+  $('#recCam').onchange = $('#recMic').onchange = $('#recQ').onchange = startPreview;
+  $('#recMirror').onchange = e => $('#recPreview').classList.toggle('nomirror', !e.target.checked);
+  $('#recGo').onclick = () => REC.recorder && REC.recorder.state === 'recording' ? stopRecording() : startRecording();
+  REC.mode = 'clip';
+  try {
+    // ask once so device labels are populated
+    const tmp = await navigator.mediaDevices.getUserMedia({ audio: true, video: true }).catch(() => navigator.mediaDevices.getUserMedia({ audio: true }));
+    tmp.getTracks().forEach(t => t.stop());
+    const devs = await navigator.mediaDevices.enumerateDevices();
+    const fill = (sel, kind, key) => {
+      const list = devs.filter(d => d.kind === kind);
+      sel.innerHTML = list.map(d => `<option value="${d.deviceId}">${esc(d.label || kind)}</option>`).join('') || '<option value="">none</option>';
+      const saved = localStorage.getItem(key); if (saved && list.some(d => d.deviceId === saved)) sel.value = saved;
+      sel.onchange = () => { localStorage.setItem(key, sel.value); startPreview(); };
+    };
+    fill($('#recCam'), 'videoinput', 'kv.cam'); fill($('#recMic'), 'audioinput', 'kv.mic');
+  } catch (e) { toast('Camera/microphone permission denied: ' + e.message, true); }
+  applyRecMode();
+  startPreview();
+}
+function applyRecMode() {
+  const vo = REC.mode === 'voiceover';
+  $('#recPreview').classList.toggle('hidden', vo);
+  $('#recCam').closest('.field').classList.toggle('hidden', vo);
+  $('#recQ').closest('.field').classList.toggle('hidden', vo);
+  $('#recVoHint').classList.toggle('hidden', !vo);
+  $('#recVoAt').textContent = fmt(playheadTime());
+}
+async function startPreview() {
+  stopStream();
+  const q = +$('#recQ').value;
+  const constraints = {
+    audio: { deviceId: $('#recMic').value ? { exact: $('#recMic').value } : undefined, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
+    video: REC.mode === 'voiceover' ? false : { deviceId: $('#recCam').value ? { exact: $('#recCam').value } : undefined, width: { ideal: q === 2160 ? 3840 : q === 720 ? 1280 : 1920 }, height: { ideal: q === 2160 ? 2160 : q }, frameRate: { ideal: 30 } },
+  };
+  try {
+    REC.stream = await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (e) { $('#recStatus').textContent = 'cannot open device: ' + e.message; return; }
+  const v = $('#recPreview'); v.srcObject = REC.stream;
+  const vt = REC.stream.getVideoTracks()[0];
+  $('#recStatus').textContent = vt ? `${vt.getSettings().width}×${vt.getSettings().height} · ${pickMime(REC.mode).split(';')[0]}` : pickMime(REC.mode).split(';')[0];
+  // level meter
+  try {
+    REC.ctx = REC.ctx || new AudioContext();
+    const src = REC.ctx.createMediaStreamSource(REC.stream);
+    const an = REC.ctx.createAnalyser(); an.fftSize = 1024; src.connect(an);
+    const buf = new Float32Array(an.fftSize);
+    const tick = () => { an.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x; const rms = Math.sqrt(s / buf.length); const db = 20 * Math.log10(rms || 1e-6); $('#recLvl').style.width = `${Math.max(0, Math.min(100, (db + 60) / 60 * 100))}%`; REC.raf = requestAnimationFrame(tick); };
+    cancelAnimationFrame(REC.raf); tick();
+  } catch { }
+}
+function stopStream() { cancelAnimationFrame(REC.raf); if (REC.stream) { REC.stream.getTracks().forEach(t => t.stop()); REC.stream = null; } }
+function closeRecorder() { if (REC.recorder && REC.recorder.state === 'recording') return toast('Stop the recording first'); stopStream(); closeModal(); }
+
+function startRecording() {
+  if (!REC.stream) return toast('No input device', true);
+  const mime = pickMime(REC.mode);
+  REC.chunks = [];
+  REC.recorder = new MediaRecorder(REC.stream, { mimeType: mime || undefined, videoBitsPerSecond: 16_000_000, audioBitsPerSecond: 192_000 });
+  REC.recorder.ondataavailable = e => { if (e.data.size) REC.chunks.push(e.data); };
+  REC.recorder.onstop = uploadRecording;
+  REC.start = performance.now();
+  if (REC.mode === 'voiceover') {
+    REC.playFrom = playheadTime();
+    if (mode !== 'timeline') setMode('timeline');
+    if (P.preview && player.src) { player.currentTime = REC.playFrom; player.play().catch(() => { }); }
+  }
+  REC.recorder.start(250);
+  $('#recGo').classList.add('on');
+  REC.timer = setInterval(() => { $('#recTime').textContent = fmt((performance.now() - REC.start) / 1000); if (REC.mode === 'voiceover' && player.ended) stopRecording(); }, 100);
+}
+function stopRecording() {
+  clearInterval(REC.timer); $('#recGo').classList.remove('on');
+  if (REC.mode === 'voiceover') player.pause();
+  if (REC.recorder && REC.recorder.state === 'recording') REC.recorder.stop();
+}
+async function uploadRecording() {
+  const blob = new Blob(REC.chunks, { type: REC.recorder.mimeType || 'video/webm' });
+  const secs = (performance.now() - REC.start) / 1000;
+  if (secs < 0.5) return toast('Too short, discarded');
+  const fd = new FormData();
+  fd.append('file', blob, 'rec.' + (blob.type.includes('mp4') ? 'mp4' : 'webm'));
+  fd.append('kind', REC.mode); fd.append('at', REC.mode === 'voiceover' ? REC.playFrom : 0); fd.append('add', 'true');
+  fd.append('fit', $('#recCover').checked ? 'cover' : 'contain');
+  $('#recStatus').textContent = `saving ${fmt(secs)} recording…`;
+  await guard(async () => {
+    const r = await api('POST', `/api/projects/${P.name}/record`, fd);
+    setProject(r.project);
+    toast(REC.mode === 'voiceover' ? `Voiceover added at ${fmt(REC.playFrom)}` : 'Recording added to timeline');
+    if (r.id && REC.mode === 'clip') select(r.id);
+    $('#recStatus').textContent = 'saved'; $('#recTime').textContent = '0:00.0';
+  });
+}
+
+// ================================================================== voiceover lane
+let selVo = null;
+function renderVoLane() {
+  const lane = $('#voLane'), track = $('#voTrack');
+  const vos = P.voiceovers || [];
+  lane.classList.toggle('hidden', !vos.length);
+  track.innerHTML = '';
+  if (!vos.length || !P.layout) return;
+  const total = Math.max(P.layout.total, 0.1);
+  for (const v of vos) {
+    const el = document.createElement('div');
+    el.className = 'vo' + (v.id === selVo ? ' selected' : '');
+    el.style.left = `${v.at / total * 100}%`; el.style.width = `${Math.max(1.5, (v.duration || 1) / total * 100)}%`;
+    el.textContent = `${v.id} ${fmt(v.at)}`; el.title = v.file;
+    el.onclick = () => { selVo = v.id; sel = null; $$('#timeline .block').forEach(b => b.classList.remove('selected')); renderVoLane(); renderVoInspector(v); };
+    track.appendChild(el);
+  }
+}
+function renderVoInspector(v) {
+  const el = $('#segInspector');
+  el.innerHTML = `<h3>Narration</h3><div class="muted" style="margin-bottom:8px">${esc(v.file)} · ${fmt(v.duration || 0)}${v.lufs != null ? ` · ${v.lufs.toFixed(1)} LUFS` : ''}</div>` +
+    field('Starts at (timeline)', `<div class="inline"><input type="text" id="voAt" value="${fmt(v.at, 2)}"><button class="btn small" id="voAtPh" title="use playhead">⟵ playhead</button></div>`) +
+    field('Volume', `<input type="range" id="voVol" min="0" max="2" step="0.1" value="${v.volume}">`) +
+    `<div class="check"><input type="checkbox" id="voDuck" ${v.duck_clips ? 'checked' : ''}><label for="voDuck">Duck clip audio under this</label></div>` +
+    `<div class="row"><button class="btn small" id="voPlay">▶ Listen</button><button class="btn small danger" id="voDel">Delete</button></div><audio id="voAudio" src="${v.url || ''}"></audio>`;
+  const patch = body => guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/voiceovers/${v.id}`, body)); const nv = P.voiceovers.find(x => x.id === v.id); if (nv) renderVoInspector(nv); });
+  $('#voAt').onchange = e => patch({ at: e.target.value }); $('#voAt').onkeydown = e => { if (e.key === 'Enter') e.target.blur(); };
+  $('#voAtPh').onclick = () => patch({ at: playheadTime() });
+  $('#voVol').onchange = e => patch({ volume: +e.target.value });
+  $('#voDuck').onchange = e => patch({ duck_clips: e.target.checked });
+  $('#voPlay').onclick = () => { const a = $('#voAudio'); a.paused ? a.play() : a.pause(); };
+  $('#voDel').onclick = () => guard(async () => { setProject(await api('DELETE', `/api/projects/${P.name}/voiceovers/${v.id}`)); selVo = null; renderInspector(); });
+}

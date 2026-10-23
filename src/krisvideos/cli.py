@@ -11,6 +11,7 @@
     vlog rm PROJECT SEG                      remove a segment
     vlog move PROJECT SEG INDEX              reorder
     vlog music PROJECT FILE [--volume 0.18]
+    vlog voiceover PROJECT FILE --at 0:12          narration layer at a timeline time (GUI can record these)
     vlog show PROJECT                        print the timeline
     vlog preview PROJECT [--open]            fast half-res render -> out/preview.mp4
     vlog render PROJECT [--open]             full-quality render -> out/<title>.mp4
@@ -224,6 +225,25 @@ def cmd_music(cfg, a):
     print("ok")
 
 
+def cmd_voiceover(cfg, a):
+    import shutil
+    p = _project(cfg, a.project)
+    if a.file in ("rm", "remove") and a.at:
+        p.voiceovers = [v for v in p.voiceovers if v.id != a.at]
+    else:
+        src = Path(a.file).expanduser().resolve()
+        p.ensure_dirs()
+        dst = p.audio_dir / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+        media.measure_loudness(dst, p.cache_dir)
+        vo = p.add_voiceover(f"audio/{dst.name}", parse_time(a.at or 0))
+        if a.volume is not None:
+            vo.volume = a.volume
+    p.save()
+    print("ok")
+
+
 def cmd_show(cfg, a):
     p = _project(cfg, a.project)
     layout = render.compute_layout(p)
@@ -244,6 +264,8 @@ def cmd_show(cfg, a):
             for ov in s.overlays:
                 desc += f"  overlay@{fmt_time(ov.at)}={ov.text!r}"
         print(f"  {s.id:>4}  {fmt_time(pl.start):>7} - {fmt_time(pl.end):<7} {desc}{tr}")
+    for v in p.voiceovers:
+        print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}")
     if p.music.file:
         print(f"  music: {p.music.file} vol={p.music.volume} duck={p.music.duck}")
 
@@ -301,6 +323,7 @@ def main(argv=None):
     s = sub.add_parser("rm"); s.add_argument("project"); s.add_argument("seg"); s.set_defaults(fn=cmd_rm)
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("music"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_music)
+    s = sub.add_parser("voiceover"); s.add_argument("project"); s.add_argument("file", help="audio file, or 'rm' with --at ID"); s.add_argument("--at", help="timeline time (or voiceover id with rm)"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_voiceover)
     s = sub.add_parser("show"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_show)
     for name, mode in (("preview", "preview"), ("render", "final")):
         s = sub.add_parser(name); s.add_argument("project", nargs="?"); s.add_argument("--open", action="store_true"); s.add_argument("--dry-run", action="store_true")

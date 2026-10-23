@@ -113,8 +113,7 @@ def prepare_async(p: Project, src_rel: str) -> None:
     """Kick off thumbnail + proxy generation in the background."""
     def work():
         try:
-            make_thumbnail(p, src_rel)
-            make_proxy(p, src_rel)
+            prepare(p, src_rel)
         except Exception as e:  # pragma: no cover
             print(f"[media] prepare failed for {src_rel}: {e}")
     _pool.submit(work)
@@ -123,7 +122,77 @@ def prepare_async(p: Project, src_rel: str) -> None:
 def prepare(p: Project, src_rel: str) -> None:
     make_thumbnail(p, src_rel)
     make_proxy(p, src_rel)
+    measure_loudness(p.resolve(src_rel), p.cache_dir)
 
 
 def media_status(p: Project, src_rel: str) -> dict:
     return {"proxy": proxy_path(p, src_rel).exists(), "thumb": thumb_path(p, src_rel).exists()}
+
+
+# --------------------------------------------------------------------------- loudness
+
+def measure_loudness(path: Path, cache_dir: Path | None = None) -> float | None:
+    """Integrated loudness (LUFS) of a file's audio via ffmpeg loudnorm; cached. None if no/silent audio."""
+    import json, re
+    path = Path(path)
+    cache = (cache_dir / (path.name + ".loud.json")) if cache_dir else None
+    if cache and cache.exists():
+        try:
+            d = json.loads(cache.read_text())
+            if d.get("size") == path.stat().st_size:
+                return d.get("lufs")
+        except Exception:
+            pass
+    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-vn", "-i", str(path), "-af",
+                        "loudnorm=print_format=json", "-f", "null", "-"], capture_output=True, text=True)
+    lufs: float | None = None
+    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
+    if m:
+        try:
+            v = float(json.loads(m.group(0))["input_i"])
+            lufs = v if v > -60 else None
+        except Exception:
+            lufs = None
+    if cache:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps({"size": path.stat().st_size, "lufs": lufs}))
+    return lufs
+
+
+def level_gain_db(lufs: float | None, target: float, limit: float = 12.0) -> float:
+    """Gain (dB) that moves `lufs` to `target`, clamped to ±limit."""
+    if lufs is None:
+        return 0.0
+    return max(-limit, min(limit, target - lufs))
+
+
+# --------------------------------------------------------------------------- recordings
+
+def ingest_recording(p: Project, blob: Path, kind: str, stamp: str) -> str:
+    """Transcode a browser MediaRecorder blob (webm/mp4) into a proper project asset.
+    kind='clip' -> clips/REC_<stamp>.mp4 (H.264 + AAC); kind='voiceover' -> audio/VO_<stamp>.m4a.
+    Returns the project-relative path."""
+    p.ensure_dirs()
+    if kind == "voiceover":
+        dst = p.audio_dir / f"VO_{stamp}.m4a"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(blob), "-vn",
+               "-af", "aresample=48000,highpass=f=70", "-c:a", "aac", "-b:a", "160k", "-ac", "1", "-movflags", "+faststart", str(dst)]
+        subprocess.run(cmd, check=True, capture_output=True, text=True)
+        rel = f"audio/{dst.name}"
+        measure_loudness(dst, p.cache_dir)
+        return rel
+    dst = p.clips_dir / f"REC_{stamp}.mp4"
+    info = probe(blob)
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(blob),
+           "-vf", "scale='min(1920,iw)':-2,fps=30,format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "12M",
+           "-profile:v", "high", "-color_primaries:v", "bt709", "-color_trc:v", "bt709", "-colorspace:v", "bt709"]
+    cmd += (["-af", "aresample=48000", "-c:a", "aac", "-b:a", "192k", "-ac", "2"] if info.has_audio else ["-an"])
+    cmd += ["-movflags", "+faststart", "-metadata", f"creation_time={stamp}", str(dst)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr[-500:])
+    rel = f"clips/{dst.name}"
+    probe(dst, p.cache_dir)
+    prepare(p, rel)
+    measure_loudness(dst, p.cache_dir)
+    return rel

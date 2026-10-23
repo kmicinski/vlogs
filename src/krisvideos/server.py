@@ -11,7 +11,7 @@ import webbrowser
 from pathlib import Path
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -20,7 +20,7 @@ from . import media, render
 from .cli import title_at
 from .config import Config
 from .probe import is_video, probe
-from .project import Overlay, Project, Segment
+from .project import Overlay, Project, Segment, Voiceover
 from .timeutil import parse_time
 
 WEB = Path(__file__).parent / "web"
@@ -86,6 +86,17 @@ class YamlIn(BaseModel):
     yaml: str
 
 
+def _cached_lufs(p: Project, rel: str):
+    import json
+    f = p.cache_dir / (Path(rel).name + ".loud.json")
+    if f.exists():
+        try:
+            return json.loads(f.read_text()).get("lufs")
+        except Exception:
+            return None
+    return None
+
+
 # --------------------------------------------------------------------------- app
 def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="krisvideos")
@@ -132,6 +143,7 @@ def create_app(cfg: Config) -> FastAPI:
             d["out"] = s.out
             d["title"] = s.text if s.kind == "title" else None
             d["overlays"] = [o.to_dict() for o in s.overlays]
+            d["fit"] = s.fit
             pl = placed.get(s.id)
             if pl:
                 d["placed"] = pl.to_dict()
@@ -143,7 +155,19 @@ def create_app(cfg: Config) -> FastAPI:
                 d["proxy_url"] = media_url(p, f"cache/{Path(s.src).name}.proxy.mp4") if st["proxy"] else None
                 d["thumb_url"] = media_url(p, f"cache/{Path(s.src).name}.thumb.jpg") if st["thumb"] else None
                 d["src_url"] = media_url(p, s.src)
+                d["lufs"] = _cached_lufs(p, s.src)
             segs.append(d)
+        vos = []
+        for v in p.voiceovers:
+            f = p.resolve(v.file)
+            vd = v.to_dict() | {"id": v.id, "at": v.at, "volume": v.volume, "duck_clips": v.duck_clips,
+                                "missing": not f.exists(), "url": media_url(p, v.file) if f.exists() else None}
+            try:
+                vd["duration"] = probe(f, p.cache_dir).duration if f.exists() else 0
+            except Exception:
+                vd["duration"] = 0
+            vd["lufs"] = _cached_lufs(p, v.file)
+            vos.append(vd)
         clips = []
         for f in sorted(p.clips_dir.glob("*")) if p.clips_dir.exists() else []:
             if not is_video(f):
@@ -166,7 +190,7 @@ def create_app(cfg: Config) -> FastAPI:
         return {
             "name": p.name, "title": p.title, "date": p.date, "folder": str(p.folder),
             "output": p.output.__dict__, "style": p.style.__dict__, "music": p.music.__dict__, "audio": p.audio.__dict__,
-            "timeline": segs, "clips": clips,
+            "timeline": segs, "clips": clips, "voiceovers": vos,
             "layout": {"width": layout.width, "height": layout.height, "total": layout.total, "fps": layout.fps,
                        "orientation": layout.orientation} if layout else None,
             "preview": {"url": media_url(p, "out/preview.mp4") + f"?v={int(preview.stat().st_mtime)}",
@@ -333,6 +357,8 @@ def create_app(cfg: Config) -> FastAPI:
                 setattr(s, k, float(v))
             elif k == "mute":
                 s.mute = bool(v)
+            elif k == "fit":
+                s.fit = "cover" if v == "cover" else "contain"
             elif k in ("caption", "subtitle", "transition", "note"):
                 setattr(s, k, v if v != "" else ("" if k in ("subtitle", "note") else None))
         p.save()
@@ -442,6 +468,82 @@ def create_app(cfg: Config) -> FastAPI:
             if is_video(f):
                 media.prepare_async(p, f"clips/{f.name}")
         return {"ok": True}
+
+    # ------------------------------------------------------------------ recording / voiceovers
+    @app.post("/api/projects/{name}/record")
+    async def record(name: str, file: UploadFile = File(...), kind: str = Form("clip"), at: float = Form(0.0),
+                     add: str = Form("true"), fit: str = Form("")):
+        """Receive a MediaRecorder blob, transcode it, and add it to the project."""
+        add = str(add).lower() in ("1", "true", "yes", "on")
+        p = load(name)
+        p.ensure_dirs()
+        stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        ext = ".webm" if "webm" in (file.content_type or "") else ".mp4"
+        blob = p.cache_dir / f"rec_{stamp}{ext}"
+        with open(blob, "wb") as out:
+            while chunk := await file.read(1 << 20):
+                out.write(chunk)
+        if blob.stat().st_size < 1000:
+            blob.unlink()
+            raise HTTPException(400, "recording was empty")
+        try:
+            rel = media.ingest_recording(p, blob, kind, stamp)
+        except Exception as e:
+            raise HTTPException(500, f"could not convert recording: {e}")
+        finally:
+            blob.unlink(missing_ok=True)
+        p = Project.load(p.folder)
+        if kind == "voiceover":
+            vo = p.add_voiceover(rel, max(0.0, at))
+            new_id = vo.id
+        else:
+            seg = p.add_clip(rel) if add else None
+            if seg is not None and fit in ("cover", "contain"):
+                seg.fit = fit
+            new_id = seg.id if seg else None
+        p.save()
+        return {"added": rel, "id": new_id, "project": project_json(p)}
+
+    @app.post("/api/projects/{name}/voiceovers")
+    def add_voiceover(name: str, body: dict):
+        p = load(name)
+        src = Path(body["file"]).expanduser()
+        if not src.exists():
+            raise HTTPException(400, f"not found: {src}")
+        p.ensure_dirs()
+        dst = p.audio_dir / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+        media.measure_loudness(dst, p.cache_dir)
+        p.add_voiceover(f"audio/{dst.name}", float(body.get("at", 0)))
+        p.save()
+        return project_json(p)
+
+    @app.patch("/api/projects/{name}/voiceovers/{vid}")
+    def patch_voiceover(name: str, vid: str, body: dict):
+        p = load(name)
+        v = p.voiceover(vid)
+        if "at" in body:
+            v.at = max(0.0, parse_time(body["at"]))
+        if "volume" in body:
+            v.volume = float(body["volume"])
+        if "duck_clips" in body:
+            v.duck_clips = bool(body["duck_clips"])
+        if "note" in body:
+            v.note = str(body["note"])
+        p.voiceovers.sort(key=lambda x: x.at)
+        p.save()
+        return project_json(p)
+
+    @app.delete("/api/projects/{name}/voiceovers/{vid}")
+    def delete_voiceover(name: str, vid: str, remove_file: bool = False):
+        p = load(name)
+        v = p.voiceover(vid)
+        p.voiceovers = [x for x in p.voiceovers if x.id != vid]
+        if remove_file:
+            p.resolve(v.file).unlink(missing_ok=True)
+        p.save()
+        return project_json(p)
 
     # ------------------------------------------------------------------ immich
     @app.get("/api/immich/videos")

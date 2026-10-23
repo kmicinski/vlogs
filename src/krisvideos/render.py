@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import titles
+from . import media, titles
 from .probe import MediaInfo, probe
 from .project import Overlay, Project, Segment
 
@@ -90,16 +90,18 @@ def probe_project(p: Project) -> dict[str, MediaInfo]:
 def pick_orientation(p: Project, infos: dict[str, MediaInfo]) -> str:
     if p.output.orientation != "auto":
         return p.output.orientation
-    portrait = landscape = 0
+    # Vote by total duration. Clips set to crop-to-fill (e.g. webcam recordings) adapt to any
+    # canvas, so they only vote when nothing else does.
+    votes = {"contain": [0.0, 0.0], "cover": [0.0, 0.0]}
     for s in p.timeline:
         if s.kind == "clip" and s.src in infos:
-            if infos[s.src].portrait:
-                portrait += 1
-            else:
-                landscape += 1
-    if portrait == 0 and landscape == 0:
+            info = infos[s.src]
+            dur = (info.duration if s.out is None else s.out) - s.in_
+            votes[s.fit if s.fit == "cover" else "contain"][0 if info.portrait else 1] += max(0.0, dur)
+    por, land = votes["contain"] if sum(votes["contain"]) > 0 else votes["cover"]
+    if por == 0 and land == 0:
         return "landscape"
-    return "portrait" if portrait >= landscape else "landscape"
+    return "portrait" if por >= land else "landscape"
 
 
 def compute_layout(p: Project, infos: dict[str, MediaInfo] | None = None, scale: float = 1.0) -> Layout:
@@ -236,9 +238,12 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             if info.hdr and hdr_mode != "none":
                 any_hdr = True
                 vchain.append(_hdr_chain(hdr_mode, fw, fh).rstrip(","))
-            vchain.append(f"scale={fw}:{fh}:flags=bicubic")
-            if (fw, fh) != (W, H):
-                vchain.append(f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black")
+            if s.fit == "cover":
+                vchain.append(f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=bicubic,crop={W}:{H}")
+            else:
+                vchain.append(f"scale={fw}:{fh}:flags=bicubic")
+                if (fw, fh) != (W, H):
+                    vchain.append(f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black")
             vchain.append(f"setsar=1,fps={FPS},format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS")
             filters.append(f"[{k}:v]{','.join(vchain)}[vb{i}]")
             cur = f"vb{i}"
@@ -268,8 +273,11 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 if s.speed != 1.0:
                     achain.append(_atempo(s.speed))
                 achain.append(AUDIO_FMT)
-                if s.volume != 1.0:
-                    achain.append(f"volume={s.volume}")
+                gain = 0.0
+                if p.audio.match_levels:
+                    gain = media.level_gain_db(media.measure_loudness(src, p.cache_dir), p.audio.target_lufs)
+                if s.volume != 1.0 or abs(gain) > 0.1:
+                    achain.append(f"volume={s.volume}*{10 ** (gain / 20):.4f}")
                 achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
                 filters.append(f"[{k}:a]{','.join(achain)}[a{i}]")
             else:
@@ -304,6 +312,31 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         vf.append(f"fade=t=out:st={total - fo:.3f}:d={fo:.3f}")
     vf.append("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
     filters.append(f"[{V}]{','.join(vf)}[vout]")
+
+    # voiceovers (narration layers), mixed over the segment audio with optional ducking
+    vos = [v for v in p.voiceovers if p.resolve(v.file).exists() and v.at < total]
+    for v in p.voiceovers:
+        if not p.resolve(v.file).exists():
+            warnings.append(f"voiceover file not found: {v.file}")
+    if vos:
+        labels = []
+        for n, v in enumerate(vos):
+            kv = add_input(["-i", str(p.resolve(v.file))])
+            gain = media.level_gain_db(media.measure_loudness(p.resolve(v.file), p.cache_dir), p.audio.target_lufs) if p.audio.match_levels else 0.0
+            filters.append(f"[{kv}:a]{AUDIO_FMT},volume={v.volume}*{10 ** (gain / 20):.4f},"
+                           f"adelay={int(v.at * 1000)}:all=1,atrim=duration={total:.3f},apad=whole_dur={total:.3f}[vo{n}]")
+            labels.append(f"vo{n}")
+        if len(labels) == 1:
+            filters.append(f"[{labels[0]}]anull[vobus]")
+        else:
+            filters.append("".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[vobus]")
+        if any(v.duck_clips for v in vos):
+            filters.append("[vobus]asplit[vomix][vokey]")
+            filters.append(f"[{A}][vokey]sidechaincompress=threshold=0.03:ratio=6:attack=80:release=700:makeup=1[Aducked]")
+            filters.append("[Aducked][vomix]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
+        else:
+            filters.append(f"[{A}][vobus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
+        A = "Avo"
 
     # music
     if p.music.file:

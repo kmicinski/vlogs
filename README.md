@@ -36,6 +36,20 @@ Immich URL + API key (Immich → Account settings → API keys), the vlogs folde
 4. Press **Preview** (⌘⏎). Scrub it; press `T` to *cut to a title card here*, `S` to split.
 5. Press **Render** → *Show in Finder* → AirDrop / iMessage.
 
+### Recording in the app
+Press **⏺ Record** (or `R`). Pick any camera and microphone the Mac sees (built-in, USB
+camera, capture card, audio interface). Two modes:
+
+- **Camera clip**: a talking-head segment that lands on the timeline like any other clip.
+  "Crop to fill frame" (default for portrait vlogs) center-crops a 16:9 camera into 9:16.
+- **Voiceover**: the preview plays from the playhead while you talk. The narration becomes a
+  layer on the *Narration* lane under the timeline, starting at that time; clip audio is
+  ducked under your voice. Wear headphones. Narration layers are `voiceovers:` in the YAML.
+
+Audio mixing: every clip and voiceover is measured (LUFS) on import and auto-gained toward
+a common level (*Match clip & voice levels*), music ducks under speech, and the final mix
+is loudness-normalized. Per-clip volume/mute and fit are in the inspector.
+
 Keyboard: `space` play · `I`/`O` in/out · `T` title at playhead · `S` split · `C` toggle
 Clip/Timeline · `⌫` delete · `↑↓` select · `←→` frame step · `⌘⏎` preview · `⇧⌘⏎` render.
 
@@ -62,6 +76,10 @@ timeline:
   mute: true
   overlays:
   - {text: look at this dog, at: 1.5, for: 3, style: big, position: center}
+- clip: clips/REC_20261023-183012.mp4   # recorded in the app
+  fit: cover                            # crop to fill instead of letterbox
+voiceovers:
+- {file: audio/VO_20261023-183401.m4a, at: 0:12, volume: 1.0, duck_clips: true}
 ```
 
 ## CLI
@@ -74,6 +92,7 @@ vlog title-at PROJ 0:32 "Lunch"            split at 0:32 on the output timeline,
 vlog caption PROJ s3 "coffee first" [--at 2 --dur 3]
 vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true transition=fade
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
+vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --at v1 to remove)
 vlog preview PROJ [--open] · vlog render PROJ [--open] · vlog serve [--open]
 ```
 `PROJ` is a folder name under `~/Vlogs` (or a path). Segments are addressed by id (`s3`) or index.
@@ -88,5 +107,6 @@ src/krisvideos/
   cli.py       `vlog`                              web/        the GUI (vanilla JS)
 scripts/make_app.py   builds dist/KrisVideos.app
 ```
-Each vlog folder: `project.yaml`, `clips/` (originals), `cache/` (proxies, thumbs, title
-PNGs, probe json), `out/` (`preview.mp4`, final `<title>.mp4`).
+Each vlog folder: `project.yaml`, `clips/` (originals + `REC_*` recordings), `audio/`
+(`VO_*` voiceovers), `cache/` (proxies, thumbs, title PNGs, probe/loudness json), `out/`
+(`preview.mp4`, final `<title>.mp4`).

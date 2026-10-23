@@ -125,3 +125,24 @@ h3 { margin: 4px 0 10px; font-size: 13px; text-transform: uppercase; letter-spac
 #toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: #2a2a33; border: 1px solid var(--line); padding: 8px 14px; border-radius: 8px; z-index: 20; box-shadow: 0 8px 30px #0008; }
 #toast.err { border-color: var(--danger); color: #ffb3ae; }
 kbd { background: #0f0f13; border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; font-family: inherit; font-size: 11px; }
+
+.btn.rec { color: #ff7b72; }
+#voLane { display: flex; align-items: center; gap: 8px; padding: 2px 0 8px; }
+#voLane .lanelbl { font-size: 11px; color: var(--muted); width: 60px; flex: none; }
+#voTrack { position: relative; flex: 1; height: 22px; background: #0f0f13; border-radius: 5px; overflow: hidden; }
+.vo { position: absolute; top: 2px; height: 18px; border-radius: 4px; background: #c2652a; color: #fff; font-size: 10px; line-height: 18px; padding: 0 6px; white-space: nowrap; overflow: hidden; cursor: pointer; min-width: 10px; border: 1px solid transparent; }
+.vo.selected { border-color: #fff; box-shadow: 0 0 0 1px var(--accent); }
+/* record panel */
+#recBox { width: 640px; }
+#recPreview { width: 100%; aspect-ratio: 16/9; background: #000; border-radius: 8px; object-fit: contain; transform: scaleX(-1); }
+#recPreview.nomirror { transform: none; }
+#recPreview.portrait { aspect-ratio: 9/16; max-height: 46vh; margin: 0 auto; display: block; width: auto; }
+.meter { height: 10px; background: #0f0f13; border-radius: 5px; overflow: hidden; margin: 8px 0; }
+.meter .lvl { height: 100%; width: 0; background: linear-gradient(90deg, #41c47a 70%, #f0a33a 85%, #e5584f); transition: width .05s linear; }
+.recctl { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.recbtn { width: 56px; height: 56px; border-radius: 50%; border: 3px solid #fff; background: #e5584f; cursor: pointer; }
+.recbtn.on { border-radius: 10px; background: #b33; animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .6; } }
+#recTime { font-size: 22px; font-variant-numeric: tabular-nums; }
+.recgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 8px; }
+.recgrid select { width: 100%; }

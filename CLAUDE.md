@@ -18,6 +18,13 @@ Projects live in `~/Vlogs/<name>/` (configurable: `vlog config`). Times in the Y
 *source-clip* seconds for `in`/`out`; `vlog title-at` takes *output-timeline* time.
 `in`/`out` accept `12.5` or `0:12.5`. Segment ids (`s3`) are stable; the GUI shows them in `vlog show`.
 
+Recording: the browser's MediaRecorder posts a webm/mp4 blob to `POST /record`;
+`media.ingest_recording` transcodes it to `clips/REC_*.mp4` or `audio/VO_*.m4a`. Voiceovers are
+`project.voiceovers` (output-timeline `at`), mixed in `render.py` after the segment join with
+sidechain ducking of clip audio; music ducking keys off that bus. Level matching uses cached
+per-file LUFS (`cache/*.loud.json`, `media.measure_loudness`) with ±12 dB gain toward
+`audio.target_lufs`. `fit: cover` clips are excluded from the auto-orientation vote.
+
 ## Development
 - `uv sync`; run with `.venv/bin/vlog ...`; GUI: `.venv/bin/vlog serve --port 8799`.
 - Test with synthetic clips (`ffmpeg -f lavfi -i testsrc2=size=1080x1920:rate=30 ...`) and
