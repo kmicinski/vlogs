@@ -768,7 +768,7 @@ def create_app(cfg: Config) -> FastAPI:
     return app
 
 
-PID_FILE = Path.home() / "Library" / "Application Support" / "krisvideos" / "server.pid"
+PID_DIR = Path.home() / "Library" / "Application Support" / "krisvideos"
 
 
 def serve(cfg: Config, port: int = 8765, open_browser: bool = False):
@@ -776,8 +776,8 @@ def serve(cfg: Config, port: int = 8765, open_browser: bool = False):
     import uvicorn
     app = create_app(cfg)
     try:  # the .app launcher uses this to restart a server running stale code
-        PID_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PID_FILE.write_text(f"{os.getpid()} {port}\n")
+        PID_DIR.mkdir(parents=True, exist_ok=True)
+        (PID_DIR / f"server-{port}.pid").write_text(f"{os.getpid()}\n")
     except OSError:
         pass
     url = f"http://127.0.0.1:{port}"

@@ -85,9 +85,9 @@ export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
 alive() {{ curl -s --max-time 1 "$URL/api/settings" >/dev/null 2>&1; }}
 
 # If a server is running but the code changed since it started, restart it.
-PIDF="$HOME/Library/Application Support/krisvideos/server.pid"
+PIDF="$HOME/Library/Application Support/krisvideos/server-$PORT.pid"
 if alive && [ -f "$PIDF" ]; then
-  PID=$(cut -d' ' -f1 "$PIDF")
+  PID=$(cat "$PIDF")
   if [ -n "$(find "$REPO/src" -newer "$PIDF" -name '*.py' -o -newer "$PIDF" -name '*.js' -o -newer "$PIDF" -name '*.css' -o -newer "$PIDF" -name '*.html' 2>/dev/null | head -1)" ]; then
     kill "$PID" 2>/dev/null; sleep 1
   fi
