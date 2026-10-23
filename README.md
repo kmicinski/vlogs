@@ -33,12 +33,17 @@ Immich URL + API key (Immich → Account settings → API keys), the vlogs folde
 1. **Project name ▸ New vlog** (⌘N). You get an opening title card automatically.
 2. **+ Add ▸ From Immich** → pick the day → *Add all*.
 3. Scrub the timeline (drag the ruler or the bar under the player). The player plays the
-   timeline **live from proxies** so there is nothing to wait for. Press `T` to cut to a
-   title card at the playhead, `S` to split, `I`/`O` to trim to the playhead, or drag the
-   blue handles on a selected clip. Click a block for the inspector (captions, speed, fit…).
-4. **Render preview** (⌘⏎) when you want to hear the real mix and see transitions; the
-   player switches to it automatically while it's up to date.
-5. **Export** → *Show in Finder* → AirDrop / iMessage.
+   timeline **live from proxies**, including title cards, captions, crossfades, music and
+   narration, so there is nothing to wait for. Press `T` to cut to a title card at the
+   playhead, `S` to split, `I`/`O` to trim to the playhead, or drag the blue handles on a
+   selected clip (they snap to the playhead). Click a block for the inspector (captions,
+   speed, fit, title colors and layout…). ⌘Z undoes anything. ⌘-scroll zooms.
+4. **Render preview** (⌘⏎) for the exact ffmpeg output; the player switches to it
+   automatically while it's up to date.
+5. **Export ▾** → pick a preset (Share 1080p, Small 720p, HEVC, 4K) → *Show in Finder*.
+
+A new vlog can pull that day's clips from Immich automatically (checkbox in *New vlog*),
+in the order they were shot.
 
 ### Recording in the app
 Press **⏺ Record** (or `R`). Pick any camera and microphone the Mac sees (built-in, USB
@@ -57,8 +62,8 @@ a common level (*Match clip & voice levels*), music ducks under speech, and the 
 is loudness-normalized. Per-clip volume/mute and fit are in the inspector.
 
 Keyboard: `space` play · `I`/`O` trim start/end to playhead · `T` title here · `S` split ·
-`R` record · `⌫` delete · `↑↓` select · `[` `]` reorder · `←→` frame step · `⌘⏎` render
-preview · `⇧⌘⏎` export.
+`R` record · `⌫` delete · `↑↓` select · `[` `]` reorder · `←→` frame step · `⌘Z` undo ·
+`⌘+/−/0` zoom · `F` fullscreen · `?` help · `⌘⏎` render preview · `⇧⌘⏎` export.
 
 ## The script (`project.yaml`)
 
@@ -78,6 +83,9 @@ timeline:
 - title: Lunch
   duration: 2
   transition: dip                    # transition *into* this segment
+  layout: lower                      # lower-third style; bg/fg override the project colors
+  bg: "#f4efe6"
+  fg: "#1d1d1f"
 - clip: clips/IMG_4830.MOV
   speed: 1.5
   mute: true
@@ -101,6 +109,7 @@ vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true 
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
 vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --at v1 to remove)
 vlog preview PROJ [--open] · vlog render PROJ [--open] · vlog serve [--open]
+vlog undo PROJ · vlog redo PROJ
 ```
 `PROJ` is a folder name under `~/Vlogs` (or a path). Segments are addressed by id (`s3`) or index.
 

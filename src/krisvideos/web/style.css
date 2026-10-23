@@ -61,10 +61,14 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 #playerBox { position: relative; flex: 1; min-height: 200px; display: flex; align-items: center; justify-content: center; }
 #canvas { position: relative; aspect-ratio: 16 / 9; height: 100%; max-width: 100%; max-height: 100%; background: #000; border-radius: 14px; overflow: hidden; box-shadow: var(--shadow); }
 #canvas video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
-#card { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 8%; }
-#card .rule { width: 36px; height: 2px; border-radius: 2px; margin-bottom: 18px; }
-#card .t { font-size: clamp(22px, 4vw, 44px); font-weight: 700; letter-spacing: -.5px; line-height: 1.15; }
-#card .s { margin-top: 10px; font-size: clamp(12px, 1.6vw, 18px); }
+.tcard { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 8%; }
+.tcard .rule { width: 36px; height: 2px; border-radius: 2px; margin-bottom: 18px; }
+.tcard .t { font-size: clamp(22px, 4vw, 44px); font-weight: 700; letter-spacing: -.5px; line-height: 1.15; }
+.tcard .s { margin-top: 10px; font-size: clamp(12px, 1.6vw, 18px); }
+.tcard.lower { align-items: flex-start; justify-content: flex-end; text-align: left; padding: 9% 9% 14%; }
+.tcard.lower .rule { margin-bottom: 12px; }
+#canvas video.top, #canvas .tcard.top { z-index: 2; }
+#modeChip { z-index: 4; }
 #capLayer { position: absolute; inset: 0; pointer-events: none; }
 .capPill { position: absolute; left: 50%; transform: translateX(-50%); bottom: 9%; background: rgba(0,0,0,.6); color: #fff; padding: .5em 1em; border-radius: 999px; font-size: clamp(11px, 1.5vw, 16px); white-space: nowrap; max-width: 90%; overflow: hidden; text-overflow: ellipsis; }
 .capPill.top { bottom: auto; top: 8%; } .capPill.center { bottom: auto; top: 50%; transform: translate(-50%, -50%); }
@@ -106,8 +110,18 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 .block.selected { outline-width: 2px; z-index: 2; }
 .block.dragover { outline: 2px dashed var(--accent); }
 .block .strip { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: left; pointer-events: none; }
+.block .wave { position: absolute; left: 0; right: 0; bottom: 0; height: 20px; width: 100%; opacity: .85; pointer-events: none; }
+.block.pending { background: linear-gradient(90deg, #e6e8ee 25%, #f2f3f6 50%, #e6e8ee 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
+@keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+.lane .vo img, .lane .mu img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .7; pointer-events: none; }
+.lane .vo span, .lane .mu span { position: relative; }
+.zoom { display: inline-flex; align-items: center; gap: 2px; margin-left: 6px; }
+.iconbtn.sm { width: 24px; height: 24px; font-size: 13px; }
+#dropHint { position: fixed; inset: 10px; border: 2px dashed var(--accent); border-radius: 16px; background: rgba(229,240,255,.85); display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: var(--accent); z-index: 50; pointer-events: none; }
+.kbd-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; align-items: center; font-size: 13px; }
+.kbd-grid kbd { font-size: 12px; padding: 2px 6px; justify-self: start; }
 .block .lbl { position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 7px; font-size: 11px; font-weight: 500; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.55)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-.block.title .lbl { background: none; font-size: 12px; bottom: auto; top: 50%; transform: translateY(-50%); text-align: center; }
+.block.title .lbl { background: none; font-size: 12px; bottom: auto; top: 50%; transform: translateY(-50%); text-align: center; color: inherit; }
 .block .meta { position: absolute; left: 6px; top: 4px; font-size: 10px; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.6); pointer-events: none; }
 .block .cap { position: absolute; right: 6px; top: 4px; font-size: 10px; color: #fff; background: rgba(0,0,0,.45); padding: 1px 6px; border-radius: 6px; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 .block .xf { position: absolute; left: 0; top: 0; bottom: 0; width: 10px; background: linear-gradient(90deg, rgba(0,0,0,.35), transparent); pointer-events: none; }

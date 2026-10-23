@@ -11,11 +11,13 @@
 <header id="top">
   <button id="projBtn" class="projbtn" title="Switch vlog"><span id="projTitle">KrisVideos</span><span class="chev">›</span></button>
   <span id="projMeta" class="meta"></span>
+  <button id="undoBtn" class="iconbtn" title="Undo (⌘Z)" disabled><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4 2.5 7.5 6 11"/><path d="M3 7.5h6.5a3.5 3.5 0 0 1 0 7H8"/></svg></button>
+  <button id="redoBtn" class="iconbtn" title="Redo (⇧⌘Z)" disabled><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m10 4 3.5 3.5L10 11"/><path d="M13 7.5H6.5a3.5 3.5 0 0 0 0 7H8"/></svg></button>
   <span class="spacer"></span>
   <button id="addBtn" class="pill">+ Add</button>
   <button id="scriptBtn" class="pill ghost" title="Edit the project script">Script</button>
   <button id="renderPreviewBtn" class="pill ghost" title="Render an accurate preview with transitions, music and narration (⌘⏎)">Render preview</button>
-  <button id="exportBtn" class="pill primary" title="Export the finished video (⇧⌘⏎)">Export</button>
+  <button id="exportBtn" class="pill primary" title="Export the finished video (⇧⌘⏎)">Export ▾</button>
   <button id="gearBtn" class="iconbtn" title="Settings">⚙︎</button>
 </header>
 
@@ -25,7 +27,8 @@
       <div id="canvas">
         <video id="vA" playsinline preload="auto"></video>
         <video id="vB" playsinline preload="auto" class="hidden"></video>
-        <div id="card" class="hidden"><div class="rule"></div><div class="t"></div><div class="s"></div></div>
+        <div id="cardA" class="tcard hidden"><div class="rule"></div><div class="t"></div><div class="s"></div></div>
+        <div id="cardB" class="tcard hidden"><div class="rule"></div><div class="t"></div><div class="s"></div></div>
         <div id="capLayer"></div>
         <div id="stageEmpty" class="hidden"></div>
         <div id="modeChip"></div>
@@ -51,6 +54,8 @@
         <button class="link" data-act="addTitle">+ Title</button>
         <button class="link" data-act="record">⏺ Record</button>
         <button class="link" data-act="music">♫ Music</button>
+        <span class="zoom"><button class="iconbtn sm" id="zoomOut" title="Zoom out (⌘−)">−</button><button class="link muted" id="zoomFit" title="Fit (⌘0)">fit</button><button class="iconbtn sm" id="zoomIn" title="Zoom in (⌘+)">+</button></span>
+        <button class="iconbtn sm" id="helpBtn" title="Keyboard shortcuts (?)">?</button>
       </div>
       <div id="tl">
         <div id="ruler"></div>

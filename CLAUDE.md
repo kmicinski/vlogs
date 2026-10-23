@@ -18,9 +18,13 @@ Projects live in `~/Vlogs/<name>/` (configurable: `vlog config`). Times in the Y
 *source-clip* seconds for `in`/`out`; `vlog title-at` takes *output-timeline* time.
 `in`/`out` accept `12.5` or `0:12.5`. Segment ids (`s3`) are stable; the GUI shows them in `vlog show`.
 
-GUI player: `web/app.js` `VP` plays the timeline live from clip proxies (two `<video>` elements,
-master clock, title cards and captions drawn in HTML) and switches to `out/preview.mp4` when it is
-newer than project.yaml. Timeline blocks show per-range filmstrips from `GET /strip`.
+GUI player: `web/app.js` `VP` plays the timeline live from clip proxies (two `<video>` layers +
+two HTML title-card layers so fades/dips crossfade; `AUD` plays music + narration `<audio>` with
+approximate ducking and per-clip LUFS gain) and switches to `out/preview.mp4` when it is newer
+than project.yaml. Timeline blocks show per-range filmstrips (`GET /strip`) and waveforms
+(`GET /wave`). Every mutating endpoint goes through `commit(p)` which records undo history
+(`cache/history.json`, `POST /undo` `/redo`, `vlog undo`). Segment joins: runs of cuts use one
+`concat` with v+a together; fades join runs with xfade/acrossfade.
 Recording: MediaRecorder chunks are POSTed to `record/start` → `record/{id}/chunk?seq=n` (appended
 + fsynced to `cache/recordings/<id>.part`) → `record/{id}/finish`; `GET /recordings` lists
 unfinished sessions for recovery. The legacy one-shot `POST /record` still exists;
