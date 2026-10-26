@@ -17,8 +17,9 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import media, render
-from .cli import title_at
+from . import edits, media, render
+from .cli import new_project as make_project, masthead_rel, sting_rel
+from .edits import title_at
 from .config import Config
 from .probe import is_video, probe
 from .project import Overlay, Project, Segment, Voiceover
@@ -40,12 +41,13 @@ class Job:
         self.error = ""
         self.output = ""
         self.warnings: list[str] = []
+        self.added: list[str] = []          # import jobs: project-relative paths brought in
         self.cancel = threading.Event()
         self.started = time.time()
 
     def to_dict(self):
         return {k: getattr(self, k) for k in ("id", "kind", "project", "status", "progress", "secs", "message",
-                                                 "error", "output", "warnings")} | {"elapsed": round(time.time() - self.started, 1)}
+                                                 "error", "output", "warnings", "added")} | {"elapsed": round(time.time() - self.started, 1)}
 
 
 JOBS: dict[str, Job] = {}
@@ -74,13 +76,25 @@ class SettingsIn(BaseModel):
     default_title_subtitle: str | None = None
     default_music: str | None = None
     default_transition: str | None = None
+    default_title_kicker: str | None = None
+    masthead_image: str | None = None
+    intro_black_hold: float | None = None
+    intro_masthead_seconds: float | None = None
+    intro_title_seconds: float | None = None
+    intro_sting: str | None = None
+    intro_sting_start: float | None = None
+    intro_sting_volume: float | None = None
     font: str | None = None
+    title_bg: str | None = None
+    title_fg: str | None = None
+    title_accent: str | None = None
 
 
 class NewProject(BaseModel):
     name: str | None = None
     title: str | None = None
     opening: bool = True
+    trim: bool = False          # leave pulled clips off the timeline (the GUI opens them in the trimmer)
     pull_immich: bool = False
 
 
@@ -163,6 +177,71 @@ def _cached_lufs(p: Project, rel: str):
 
 
 # --------------------------------------------------------------------------- app
+def _asset_dest(p: Project, name: str, size: int | None = None) -> Path:
+    """A free path in assets/ for `name` (reusing an existing file only when it is the same size)."""
+    d = p.folder / "assets"
+    d.mkdir(parents=True, exist_ok=True)
+    dst, stem, suf, n = d / name, Path(name).stem, Path(name).suffix, 2
+    while dst.exists() and (size is None or dst.stat().st_size != size):
+        dst = d / f"{stem}_{n}{suf}"
+        n += 1
+    return dst
+
+
+def _browser_image(path: Path) -> Path:
+    """HEIC/HEIF (iPhone photos) -> JPEG next to it, so browsers and Pillow can use it."""
+    if path.suffix.lower() not in (".heic", ".heif"):
+        return path
+    jpg = path.with_suffix(".jpg")
+    if not jpg.exists():
+        r = subprocess.run(["sips", "-s", "format", "jpeg", str(path), "--out", str(jpg)], capture_output=True, text=True)
+        if r.returncode != 0 or not jpg.exists():
+            raise HTTPException(400, f"could not convert {path.name}: {r.stderr.strip()[:200]}")
+    path.unlink(missing_ok=True)
+    return jpg
+
+
+def _import_asset(p: Project, path: str) -> str:
+    """An image for a card or for the images track: project-relative paths are kept; absolute paths
+    are copied into assets/ (HEIC photos become JPEG)."""
+    src = Path(path).expanduser()
+    if not src.is_absolute():
+        if not p.resolve(path).exists():
+            raise HTTPException(400, f"missing {path}")
+        return path
+    if not src.exists():
+        raise HTTPException(400, f"missing {path}")
+    dst = _asset_dest(p, src.name, src.stat().st_size)
+    if not dst.exists():
+        shutil.copy2(src, dst)
+    return f"assets/{_browser_image(dst).name}"
+
+
+_IMG_SIZE: dict[tuple, tuple[int, int]] = {}
+
+
+def _image_size(path: Path) -> tuple[int, int]:
+    key = (str(path), path.stat().st_mtime_ns)
+    if key not in _IMG_SIZE:
+        from PIL import Image
+        try:
+            with Image.open(path) as im:
+                _IMG_SIZE[key] = im.size
+        except Exception:
+            _IMG_SIZE[key] = (0, 0)
+    return _IMG_SIZE[key]
+
+
+def _box(v) -> tuple | None:
+    """A box from the API: null/"full" = full screen, else {x, y, w} or [x, y, w] fractions of the frame."""
+    if v in (None, "", "full"):
+        return None
+    if isinstance(v, dict):
+        v = (v.get("x", 0.5), v.get("y", 0.5), v.get("w", 0.4))
+    x, y, w = (float(t) for t in v)
+    return (max(-0.5, min(1.5, x)), max(-0.5, min(1.5, y)), max(0.03, min(2.0, w)))
+
+
 def create_app(cfg: Config) -> FastAPI:
     app = FastAPI(title="krisvideos")
     root = cfg.vlogs_path
@@ -181,8 +260,14 @@ def create_app(cfg: Config) -> FastAPI:
         return p
 
     def commit(p: Project) -> None:
-        """Save the project, recording the previous text for undo."""
+        """Save the project, recording the previous text for undo. Pictures over the video and
+        voiceovers follow the frames they were placed over when the clips under them change."""
         before = p.extra.pop("__before", None)
+        if before is not None and (p.images or p.voiceovers):
+            try:
+                edits.follow_content(Project.from_dict(yaml.safe_load(before) or {}, p.folder), p)
+            except Exception as e:  # never block an edit on this
+                print(f"[follow_content] {e}")
         p.save()
         if before is not None and before != p.path.read_text():
             HISTORY.push(p, before)
@@ -218,6 +303,12 @@ def create_app(cfg: Config) -> FastAPI:
             d["in"] = s.in_
             d["out"] = s.out
             d["title"] = s.text if s.kind == "title" else None
+            if s.kind == "title":
+                d["kicker"] = s.kicker
+                d["image"] = s.image
+                img = p.resolve(s.image) if s.image else None
+                d["image_url"] = media_url(p, s.image) + f"?v={int(img.stat().st_mtime)}" if img and img.exists() and not Path(s.image).is_absolute() else None
+                d["image_missing"] = bool(s.image) and not (img and img.exists())
             d["overlays"] = [o.to_dict() for o in s.overlays]
             d["fit"] = s.fit
             pl = placed.get(s.id)
@@ -228,7 +319,8 @@ def create_app(cfg: Config) -> FastAPI:
                 d["media"] = info.to_dict() if info else None
                 d["missing"] = info is None
                 st = media.media_status(p, s.src)
-                d["proxy_url"] = media_url(p, f"cache/{Path(s.src).name}.proxy.mp4") if st["proxy"] else None
+                # until the 540p proxy exists, a browser-playable source (e.g. a fresh recording) stands in for it
+                d["proxy_url"] = media_url(p, f"cache/{Path(s.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, s.src) if media.browser_playable(info) else None)
                 d["thumb_url"] = media_url(p, f"cache/{Path(s.src).name}.thumb.jpg") if st["thumb"] else None
                 d["src_url"] = media_url(p, s.src)
                 d["lufs"] = _cached_lufs(p, s.src)
@@ -244,6 +336,26 @@ def create_app(cfg: Config) -> FastAPI:
                 vd["duration"] = 0
             vd["lufs"] = _cached_lufs(p, v.file)
             vos.append(vd)
+        stings = []
+        for m in p.stings:
+            f = p.resolve(m.file)
+            span = render.sting_span(layout, m) if layout else None
+            md = m.to_dict() | {"id": m.id, "from": m.from_id, "to": m.to_id, "start": m.start, "volume": m.volume,
+                                "fade_in": m.fade_in, "fade_out": m.fade_out, "duck": m.duck, "missing": not f.exists(),
+                                "url": media_url(p, m.file) if f.exists() and not Path(m.file).is_absolute() else None,
+                                "at": span[0] if span else None, "end": span[1] if span else None}
+            try:
+                md["file_duration"] = probe(f, p.cache_dir).duration if f.exists() else 0
+            except Exception:
+                md["file_duration"] = 0
+            stings.append(md)
+        images = []
+        for m in p.images:
+            f = p.resolve(m.file)
+            iw, ih = _image_size(f) if f.exists() else (0, 0)
+            images.append(m.to_dict() | {"id": m.id, "file": m.file, "at": m.at, "duration": m.duration, "box": list(m.box) if m.box else None,
+                                         "fit": m.fit, "fade": m.fade, "missing": not f.exists(), "iw": iw, "ih": ih,
+                                         "url": media_url(p, m.file) + f"?v={int(f.stat().st_mtime)}" if f.exists() and not Path(m.file).is_absolute() else None})
         clips = []
         for f in sorted(p.clips_dir.glob("*")) if p.clips_dir.exists() else []:
             if not is_video(f):
@@ -258,7 +370,7 @@ def create_app(cfg: Config) -> FastAPI:
                 "src": rel, "name": f.name, "media": info,
                 "in_timeline": any(s.src == rel for s in p.timeline),
                 "thumb_url": media_url(p, f"cache/{f.name}.thumb.jpg") if st["thumb"] else None,
-                "proxy_url": media_url(p, f"cache/{f.name}.proxy.mp4") if st["proxy"] else None,
+                "proxy_url": media_url(p, f"cache/{f.name}.proxy.mp4") if st["proxy"] else (media_url(p, rel) if info and media.browser_playable(probe(f, p.cache_dir)) else None),
             })
         preview = p.out_dir / "preview.mp4"
         final = p.out_dir / p.output_filename()
@@ -266,7 +378,7 @@ def create_app(cfg: Config) -> FastAPI:
         return {
             "name": p.name, "title": p.title, "date": p.date, "folder": str(p.folder),
             "output": p.output.__dict__, "style": p.style.__dict__, "music": p.music.__dict__, "audio": p.audio.__dict__,
-            "timeline": segs, "clips": clips, "voiceovers": vos,
+            "timeline": segs, "clips": clips, "voiceovers": vos, "stings": stings, "images": images,
             "layout": {"width": layout.width, "height": layout.height, "total": layout.total, "fps": layout.fps,
                        "orientation": layout.orientation} if layout else None,
             "preview": {"url": media_url(p, "out/preview.mp4") + f"?v={int(preview.stat().st_mtime)}",
@@ -389,18 +501,7 @@ def create_app(cfg: Config) -> FastAPI:
         folder = root / name
         if (folder / "project.yaml").exists():
             raise HTTPException(409, f"project {name} already exists")
-        p = Project.new(folder, title=body.title or name)
-        p.output.orientation = cfg.default_orientation
-        p.style.font = cfg.font
-        p.style.transition = cfg.default_transition
-        if cfg.default_music:
-            p.music.file = cfg.default_music
-        if body.opening:
-            try:
-                pretty = dt.date.fromisoformat(name).strftime("%A, %B %-d")
-            except ValueError:
-                pretty = p.title
-            p.add_title(body.title or pretty, cfg.default_title_subtitle, 3.0)
+        p = make_project(cfg, folder, body.title, body.opening)
         p.save()
         out = {"project": project_json(p), "job": None}
         if body.pull_immich and cfg.immich_url and cfg.immich_api_key:
@@ -410,7 +511,8 @@ def create_app(cfg: Config) -> FastAPI:
                 day = dt.date.today()
             vids = immich().videos_on(day)
             if vids:
-                out["job"] = import_immich(name, {"assets": [{"id": v["id"], "filename": v["filename"]} for v in vids]})
+                out["job"] = import_immich(name, {"assets": [{"id": v["id"], "filename": v["filename"]} for v in vids],
+                                                  "add": not body.trim})
         return out
 
     @app.get("/api/projects/{name}")
@@ -461,13 +563,31 @@ def create_app(cfg: Config) -> FastAPI:
     def add_segment(name: str, body: dict):
         p = load(name)
         at = body.get("at")
-        if body.get("kind") == "title":
-            p.add_title(body.get("text") or "Title", body.get("subtitle") or "", float(body.get("duration") or 3), at=at)
+        if body.get("kind") == "masthead":
+            rel = masthead_rel(p, cfg)
+            if not rel:
+                raise HTTPException(400, "no masthead image configured (Settings → App)")
+            p.add_title("", "", float(body.get("duration") or 3), at=at, image=rel)
+        elif body.get("kind") == "title":
+            image = body.get("image") or None
+            if image:
+                image = _import_asset(p, image)
+            p.add_title(body.get("text") or ("" if image else "Title"), body.get("subtitle") or "",
+                        float(body.get("duration") or 3), at=at, kicker=body.get("kicker") or "", image=image,
+                        bg=body.get("bg") or None, fg=body.get("fg") or None)
         else:
             src = body["src"]
             if not p.resolve(src).exists():
                 raise HTTPException(400, f"missing {src}")
-            p.add_clip(src, at=at)
+            if body.get("at_time") is not None:          # insert at a timeline time (splits a clip there)
+                at = edits.insert_index_at(p, float(body["at_time"]))
+            seg = p.add_clip(src, at=at)
+            if body.get("in") not in (None, ""):
+                seg.in_ = max(0.0, parse_time(body["in"]))
+            if body.get("out") not in (None, ""):
+                seg.out = parse_time(body["out"])
+            commit(p)
+            return project_json(p) | {"new_id": seg.id}
         commit(p)
         return project_json(p)
 
@@ -477,13 +597,15 @@ def create_app(cfg: Config) -> FastAPI:
         s = p.timeline[p.index_of(sid)]
         for k, v in body.items():
             if k == "in":
-                s.in_ = parse_time(v)
+                edits.set_in(s, parse_time(v))
             elif k == "out":
                 s.out = None if v in (None, "", "end") else parse_time(v)
             elif k in ("text", "title"):
                 s.text = str(v)
             elif k == "overlays":
                 s.overlays = [Overlay.from_dict(o) for o in v]
+            elif k == "markers":
+                s.markers = sorted({round(max(0.0, float(parse_time(x))), 3) for x in (v or [])})
             elif k in ("duration", "transition_duration"):
                 setattr(s, k, None if v in (None, "") else float(v))
             elif k in ("speed", "volume"):
@@ -494,6 +616,10 @@ def create_app(cfg: Config) -> FastAPI:
                 s.fit = "cover" if v == "cover" else "contain"
             elif k in ("bg", "fg"):
                 setattr(s, k, v or None)
+            elif k == "kicker":
+                s.kicker = str(v or "")
+            elif k == "image":
+                s.image = _import_asset(p, str(v)) if v else None
             elif k == "layout":
                 s.layout = "lower" if v == "lower" else "center"
             elif k in ("caption", "subtitle", "transition", "note"):
@@ -532,19 +658,29 @@ def create_app(cfg: Config) -> FastAPI:
         pl, off = render.locate(layout, float(body["time"]))
         if pl is None or pl.seg.kind != "clip" or off < 0.25 or pl.duration - off < 0.25:
             raise HTTPException(400, "nothing to split here")
-        from copy import deepcopy
-        seg = pl.seg
-        cut = pl.src_in + off * seg.speed
-        tail = deepcopy(seg)
-        tail.id = p.next_id()
-        tail.in_, tail.out, tail.caption, tail.transition = cut, pl.src_out, None, None
-        tail.overlays = [Overlay(text=o.text, at=o.at - off, duration=o.duration, position=o.position, style=o.style)
-                         for o in seg.overlays if o.at >= off]
-        seg.out = cut
-        seg.overlays = [o for o in seg.overlays if o.at < off]
-        p.timeline.insert(pl.index + 1, tail)
+        edits.split_segment(p, pl, off)
         commit(p)
         return project_json(p)
+
+    @app.post("/api/projects/{name}/cut")
+    def cut_api(name: str, body: dict):
+        """Remove output-timeline [start, end) and close the gap (ripple delete)."""
+        p = load(name)
+        removed = edits.cut_range(p, float(body["start"]), float(body["end"]))
+        if removed <= 0:
+            raise HTTPException(400, "nothing to cut there")
+        commit(p)
+        return project_json(p) | {"removed": removed}
+
+    @app.post("/api/projects/{name}/keep")
+    def keep_api(name: str, body: dict):
+        """Trim the clip(s) under [start, end) to just that part."""
+        p = load(name)
+        removed, at = edits.keep_range(p, float(body["start"]), float(body["end"]))
+        if removed <= 0:
+            raise HTTPException(400, "nothing to trim there (mark a part inside a clip)")
+        commit(p)
+        return project_json(p) | {"removed": removed, "at": at}
 
     # ------------------------------------------------------------------ import
     @app.post("/api/projects/{name}/import")
@@ -636,17 +772,38 @@ def create_app(cfg: Config) -> FastAPI:
         except Exception as e:
             raise HTTPException(500, f"could not convert recording: {e}")
         p = load(p.name)
+        marks = sorted(max(0.0, float(t)) for t in m.get("markers") or [])
         if m["kind"] == "voiceover":
-            new_id = p.add_voiceover(rel, max(0.0, float(m.get("at") or 0))).id
+            at0 = max(0.0, float(m.get("at") or 0))
+            new_id = p.add_voiceover(rel, at0).id
+            if marks:   # markers dropped while narrating go on the clips that were playing at the time
+                try:
+                    layout = render.compute_layout(p)
+                    for t in marks:
+                        pl, off = render.locate(layout, at0 + t)
+                        if pl is not None and pl.seg.kind == "clip":
+                            pl.seg.markers = sorted(pl.seg.markers + [round(pl.src_in + off * (pl.seg.speed or 1.0), 3)])
+                except Exception:
+                    pass
         else:
-            seg = p.add_clip(rel) if m.get("add", True) else None
+            at = None
+            try:   # a take recorded with the playhead at a segment's start goes in front of that segment
+                layout = render.compute_layout(p)
+                pl, off = render.locate(layout, float(m.get("at") or 0))
+                if pl is not None and off < 0.25:
+                    at = pl.index
+            except Exception:
+                at = None
+            seg = p.add_clip(rel, at=at) if m.get("add", True) else None
             if seg is not None and m.get("fit") in ("cover", "contain"):
                 seg.fit = m["fit"]
+            if seg is not None and marks:
+                seg.markers = [round(t, 3) for t in marks]
             new_id = seg.id if seg else None
         commit(p)
         part.unlink(missing_ok=True)
         (rec_dir(p) / f"{m['id']}.json").unlink(missing_ok=True)
-        return {"added": rel, "id": new_id, "project": project_json(p)}
+        return {"added": rel, "id": new_id, "markers": len(marks), "project": project_json(p)}
 
     @app.post("/api/projects/{name}/record/start")
     def record_start(name: str, body: dict):
@@ -655,7 +812,7 @@ def create_app(cfg: Config) -> FastAPI:
         mime = str(body.get("mime") or "video/webm")
         m = {"id": rid, "kind": body.get("kind", "clip"), "at": float(body.get("at") or 0), "fit": body.get("fit", ""),
              "add": bool(body.get("add", True)), "mime": mime, "ext": "mp4" if "mp4" in mime else "webm",
-             "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0}
+             "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0, "markers": []}
         (rec_dir(p) / f"{rid}.part").write_bytes(b"")
         rec_save_manifest(p, m)
         return {"id": rid}
@@ -682,6 +839,16 @@ def create_app(cfg: Config) -> FastAPI:
     def record_finish(name: str, rid: str):
         p = load(name)
         return finalize_recording(p, rec_manifest(p, rid))
+
+    @app.post("/api/projects/{name}/record/{rid}/marker")
+    def record_marker(name: str, rid: str, body: dict):
+        """A marker dropped while recording (seconds into the take). Saved right away so a take
+        recovered after a crash keeps its markers."""
+        p = load(name)
+        m = rec_manifest(p, rid)
+        m["markers"] = sorted(set((m.get("markers") or []) + [round(max(0.0, float(body["t"])), 3)]))
+        rec_save_manifest(p, m)
+        return {"n": len(m["markers"])}
 
     @app.get("/api/projects/{name}/recordings")
     def recordings_pending(name: str):
@@ -710,13 +877,18 @@ def create_app(cfg: Config) -> FastAPI:
 
     @app.post("/api/projects/{name}/record")
     async def record(name: str, file: UploadFile = File(...), kind: str = Form("clip"), at: float = Form(0.0),
-                     add: str = Form("true"), fit: str = Form("")):
+                     add: str = Form("true"), fit: str = Form(""), markers: str = Form("[]")):
         """One-shot upload of a whole recording (fallback / CLI use)."""
         p = load(name)
         rid = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4]
         mime = file.content_type or "video/webm"
         m = {"id": rid, "kind": kind, "at": at, "fit": fit, "add": str(add).lower() in ("1", "true", "yes", "on"),
              "mime": mime, "ext": "mp4" if "mp4" in mime else "webm", "started": dt.datetime.now().isoformat(timespec="seconds")}
+        try:
+            import json
+            m["markers"] = [float(t) for t in json.loads(markers or "[]")]
+        except Exception:
+            m["markers"] = []
         with open(rec_dir(p) / f"{rid}.part", "wb") as out:
             while chunk := await file.read(1 << 20):
                 out.write(chunk)
@@ -761,6 +933,133 @@ def create_app(cfg: Config) -> FastAPI:
         p.voiceovers = [x for x in p.voiceovers if x.id != vid]
         if remove_file:
             p.resolve(v.file).unlink(missing_ok=True)
+        commit(p)
+        return project_json(p)
+
+    @app.post("/api/projects/{name}/stings")
+    def add_sting(name: str, body: dict):
+        p = load(name)
+        if body.get("file") == "intro":
+            rel = sting_rel(p, cfg)
+            if not rel:
+                raise HTTPException(400, "no intro sting configured (Settings → App)")
+        else:
+            src = Path(body["file"]).expanduser()
+            if not src.exists():
+                raise HTTPException(400, f"not found: {src}")
+            p.ensure_dirs()
+            dst = p.audio_dir / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            rel = f"audio/{dst.name}"
+        frm = body.get("from") or (p.timeline[0].id if p.timeline else "")
+        if not frm:
+            raise HTTPException(400, "timeline is empty")
+        kw = {}
+        for k in ("start", "volume", "fade_in", "fade_out"):
+            if body.get(k) is not None:
+                kw[k] = parse_time(body[k]) if k == "start" else float(body[k])
+        if body.get("duck") is not None:
+            kw["duck"] = bool(body["duck"])
+        p.add_sting(rel, frm, body.get("to") or frm, **kw)
+        commit(p)
+        return project_json(p)
+
+    @app.patch("/api/projects/{name}/stings/{mid}")
+    def patch_sting(name: str, mid: str, body: dict):
+        p = load(name)
+        m = p.sting(mid)
+        if "from" in body:
+            m.from_id = str(body["from"])
+        if "to" in body:
+            m.to_id = str(body["to"] or m.from_id)
+        if "start" in body:
+            m.start = max(0.0, parse_time(body["start"]))
+        for k in ("volume", "fade_in", "fade_out"):
+            if k in body:
+                setattr(m, k, max(0.0, float(body[k])))
+        if "duck" in body:
+            m.duck = bool(body["duck"])
+        if "note" in body:
+            m.note = str(body["note"])
+        commit(p)
+        return project_json(p)
+
+    @app.delete("/api/projects/{name}/stings/{mid}")
+    def delete_sting(name: str, mid: str):
+        p = load(name)
+        p.stings = [x for x in p.stings if x.id != mid]
+        commit(p)
+        return project_json(p)
+
+    # ------------------------------------------------------------------ pictures over the video
+    @app.post("/api/projects/{name}/images")
+    def add_image(name: str, body: dict):
+        """Add pictures (paths) to the images track, one after another from `at`."""
+        p = load(name)
+        files = body.get("files") or ([body["file"]] if body.get("file") else [])
+        if not files:
+            raise HTTPException(400, "no image")
+        at, dur, ids = float(body.get("at") or 0), float(body.get("for") or 3), []
+        for path in files:
+            rel = _import_asset(p, path)
+            ids.append(p.add_image(rel, at, dur, box=_box(body.get("box")), fit=str(body.get("fit") or "contain")).id)
+            at += dur
+        commit(p)
+        return project_json(p) | {"new_ids": ids}
+
+    @app.post("/api/projects/{name}/images/upload")
+    async def upload_images(name: str, files: list[UploadFile] = File(...), at: float = Form(0.0), dur: float = Form(3.0)):
+        """Dropped or pasted pictures: saved into assets/ and placed one after another from `at`."""
+        p = load(name)
+        ids = []
+        for uf in files:
+            fname = Path(uf.filename or "image.png").name
+            suf = Path(fname).suffix.lower()
+            if suf not in (".jpg", ".jpeg", ".png", ".webp", ".heic", ".heif", ".gif"):
+                continue
+            if Path(fname).stem.lower() in ("image", "blob", "") or fname.lower().startswith("pasted"):
+                fname = f"pasted-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}{suf}"
+            data = await uf.read()
+            dst = _asset_dest(p, fname, len(data))
+            if not dst.exists():
+                dst.write_bytes(data)
+            rel = f"assets/{_browser_image(dst).name}"
+            ids.append(p.add_image(rel, at, dur).id)
+            at += dur
+        if not ids:
+            raise HTTPException(400, "no pictures in that drop (JPEG, PNG, HEIC or WebP)")
+        commit(p)
+        return project_json(p) | {"new_ids": ids}
+
+    @app.patch("/api/projects/{name}/images/{iid}")
+    def patch_image(name: str, iid: str, body: dict):
+        p = load(name)
+        m = p.image(iid)
+        if "at" in body:
+            m.at = max(0.0, parse_time(body["at"]))
+        if "for" in body or "duration" in body:
+            m.duration = max(0.2, float(parse_time(body.get("for", body.get("duration")))))
+        if "box" in body:
+            m.box = _box(body["box"])
+        if "fit" in body:
+            m.fit = "cover" if body["fit"] == "cover" else "contain"
+        if "fade" in body:
+            m.fade = max(0.0, min(3.0, float(body["fade"])))
+        if body.get("file"):
+            m.file = _import_asset(p, str(body["file"]))
+        if "note" in body:
+            m.note = str(body["note"])
+        if body.get("front"):                      # draw it above the others
+            p.images = [x for x in p.images if x.id != iid] + [m]
+        commit(p)
+        return project_json(p)
+
+    @app.delete("/api/projects/{name}/images/{iid}")
+    def delete_image(name: str, iid: str):
+        p = load(name)
+        p.image(iid)
+        p.images = [x for x in p.images if x.id != iid]
         commit(p)
         return project_json(p)
 
@@ -809,6 +1108,7 @@ def create_app(cfg: Config) -> FastAPI:
                 job.progress = i / max(1, len(assets))
                 path = im.download(a["id"], p.clips_dir, a.get("filename"))
                 rel = f"clips/{path.name}"
+                job.added.append(rel)
                 media.prepare(p, rel)
                 pp = Project.load(p.folder)   # reload: UI may have changed things meanwhile
                 if add and not any(s.src == rel for s in pp.timeline):
@@ -883,6 +1183,9 @@ def create_app(cfg: Config) -> FastAPI:
                      'set out to ""\nrepeat with f in fs\nset out to out & POSIX path of f & linefeed\nend repeat\nreturn out',
             "folder": 'return POSIX path of (choose folder with prompt "Choose a folder of clips")',
             "music": 'return POSIX path of (choose file with prompt "Choose music" of type {"public.audio"})',
+            "image": 'return POSIX path of (choose file with prompt "Choose an image" of type {"public.image"})',
+            "images": 'set fs to choose file with prompt "Choose pictures to show over the video" of type {"public.image"} with multiple selections allowed\n'
+                      'set out to ""\nrepeat with f in fs\nset out to out & POSIX path of f & linefeed\nend repeat\nreturn out',
         }[kind]
         r = subprocess.run(["osascript", "-e", script], capture_output=True, text=True)
         if r.returncode != 0:

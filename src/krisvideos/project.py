@@ -9,7 +9,8 @@ A project folder looks like:
       out/              <- preview.mp4 and final renders
 
 Segment types in `timeline`:
-  - title:  a full-frame title card (text, subtitle, duration)
+  - title:  a full-frame title card (text, subtitle, kicker, duration; optional background `image`)
+            an `image:` entry with no text is a plain image card (e.g. the show's masthead)
   - clip:   a slice of a media file (in/out, speed, mute, caption, overlays)
 """
 from __future__ import annotations
@@ -92,6 +93,89 @@ class Voiceover:
 
 
 @dataclass
+class ImageLayer:
+    """A picture shown over the video for a while (the track above the clips). Full screen, or in a
+    box given as fractions of the frame: centre x/y and width (the height follows the picture)."""
+    file: str                       # project-relative (assets/...) or absolute
+    at: float = 0.0                 # output-timeline seconds
+    duration: float = 3.0
+    box: tuple | None = None        # (x, y, w); None = full screen
+    fit: str = "contain"            # full screen: contain (whole picture, blurred fill) | cover (crop to fill)
+    fade: float = 0.25
+    id: str = ""
+    note: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict, idx: int) -> "ImageLayer":
+        box = d.get("box")
+        if isinstance(box, dict):
+            box = (float(box.get("x", 0.5)), float(box.get("y", 0.5)), float(box.get("w", 0.4)))
+        elif isinstance(box, (list, tuple)) and len(box) == 3:
+            box = tuple(float(v) for v in box)
+        else:
+            box = None
+        return cls(file=str(d.get("image") or d.get("file")), at=parse_time(d.get("at", 0)),
+                   duration=float(parse_time(d.get("for", d.get("duration", 3)))), box=box,
+                   fit=str(d.get("fit") or "contain"), fade=float(d.get("fade", 0.25)),
+                   id=str(d.get("id") or f"i{idx+1}"), note=str(d.get("note") or ""))
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {"image": self.file, "at": round(self.at, 3), "for": round(self.duration, 3)}
+        if self.box:
+            d["box"] = {"x": round(self.box[0], 4), "y": round(self.box[1], 4), "w": round(self.box[2], 4)}
+        if self.fit != "contain":
+            d["fit"] = self.fit
+        if self.fade != 0.25:
+            d["fade"] = self.fade
+        if self.note:
+            d["note"] = self.note
+        d["id"] = self.id
+        return d
+
+
+@dataclass
+class Sting:
+    """A short music cue laid over a run of segments (e.g. the intro masthead + date card).
+    Anchored to segment ids so it follows the segments when the timeline changes."""
+    file: str                       # project-relative (audio/sting.mp3) or absolute
+    from_id: str = ""               # first segment it plays over
+    to_id: str = ""                 # last segment (default: same as from_id)
+    start: float = 0.0              # offset into the music file
+    volume: float = 0.7
+    fade_in: float = 0.6
+    fade_out: float = 1.0           # fades out as the next segment cuts in
+    duck: bool = True               # lower it while clips have speech (like the background music)
+    id: str = ""
+    note: str = ""
+
+    @classmethod
+    def from_dict(cls, d: dict, idx: int) -> "Sting":
+        return cls(file=str(d["file"]), from_id=str(d.get("from") or ""), to_id=str(d.get("to") or d.get("from") or ""),
+                   start=parse_time(d.get("start", 0)), volume=float(d.get("volume", 0.7)),
+                   fade_in=float(d.get("fade_in", 0.6)), fade_out=float(d.get("fade_out", 1.0)),
+                   duck=bool(d.get("duck", True)), id=str(d.get("id") or f"m{idx+1}"), note=str(d.get("note") or ""))
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {"file": self.file, "from": self.from_id}
+        if self.to_id and self.to_id != self.from_id:
+            d["to"] = self.to_id
+        if self.start:
+            d["start"] = round(self.start, 3)
+        if self.volume != 0.7:
+            d["volume"] = self.volume
+        if self.fade_in != 0.6:
+            d["fade_in"] = self.fade_in
+        if self.fade_out != 1.0:
+            d["fade_out"] = self.fade_out
+        if not self.duck:
+            d["duck"] = False
+        if self.note:
+            d["note"] = self.note
+        d["id"] = self.id
+        return d
+
+
+@dataclass
 class Segment:
     kind: str                       # "clip" | "title"
     id: str = ""
@@ -105,9 +189,12 @@ class Segment:
     caption: str | None = None      # convenience: a lower-third shown for the whole clip
     fit: str = "contain"            # contain (letterbox) | cover (crop to fill the canvas)
     overlays: list[Overlay] = field(default_factory=list)
+    markers: list[float] = field(default_factory=list)   # moments to come back to (source-clip seconds)
     # title fields
     text: str = ""
     subtitle: str = ""
+    kicker: str = ""                # small line above the title ("Daily Vlogs")
+    image: str | None = None        # background image (project-relative or absolute); text optional
     duration: float = 3.0
     bg: str | None = None           # per-title overrides of style.title_bg / title_fg
     fg: str | None = None
@@ -130,15 +217,19 @@ class Segment:
             seg.caption = d.get("caption")
             seg.fit = str(d.get("fit") or "contain")
             seg.overlays = [Overlay.from_dict(o) for o in d.get("overlays", []) or []]
-        elif "title" in d:
+            seg.markers = sorted(float(parse_time(x)) for x in d.get("markers") or [])
+        elif "title" in d or "image" in d:
             seg = cls(kind="title", text=str(d.get("title") or ""))
             seg.subtitle = str(d.get("subtitle") or "")
+            seg.kicker = str(d.get("kicker") or "")
+            seg.image = str(d["image"]) if d.get("image") else None
+            seg.fit = str(d.get("fit") or "contain")
             seg.duration = float(parse_time(d.get("duration", 3)))
             seg.bg = d.get("bg") or None
             seg.fg = d.get("fg") or None
             seg.layout = str(d.get("layout") or "center")
         else:
-            raise ValueError(f"timeline entry #{idx} must have `clip:` or `title:`: {d}")
+            raise ValueError(f"timeline entry #{idx} must have `clip:`, `title:` or `image:`: {d}")
         seg.id = str(d.get("id") or f"s{idx+1}")
         seg.transition = d.get("transition")
         if d.get("transition_duration") is not None:
@@ -166,11 +257,20 @@ class Segment:
                 d["fit"] = self.fit
             if self.overlays:
                 d["overlays"] = [o.to_dict() for o in self.overlays]
+            if self.markers:
+                d["markers"] = [round(x, 3) for x in self.markers]
         else:
-            d["title"] = self.text
+            if self.text or not self.image:
+                d["title"] = self.text
+            if self.image:
+                d["image"] = self.image
+            if self.kicker:
+                d["kicker"] = self.kicker
             if self.subtitle:
                 d["subtitle"] = self.subtitle
             d["duration"] = self.duration
+            if self.fit != "contain":
+                d["fit"] = self.fit
             if self.bg:
                 d["bg"] = self.bg
             if self.fg:
@@ -243,6 +343,8 @@ class Project:
     audio: Audio = field(default_factory=Audio)
     timeline: list[Segment] = field(default_factory=list)
     voiceovers: list[Voiceover] = field(default_factory=list)
+    stings: list[Sting] = field(default_factory=list)
+    images: list[ImageLayer] = field(default_factory=list)
     extra: dict = field(default_factory=dict)    # unknown top-level keys, preserved
 
     # ------------------------------------------------------------------ paths
@@ -295,7 +397,7 @@ class Project:
     @classmethod
     def from_dict(cls, data: dict, folder: Path) -> "Project":
         folder = Path(folder)
-        known = {"title", "date", "output", "style", "music", "audio", "timeline", "voiceovers"}
+        known = {"title", "date", "output", "style", "music", "audio", "timeline", "voiceovers", "stings", "images"}
         p = cls(name=folder.name, folder=folder)
         p.title = str(data.get("title") or folder.name)
         p.date = str(data.get("date") or "")
@@ -305,6 +407,8 @@ class Project:
         p.audio = _fill(Audio, data.get("audio"))
         p.timeline = [Segment.from_dict(s, i) for i, s in enumerate(data.get("timeline") or [])]
         p.voiceovers = [Voiceover.from_dict(v, i) for i, v in enumerate(data.get("voiceovers") or [])]
+        p.stings = [Sting.from_dict(v, i) for i, v in enumerate(data.get("stings") or [])]
+        p.images = [ImageLayer.from_dict(v, i) for i, v in enumerate(data.get("images") or [])]
         p.extra = {k: v for k, v in data.items() if k not in known}
         p.renumber_ids()
         return p
@@ -324,6 +428,10 @@ class Project:
         d["timeline"] = [s.to_dict() for s in self.timeline]
         if self.voiceovers:
             d["voiceovers"] = [v.to_dict() for v in self.voiceovers]
+        if self.stings:
+            d["stings"] = [m.to_dict() for m in self.stings]
+        if self.images:
+            d["images"] = [m.to_dict() for m in self.images]
         return d
 
     def save(self) -> None:
@@ -356,6 +464,36 @@ class Project:
         self.voiceovers.sort(key=lambda v: v.at)
         return vo
 
+    def add_sting(self, file: str, from_id: str, to_id: str = "", **kw) -> Sting:
+        ids = {m.id for m in self.stings}
+        n = len(self.stings) + 1
+        while f"m{n}" in ids:
+            n += 1
+        m = Sting(file=file, from_id=from_id, to_id=to_id or from_id, id=f"m{n}", **kw)
+        self.stings.append(m)
+        return m
+
+    def add_image(self, file: str, at: float, duration: float = 3.0, **kw) -> ImageLayer:
+        ids = {m.id for m in self.images}
+        n = len(self.images) + 1
+        while f"i{n}" in ids:
+            n += 1
+        m = ImageLayer(file=file, at=max(0.0, at), duration=max(0.2, duration), id=f"i{n}", **kw)
+        self.images.append(m)
+        return m
+
+    def image(self, iid: str) -> ImageLayer:
+        for m in self.images:
+            if m.id == iid:
+                return m
+        raise KeyError(iid)
+
+    def sting(self, mid: str) -> Sting:
+        for m in self.stings:
+            if m.id == mid:
+                return m
+        raise KeyError(mid)
+
     def voiceover(self, vid: str) -> Voiceover:
         for v in self.voiceovers:
             if v.id == vid:
@@ -380,8 +518,8 @@ class Project:
         self._insert(seg, at)
         return seg
 
-    def add_title(self, text: str, subtitle: str = "", duration: float = 3.0, at: int | None = None) -> Segment:
-        seg = Segment(kind="title", text=text, subtitle=subtitle, duration=duration, id=self.next_id())
+    def add_title(self, text: str, subtitle: str = "", duration: float = 3.0, at: int | None = None, **kw) -> Segment:
+        seg = Segment(kind="title", text=text, subtitle=subtitle, duration=duration, id=self.next_id(), **kw)
         self._insert(seg, at)
         return seg
 

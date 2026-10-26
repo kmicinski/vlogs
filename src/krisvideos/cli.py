@@ -3,8 +3,11 @@
     vlog new [NAME] [--title T]              create ~/Vlogs/NAME (default: today)
     vlog add PROJECT FILE...                 import clips (local files)
     vlog pull PROJECT [--date YYYY-MM-DD]    pull a day's videos from Immich
-    vlog title PROJECT "Text" [--sub S] [--dur 3] [--at INDEX]
+    vlog title PROJECT "Text" [--sub S] [--kicker K] [--image FILE] [--dur 3] [--at INDEX]
+    vlog masthead PROJECT [--at INDEX]       insert the configured masthead image card
     vlog title-at PROJECT 0:32 "Text"        split the timeline at 0:32 and cut to a title card
+    vlog cut PROJECT 0:12 0:15               cut out that stretch of the output timeline (closes the gap)
+    vlog keep PROJECT 0:12 0:15              trim the clip(s) there so only that stretch remains
     vlog caption PROJECT SEG "Text"          lower-third over a segment (SEG = id like s3, or index)
     vlog trim PROJECT SEG --in 0:03 --out 0:14
     vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade
@@ -12,6 +15,8 @@
     vlog move PROJECT SEG INDEX              reorder
     vlog music PROJECT FILE [--volume 0.18]
     vlog voiceover PROJECT FILE --at 0:12          narration layer at a timeline time (GUI can record these)
+    vlog sting PROJECT song.mp3 --from s1 --to s3 [--start 0:06.5]   music cue over those segments (fades in/out)
+    vlog image PROJECT pic.jpg --at 0:12 [--for 3] [--size full|large|half|small] [--pos tr]   picture over the video
     vlog show PROJECT                        print the timeline
     vlog preview PROJECT [--open]            fast half-res render -> out/preview.mp4
     vlog render PROJECT [--open]             full-quality render -> out/<title>.mp4
@@ -25,8 +30,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import media, render
+from . import edits, media, render
 from .config import Config
+from .edits import title_at  # noqa: F401  (re-exported: older imports use cli.title_at)
 from .project import Overlay, Project
 from .timeutil import fmt_time, parse_time
 
@@ -41,6 +47,11 @@ def _project(cfg: Config, name: str | None) -> Project:
     return Project.load(folder)
 
 
+def _snapshot(p: Project) -> Project:
+    from copy import deepcopy
+    return deepcopy(p)
+
+
 def _seg(p: Project, ref: str):
     if ref.isdigit():
         return p.timeline[int(ref)]
@@ -53,19 +64,85 @@ def _import(p: Project, path: Path) -> str:
     return rel
 
 
+def new_project(cfg: Config, folder: Path, title: str | None, opening: bool = True) -> Project:
+    """Create a project with the configured defaults and (optionally) the standard intro."""
+    p = Project.new(folder, title=title or folder.name)
+    p.output.orientation = cfg.default_orientation
+    p.style.font = cfg.font
+    p.style.transition = cfg.default_transition
+    p.style.title_bg, p.style.title_fg, p.style.title_accent = cfg.title_bg, cfg.title_fg, cfg.title_accent
+    if cfg.default_music:
+        p.music.file = cfg.default_music
+    if opening:
+        add_opening(p, cfg, title or _pretty_date(folder.name))
+    return p
+
+
+def masthead_rel(p: Project, cfg: Config) -> str | None:
+    """Copy the configured masthead image into the project (assets/) and return its relative path."""
+    import shutil
+    if not cfg.masthead_image:
+        return None
+    src = Path(cfg.masthead_image).expanduser()
+    if not src.exists():
+        return None
+    dst_dir = p.folder / "assets"
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / ("masthead" + src.suffix.lower())
+    if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+        shutil.copy2(src, dst)
+    return f"assets/{dst.name}"
+
+
+INTRO_FADE_OUT = 1.0   # masthead -> black
+INTRO_FADE_IN = 0.8    # black -> opening card
+
+
+def add_opening(p: Project, cfg: Config, title: str, at: int | None = None) -> None:
+    """The standard intro: masthead image card -> fade to black (hold) -> opening date card.
+    Without a masthead configured this is just the opening card."""
+    idx = len(p.timeline) if at is None else at
+    rel = masthead_rel(p, cfg)
+    first = None
+    if rel:
+        first = p.add_title("", "", float(cfg.intro_masthead_seconds or 2.5), at=idx, image=rel)
+        idx += 1
+        hold = max(0.0, float(cfg.intro_black_hold))
+        # the black card overlaps both fades (xfade eats into it), so pad it to leave `hold` seconds of pure black
+        p.add_title("", "", round(hold + INTRO_FADE_OUT + INTRO_FADE_IN, 2), at=idx, bg="#000000", transition="fade",
+                    transition_duration=INTRO_FADE_OUT, note="fade to black")
+        idx += 1
+    card = p.add_title(title, cfg.default_title_subtitle, float(cfg.intro_title_seconds or 2.0), at=idx,
+                       kicker=cfg.default_title_kicker)
+    if rel:
+        card.transition, card.transition_duration = "fade", INTRO_FADE_IN
+    sting = sting_rel(p, cfg)
+    if sting:
+        p.add_sting(sting, (first or card).id, card.id, start=float(cfg.intro_sting_start or 0),
+                    volume=float(cfg.intro_sting_volume or 0.7), note="intro")
+
+
+def sting_rel(p: Project, cfg: Config) -> str | None:
+    """Copy the configured intro sting into the project (audio/) and return its relative path."""
+    import shutil
+    if not cfg.intro_sting:
+        return None
+    src = Path(cfg.intro_sting).expanduser()
+    if not src.exists():
+        return None
+    p.ensure_dirs()
+    dst = p.audio_dir / ("sting" + src.suffix.lower())
+    if not dst.exists() or dst.stat().st_mtime < src.stat().st_mtime:
+        shutil.copy2(src, dst)
+    return f"audio/{dst.name}"
+
+
 def cmd_new(cfg, a):
     name = a.name or dt.date.today().isoformat()
     folder = cfg.vlogs_path / name
     if (folder / "project.yaml").exists():
         sys.exit(f"project already exists: {folder}")
-    p = Project.new(folder, title=a.title or name)
-    p.output.orientation = cfg.default_orientation
-    p.style.font = cfg.font
-    p.style.transition = cfg.default_transition
-    if cfg.default_music:
-        p.music.file = cfg.default_music
-    if a.opening:
-        p.add_title(a.title or _pretty_date(name), cfg.default_title_subtitle, 3.0)
+    p = new_project(cfg, folder, a.title, a.opening)
     p.save()
     print(f"created {p.path}")
 
@@ -106,52 +183,56 @@ def cmd_pull(cfg, a):
 
 def cmd_title(cfg, a):
     p = _project(cfg, a.project)
-    p.add_title(a.text, a.sub or "", a.dur, at=a.at)
+    image = None
+    if a.image:
+        import shutil
+        src = Path(a.image).expanduser().resolve()
+        if not src.exists():
+            sys.exit(f"no such image: {src}")
+        (p.folder / "assets").mkdir(parents=True, exist_ok=True)
+        dst = p.folder / "assets" / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+        image = f"assets/{dst.name}"
+    p.add_title(a.text, a.sub or "", a.dur, at=a.at, kicker=a.kicker or "", image=image)
     p.save()
     print("ok")
 
 
-def title_at(p: Project, t: float, text: str, subtitle: str = "", duration: float = 3.0) -> None:
-    """Split the timeline at output time t and insert a title card there."""
-    layout = render.compute_layout(p)
-    pl, offset = render.locate(layout, t)
-    if pl is None:
-        p.add_title(text, subtitle, duration)
-        return
-    idx = pl.index
-    if pl.seg.kind == "title" or offset < 0.25:
-        p.add_title(text, subtitle, duration, at=idx)
-        return
-    if pl.duration - offset < 0.25:
-        p.add_title(text, subtitle, duration, at=idx + 1)
-        return
-    seg = pl.seg
-    split_src = pl.src_in + offset * seg.speed
-    second = Overlay  # noqa (keep import used)
-    from copy import deepcopy
-    tail = deepcopy(seg)
-    tail.id = p.next_id()
-    tail.in_ = split_src
-    tail.out = pl.src_out
-    tail.caption = None
-    tail.transition = None
-    kept = []
-    for ov in seg.overlays:
-        if ov.at >= offset:
-            ov2 = deepcopy(ov)
-            ov2.at = ov.at - offset
-            kept.append(ov2)
-    tail.overlays = kept
-    seg.out = split_src
-    seg.overlays = [ov for ov in seg.overlays if ov.at < offset]
-    p.timeline.insert(idx + 1, tail)
-    p.add_title(text, subtitle, duration, at=idx + 1)
+def cmd_masthead(cfg, a):
+    p = _project(cfg, a.project)
+    rel = masthead_rel(p, cfg)
+    if not rel:
+        sys.exit("no masthead image configured (vlog config masthead_image=/path/to/image.png)")
+    p.add_title("", "", a.dur, at=a.at, image=rel)
+    p.save()
+    print("ok")
 
 
 def cmd_title_at(cfg, a):
     p = _project(cfg, a.project)
     title_at(p, parse_time(a.time), a.text, a.sub or "", a.dur)
     p.save()
+    cmd_show(cfg, a)
+
+
+def cmd_cut(cfg, a):
+    p = _project(cfg, a.project)
+    removed = edits.cut_range(p, parse_time(a.start), parse_time(a.end))
+    if removed <= 0:
+        sys.exit("nothing to cut there")
+    p.save()
+    print(f"cut out {fmt_time(removed)}")
+    cmd_show(cfg, a)
+
+
+def cmd_keep(cfg, a):
+    p = _project(cfg, a.project)
+    removed, _ = edits.keep_range(p, parse_time(a.start), parse_time(a.end))
+    if removed <= 0:
+        sys.exit("nothing to trim there (the range must be inside a clip)")
+    p.save()
+    print(f"trimmed {fmt_time(removed)}")
     cmd_show(cfg, a)
 
 
@@ -168,11 +249,13 @@ def cmd_caption(cfg, a):
 
 def cmd_trim(cfg, a):
     p = _project(cfg, a.project)
+    before = _snapshot(p)
     s = _seg(p, a.seg)
     if a.in_ is not None:
-        s.in_ = parse_time(a.in_)
+        edits.set_in(s, parse_time(a.in_))
     if a.out is not None:
         s.out = None if a.out in ("end", "none") else parse_time(a.out)
+    edits.follow_content(before, p)
     p.save()
     print("ok")
 
@@ -190,6 +273,8 @@ def cmd_set(cfg, a):
             v = v.lower() in ("1", "true", "yes", "on")
         elif k in ("in_", "out", "duration", "transition_duration"):
             v = None if v in ("none", "end", "") else parse_time(v)
+        elif k == "image":
+            v = None if v in ("none", "") else v
         elif isinstance(cur, float):
             v = float(v)
         setattr(s, k, v)
@@ -199,16 +284,20 @@ def cmd_set(cfg, a):
 
 def cmd_rm(cfg, a):
     p = _project(cfg, a.project)
+    before = _snapshot(p)
     s = _seg(p, a.seg)
     p.remove(s.id)
+    edits.follow_content(before, p)
     p.save()
     print("ok")
 
 
 def cmd_move(cfg, a):
     p = _project(cfg, a.project)
+    before = _snapshot(p)
     s = _seg(p, a.seg)
     p.move(s.id, a.index)
+    edits.follow_content(before, p)
     p.save()
     print("ok")
 
@@ -244,6 +333,87 @@ def cmd_voiceover(cfg, a):
     print("ok")
 
 
+def cmd_sting(cfg, a):
+    import shutil
+    p = _project(cfg, a.project)
+    if a.file in ("rm", "remove"):
+        if not a.id:
+            sys.exit("vlog sting PROJ rm --id m1")
+        p.stings = [m for m in p.stings if m.id != a.id]
+    else:
+        if a.file == "intro":
+            rel = sting_rel(p, cfg)
+            if not rel:
+                sys.exit("no intro sting configured (vlog config intro_sting=/path/to/song.mp3)")
+        else:
+            src = Path(a.file).expanduser().resolve()
+            if not src.exists():
+                sys.exit(f"no such file: {src}")
+            p.ensure_dirs()
+            dst = p.audio_dir / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+            rel = f"audio/{dst.name}"
+        frm = _seg(p, a.from_seg) if a.from_seg else (p.timeline[0] if p.timeline else None)
+        if frm is None:
+            sys.exit("timeline is empty")
+        to = _seg(p, a.to_seg) if a.to_seg else frm
+        kw = {}
+        if a.start is not None:
+            kw["start"] = parse_time(a.start)
+        if a.volume is not None:
+            kw["volume"] = a.volume
+        if a.no_duck:
+            kw["duck"] = False
+        p.add_sting(rel, frm.id, to.id, **kw)
+    p.save()
+    print("ok")
+
+
+SIZES = {"full": None, "large": 0.8, "half": 0.5, "small": 0.32}
+POSITIONS = {"tl": (0, 0), "t": (1, 0), "tr": (2, 0), "l": (0, 1), "c": (1, 1), "center": (1, 1), "r": (2, 1),
+             "bl": (0, 2), "b": (1, 2), "br": (2, 2)}
+
+
+def image_box(size, pos: str, frame_w: int, frame_h: int, img_w: int, img_h: int, margin: float = 0.05):
+    """(x, y, w) for a picture of the given size (fraction of the frame width) at one of 9 anchors."""
+    if size is None:
+        return None
+    w = float(size)
+    hf = w * frame_w / frame_h * (img_h / max(1, img_w))      # its height as a fraction of the frame height
+    col, row = POSITIONS.get(pos, (1, 1))
+    x = [margin + w / 2, 0.5, 1 - margin - w / 2][col]
+    y = [margin + hf / 2, 0.5, 1 - margin - hf / 2][row]
+    return (round(x, 4), round(y, 4), round(w, 4))
+
+
+def cmd_image(cfg, a):
+    import shutil
+    from PIL import Image
+    p = _project(cfg, a.project)
+    if a.file in ("rm", "remove"):
+        if not a.id:
+            sys.exit("vlog image PROJ rm --id i1")
+        p.images = [m for m in p.images if m.id != a.id]
+        p.save()
+        print("ok")
+        return
+    src = Path(a.file).expanduser().resolve()
+    if not src.exists():
+        sys.exit(f"no such file: {src}")
+    (p.folder / "assets").mkdir(parents=True, exist_ok=True)
+    dst = p.folder / "assets" / src.name
+    if not dst.exists():
+        shutil.copy2(src, dst)
+    size = SIZES[a.size] if a.size in SIZES else float(a.size)
+    layout = render.compute_layout(p)
+    with Image.open(dst) as im:
+        box = image_box(size, a.pos, layout.width, layout.height, *im.size)
+    m = p.add_image(f"assets/{dst.name}", parse_time(a.at or 0), a.dur, box=box)
+    p.save()
+    print(f"added {m.id}")
+
+
 def cmd_undo(cfg, a, redo=False):
     from .server import HISTORY
     p = _project(cfg, a.project)
@@ -259,7 +429,13 @@ def cmd_show(cfg, a):
         s = pl.seg
         tr = "" if pl.transition == "cut" else f" ({pl.transition} {pl.transition_duration}s)"
         if s.kind == "title":
-            desc = f"TITLE  {s.text!r}" + (f" / {s.subtitle!r}" if s.subtitle else "")
+            desc = ("IMAGE  " if s.image and not s.text else "TITLE  ") + (f"{s.text!r}" if s.text else "") + (f" / {s.subtitle!r}" if s.subtitle else "")
+            if s.kicker:
+                desc += f"  kicker={s.kicker!r}"
+            if s.image:
+                desc += f"  image={s.image}"
+            if s.bg == "#000000" and not s.text and not s.image:
+                desc = "BLACK  "
         else:
             desc = f"CLIP   {s.src}  [{fmt_time(pl.src_in)} - {fmt_time(pl.src_out)}]"
             if s.speed != 1:
@@ -270,9 +446,19 @@ def cmd_show(cfg, a):
                 desc += f"  caption={s.caption!r}"
             for ov in s.overlays:
                 desc += f"  overlay@{fmt_time(ov.at)}={ov.text!r}"
+            mk = [pl.start + (x - pl.src_in) / (s.speed or 1.0) for x in s.markers if pl.src_in - 1e-3 <= x <= pl.src_out + 1e-3]
+            if mk:
+                desc += "  markers@" + ",".join(fmt_time(t) for t in mk)
         print(f"  {s.id:>4}  {fmt_time(pl.start):>7} - {fmt_time(pl.end):<7} {desc}{tr}")
     for v in p.voiceovers:
         print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}")
+    for m in p.images:
+        where = "full screen" if not m.box else f"box x={m.box[0]:.2f} y={m.box[1]:.2f} w={m.box[2]:.2f}"
+        print(f"  {m.id:>4}  {fmt_time(m.at):>7} - {fmt_time(m.at + m.duration):<7} IMAGE  {m.file}  {where}")
+    for m in p.stings:
+        span = render.sting_span(layout, m)
+        when = f"{fmt_time(span[0]):>7} - {fmt_time(span[1]):<7}" if span else "   (segments gone)   "
+        print(f"  {m.id:>4}  {when} STING  {m.file} @{fmt_time(m.start)} over {m.from_id}..{m.to_id} vol={m.volume}{'' if m.duck else ' no-duck'}")
     if p.music.file:
         print(f"  music: {p.music.file} vol={p.music.volume} duck={p.music.duck}")
 
@@ -322,8 +508,11 @@ def main(argv=None):
     s = sub.add_parser("new"); s.add_argument("name", nargs="?"); s.add_argument("--title"); s.add_argument("--no-opening", dest="opening", action="store_false"); s.set_defaults(fn=cmd_new)
     s = sub.add_parser("add"); s.add_argument("project"); s.add_argument("files", nargs="+"); s.set_defaults(fn=cmd_add)
     s = sub.add_parser("pull"); s.add_argument("project"); s.add_argument("--date"); s.add_argument("--no-add", dest="add", action="store_false"); s.set_defaults(fn=cmd_pull)
-    s = sub.add_parser("title"); s.add_argument("project"); s.add_argument("text"); s.add_argument("--sub"); s.add_argument("--dur", type=float, default=3.0); s.add_argument("--at", type=int); s.set_defaults(fn=cmd_title)
+    s = sub.add_parser("title"); s.add_argument("project"); s.add_argument("text"); s.add_argument("--sub"); s.add_argument("--kicker"); s.add_argument("--image"); s.add_argument("--dur", type=float, default=3.0); s.add_argument("--at", type=int); s.set_defaults(fn=cmd_title)
+    s = sub.add_parser("masthead"); s.add_argument("project"); s.add_argument("--dur", type=float, default=3.0); s.add_argument("--at", type=int); s.set_defaults(fn=cmd_masthead)
     s = sub.add_parser("title-at"); s.add_argument("project"); s.add_argument("time"); s.add_argument("text"); s.add_argument("--sub"); s.add_argument("--dur", type=float, default=3.0); s.set_defaults(fn=cmd_title_at)
+    s = sub.add_parser("cut", help="remove a stretch of the output timeline and close the gap"); s.add_argument("project"); s.add_argument("start"); s.add_argument("end"); s.set_defaults(fn=cmd_cut)
+    s = sub.add_parser("keep", help="trim the clip(s) there to just that stretch"); s.add_argument("project"); s.add_argument("start"); s.add_argument("end"); s.set_defaults(fn=cmd_keep)
     s = sub.add_parser("caption"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("text"); s.add_argument("--at"); s.add_argument("--dur", type=float); s.add_argument("--position", default="bottom"); s.set_defaults(fn=cmd_caption)
     s = sub.add_parser("trim"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("--in", dest="in_"); s.add_argument("--out"); s.set_defaults(fn=cmd_trim)
     s = sub.add_parser("set"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("pairs", nargs="+"); s.set_defaults(fn=cmd_set)
@@ -331,6 +520,8 @@ def main(argv=None):
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("music"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_music)
     s = sub.add_parser("voiceover"); s.add_argument("project"); s.add_argument("file", help="audio file, or 'rm' with --at ID"); s.add_argument("--at", help="timeline time (or voiceover id with rm)"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_voiceover)
+    s = sub.add_parser("sting"); s.add_argument("project"); s.add_argument("file", help="audio file, 'intro' for the configured one, or 'rm' with --id"); s.add_argument("--from", dest="from_seg"); s.add_argument("--to", dest="to_seg"); s.add_argument("--start", help="offset into the file"); s.add_argument("--volume", type=float); s.add_argument("--no-duck", action="store_true", help="don't lower it under speech"); s.add_argument("--id"); s.set_defaults(fn=cmd_sting)
+    s = sub.add_parser("image", help="a picture over the video for a few seconds"); s.add_argument("project"); s.add_argument("file", help="image file, or 'rm' with --id"); s.add_argument("--at", help="timeline time"); s.add_argument("--for", dest="dur", type=float, default=3.0); s.add_argument("--size", default="full", help="full | large | half | small | a fraction of the frame width"); s.add_argument("--pos", default="c", help="tl t tr l c r bl b br"); s.add_argument("--id"); s.set_defaults(fn=cmd_image)
     s = sub.add_parser("undo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_undo)
     s = sub.add_parser("redo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=lambda c, a: cmd_undo(c, a, True))
     s = sub.add_parser("show"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_show)

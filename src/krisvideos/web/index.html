@@ -27,18 +27,13 @@
       <div id="canvas">
         <video id="vA" playsinline preload="auto"></video>
         <video id="vB" playsinline preload="auto" class="hidden"></video>
-        <div id="cardA" class="tcard hidden"><div class="rule"></div><div class="t"></div><div class="s"></div></div>
-        <div id="cardB" class="tcard hidden"><div class="rule"></div><div class="t"></div><div class="s"></div></div>
+        <div id="cardA" class="tcard hidden"><div class="bg"></div><div class="pic"></div><div class="k"></div><div class="rule"></div><div class="t"></div><div class="s"></div></div>
+        <div id="cardB" class="tcard hidden"><div class="bg"></div><div class="pic"></div><div class="k"></div><div class="rule"></div><div class="t"></div><div class="s"></div></div>
         <div id="capLayer"></div>
+        <div id="layerLayer"></div>
         <div id="stageEmpty" class="hidden"></div>
         <div id="modeChip"></div>
       </div>
-    </div>
-    <div id="transport">
-      <button id="playBtn" class="playbtn" title="Play / pause (space)"><svg viewBox="0 0 16 16" width="16" height="16"><path id="playIcon" d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg></button>
-      <span id="tNow" class="tc">0:00.0</span>
-      <div id="scrubber"><div class="rail"></div><div class="fill"></div><div class="knob"></div></div>
-      <span id="tTotal" class="tc muted">0:00.0</span>
     </div>
     <div id="jobBar" class="hidden"><div class="bar"><div class="fill"></div></div><span class="msg"></span><button class="link" id="jobCancel">Cancel</button></div>
     <div id="doneBar" class="hidden"><span class="msg"></span><button class="link" id="revealBtn">Show in Finder</button><button class="link" id="openBtn">Open</button><button class="link muted" id="doneClose">✕</button></div>
@@ -46,22 +41,31 @@
 
     <div id="tlWrap">
       <div id="ctx">
-        <button class="link" data-act="split" title="Split the clip at the playhead (S)">Split</button>
-        <button class="link" data-act="title" title="Cut to a title card here (T)">Cut to title</button>
-        <button class="link" data-act="trimStart" title="Trim the clip's start to the playhead (I)">Trim start</button>
-        <button class="link" data-act="trimEnd" title="Trim the clip's end to the playhead (O)">Trim end</button>
-        <span class="spacer"></span>
-        <button class="link" data-act="addTitle">+ Title</button>
-        <button class="link" data-act="record">⏺ Record</button>
-        <button class="link" data-act="music">♫ Music</button>
-        <span class="zoom"><button class="iconbtn sm" id="zoomOut" title="Zoom out (⌘−)">−</button><button class="link muted" id="zoomFit" title="Fit (⌘0)">fit</button><button class="iconbtn sm" id="zoomIn" title="Zoom in (⌘+)">+</button></span>
-        <button class="iconbtn sm" id="helpBtn" title="Keyboard shortcuts (?)">?</button>
+        <button id="playBtn" class="playbtn" title="Play / pause (space)"><svg viewBox="0 0 16 16" width="14" height="14"><path id="playIcon" d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg></button>
+        <span class="tc"><span id="tNow">0:00.0</span><span class="muted"> / <span id="tTotal">0:00.0</span></span></span>
+        <span class="vsep"></span>
+        <button class="link" data-act="markIn" title="Mark the start of a part at the playhead (I)">Mark in <kbd>I</kbd></button>
+        <button class="link" data-act="markOut" title="Mark the end of a part at the playhead (O)">Mark out <kbd>O</kbd></button>
+        <button class="link" data-act="split" title="Split the clip at the playhead (S)">✂ Split <kbd>S</kbd></button>
+        <button class="link" data-act="title" title="Cut to a title card at the playhead (T)">Title here</button>
+        <span id="rangeChip" class="hidden"><span id="rangeLbl"></span><button class="link" data-act="keepRange" title="Trim the clip(s) so only the marked part remains (K)">Keep <kbd>K</kbd></button><button class="link danger" data-act="cutRange" title="Remove the marked part and close the gap (⌫)">Cut out <kbd>⌫</kbd></button><button class="link muted" data-act="clearRange" title="Clear the marks (esc)">✕</button></span>
+        <span class="ctxright">
+          <button class="link" data-act="addTitle">+ Title</button>
+          <button class="link" data-act="record">⏺ Record</button>
+          <button class="link" data-act="music">♫ Music</button>
+          <span class="zoom"><button class="link muted" id="scaleBtn"></button><button class="iconbtn sm" id="zoomOut" title="Zoom out (⌘−)">−</button><button class="link muted" id="zoomFit" title="Fit (⌘0)">fit</button><button class="iconbtn sm" id="zoomIn" title="Zoom in (⌘+)">+</button></span>
+          <button class="iconbtn sm" id="helpBtn" title="Keyboard shortcuts (?)">?</button>
+        </span>
       </div>
       <div id="tl">
-        <div id="ruler"></div>
-        <div id="track"><div id="tlEmpty" class="hidden">Add your first clips with <b>+ Add</b> above, or press <b>R</b> to record.</div></div>
-        <div id="lanes"></div>
-        <div id="playhead"><div class="head"></div></div>
+        <div id="tlInner">
+          <div id="ruler"></div>
+          <div id="imgLane"></div>
+          <div id="track"><div id="tlEmpty" class="hidden">Add your first clips with <b>+ Add</b> above, or press <b>R</b> to record.</div></div>
+          <div id="lanes"></div>
+          <div id="range" class="hidden"><div class="edge l" title="Drag to move the in mark"></div><div class="edge r" title="Drag to move the out mark"></div></div>
+          <div id="playhead"><div class="head" title="Drag to scrub"></div></div>
+        </div>
       </div>
     </div>
   </section>

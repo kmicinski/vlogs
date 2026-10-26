@@ -20,7 +20,18 @@ class Config:
     default_title_subtitle: str = ""   # e.g. "daily vlog"
     default_music: str = ""            # path to a music file used for new projects
     default_transition: str = "cut"
+    default_title_kicker: str = ""     # small line above the opening card's title, e.g. "Daily Vlogs"
+    masthead_image: str = ""           # image shown as a card before the opening title (the show's "masthead")
+    intro_black_hold: float = 0.0      # extra seconds of pure black between masthead and opening card (0 = just the dip)
+    intro_masthead_seconds: float = 2.5
+    intro_title_seconds: float = 2.0
+    intro_sting: str = ""              # music cue played over the masthead + opening card
+    intro_sting_start: float = 0.0     # offset into that file
+    intro_sting_volume: float = 0.7
     font: str = "Avenir Next"
+    title_bg: str = "#0b0b0f"          # title-card colors for new projects
+    title_fg: str = "#ffffff"
+    title_accent: str = "#9aa0b4"
     port: int = 8765
 
     @property

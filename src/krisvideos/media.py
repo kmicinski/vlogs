@@ -129,6 +129,12 @@ def media_status(p: Project, src_rel: str) -> dict:
     return {"proxy": proxy_path(p, src_rel).exists(), "thumb": thumb_path(p, src_rel).exists()}
 
 
+def browser_playable(info: MediaInfo | None) -> bool:
+    """Can a browser <video> play the source file as-is (so it can stand in for the proxy)?"""
+    return bool(info and info.has_video and not info.hdr and info.codec in ("h264", "vp8", "vp9", "av1")
+                and max(info.width, info.height) <= 1920)
+
+
 # --------------------------------------------------------------------------- loudness
 
 def measure_loudness(path: Path, cache_dir: Path | None = None) -> float | None:
@@ -188,11 +194,35 @@ def ingest_recording(p: Project, blob: Path, kind: str, stamp: str, container: s
         rel = f"audio/{dst.name}"
         measure_loudness(dst, p.cache_dir)
         return rel
-    dst = p.clips_dir / f"REC_{stamp}.mp4"
+    # Fast path: the browser already encoded H.264/AAC (or VP8/VP9/Opus); just rewrite the container so the
+    # file has a proper header/duration. Takes milliseconds, and the result plays in the browser as-is.
     try:
-        has_audio = probe(blob).has_audio
+        binfo = probe(blob)
+        has_audio = binfo.has_audio
     except Exception:
-        has_audio = True
+        binfo, has_audio = None, True
+    if browser_playable(binfo):
+        ext = ".mp4" if binfo.codec == "h264" else ".webm"
+        dst = p.clips_dir / f"REC_{stamp}{ext}"
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *_TOLERANT, *fmt, "-i", str(blob), "-c", "copy",
+               "-metadata", f"creation_time={stamp}"]
+        cmd += ["-movflags", "+faststart"] if ext == ".mp4" else ["-cues_to_front", "1"]
+        r = subprocess.run(cmd + [str(dst)], capture_output=True, text=True)
+        if r.returncode == 0 and dst.exists() and dst.stat().st_size > 1000:
+            try:
+                info = probe(dst, p.cache_dir)
+                if info.duration > 0 and browser_playable(info):
+                    rel = f"clips/{dst.name}"
+                    try:
+                        make_thumbnail(p, rel)
+                    except Exception:
+                        pass
+                    prepare_async(p, rel)      # proxy + loudness in the background
+                    return rel
+            except Exception:
+                pass
+        dst.unlink(missing_ok=True)
+    dst = p.clips_dir / f"REC_{stamp}.mp4"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *_TOLERANT, *fmt, "-i", str(blob),
            "-vf", "scale='min(1920,iw)':-2,fps=30,format=yuv420p", "-c:v", "h264_videotoolbox", "-b:v", "12M",
            "-profile:v", "high", "-color_primaries:v", "bt709", "-color_trc:v", "bt709", "-colorspace:v", "bt709"]
@@ -206,8 +236,11 @@ def ingest_recording(p: Project, blob: Path, kind: str, stamp: str, container: s
         raise RuntimeError(r.stderr[-500:])
     rel = f"clips/{dst.name}"
     probe(dst, p.cache_dir)
-    prepare(p, rel)
-    measure_loudness(dst, p.cache_dir)
+    try:
+        make_thumbnail(p, rel)
+    except Exception:
+        pass
+    prepare_async(p, rel)
     return rel
 
 
@@ -221,17 +254,19 @@ def filmstrip(p: Project, src_rel: str, n: int = 8, start: float = 0.0, end: flo
     end = info.duration if end is None else min(end, info.duration)
     start = max(0.0, min(start, end))
     dur = max(0.05, end - start)
-    key = hashlib.sha1(f"{src_rel}|{n}|{start:.2f}|{end:.2f}|{height}|{src.stat().st_mtime}".encode()).hexdigest()[:16]
+    key = hashlib.sha1(f"v2|{src_rel}|{n}|{start:.2f}|{end:.2f}|{height}|{src.stat().st_mtime}".encode()).hexdigest()[:16]
     out = p.cache_dir / "strips" / f"{key}.jpg"
     if out.exists():
         return out
     out.parent.mkdir(parents=True, exist_ok=True)
     fw = int(height * info.width / max(1, info.height)) if info.width and info.height else height
     fw += fw % 2
-    # pick frame i at start + (i + 0.5) * dur / n
-    sel = "+".join(f"lt(prev_pts*TB,{start + (i + 0.5) * dur / n:.3f})*gte(pts*TB,{start + (i + 0.5) * dur / n:.3f})" for i in range(n))
+    # pick frame i at start + (i + 0.5) * dur / n. Input seeking resets timestamps to 0 at the seek
+    # point, so the thresholds are measured from there, not from the start of the file.
+    seek = max(0.0, start - 0.5)
+    sel = "+".join(f"lt(prev_pts*TB,{start - seek + (i + 0.5) * dur / n:.3f})*gte(pts*TB,{start - seek + (i + 0.5) * dur / n:.3f})" for i in range(n))
     vf = f"select='{sel}',scale={fw}:{height},tile={n}x1"
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{max(0.0, start - 0.5):.3f}", "-t", f"{dur + 1.5:.3f}",
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seek:.3f}", "-t", f"{dur + 1.5:.3f}",
            "-i", str(src), "-vf", vf, "-frames:v", "1", "-fps_mode", "passthrough", "-q:v", "5", str(out)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not out.exists():

@@ -140,6 +140,18 @@ def compute_layout(p: Project, infos: dict[str, MediaInfo] | None = None, scale:
                   orientation=orientation)
 
 
+def sting_span(layout: Layout, m) -> tuple[float, float] | None:
+    """Output-timeline (start, end) a sting plays over, from its anchor segments. None if both are gone."""
+    by_id = {pl.seg.id: pl for pl in layout.placed}
+    a, b = by_id.get(m.from_id), by_id.get(m.to_id or m.from_id)
+    a, b = a or b, b or a
+    if a is None:
+        return None
+    if a.index > b.index:
+        a, b = b, a
+    return a.start, b.end
+
+
 def locate(layout: Layout, t: float) -> tuple[Placed | None, float]:
     """Map an output-timeline time to (placed segment, seconds into that segment)."""
     for pl in layout.placed:
@@ -218,15 +230,23 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         dur = pl.duration
         if s.kind == "title":
             bg, fg = s.bg or st.title_bg, s.fg or st.title_fg
+            image = None
+            if s.image:
+                image = p.resolve(s.image)
+                if not image.exists():
+                    warnings.append(f"card image not found: {s.image}")
+                    image = None
             png = titles.render_title_card(p.cache_dir, W, H, s.text, s.subtitle, font=st.font, bg=bg,
-                                           fg=fg, accent=st.title_accent, layout=s.layout)
+                                           fg=fg, accent=st.title_accent, layout=s.layout, kicker=s.kicker,
+                                           image=image, fit=s.fit)
             k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", str(png)])
             tf = min(st.title_fade, dur / 3)
             fade = ""
-            if tf > 0:
+            if tf > 0 and image is None:   # text cards fade their text in/out; image cards are joined by transitions
                 c = _hexcolor(bg)
                 fade = f",fade=t=in:st=0:d={tf:.3f}:c={c},fade=t=out:st={dur - tf:.3f}:d={tf:.3f}:c={c}"
-            filters.append(f"[{k}:v]format=yuv420p,setsar=1,fps={FPS},trim=duration={dur:.3f},setpts=PTS-STARTPTS{fade},settb=AVTB[v{i}]")
+            # NB: `fps` must come after trim/setpts/fade, or the stream loses its constant frame rate and xfade refuses it
+            filters.append(f"[{k}:v]format=yuv420p,setsar=1,trim=duration={dur:.3f},setpts=PTS-STARTPTS{fade},fps={FPS},settb=AVTB[v{i}]")
             filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
         else:
             info = pl.info
@@ -247,7 +267,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 vchain.append(f"scale={fw}:{fh}:flags=bicubic")
                 if (fw, fh) != (W, H):
                     vchain.append(f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black")
-            vchain.append(f"setsar=1,fps={FPS},format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS")
+            vchain.append(f"setsar=1,format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
             filters.append(f"[{k}:v]{','.join(vchain)}[vb{i}]")
             cur = f"vb{i}"
             # captions/overlays
@@ -318,6 +338,24 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         V, A = f"V{gi}", f"A{gi}"
     total = layout.total
 
+    # pictures over the video (the images track), stacked in list order, each fading in and out
+    for n, im in enumerate(p.images):
+        src = p.resolve(im.file)
+        if not src.exists():
+            warnings.append(f"image not found: {im.file}")
+            continue
+        a = max(0.0, im.at)
+        d = min(im.duration, total - a)
+        if d < 0.05:
+            continue
+        png = titles.render_layer(p.cache_dir, W, H, src, im.box, im.fit)
+        k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", str(png)])
+        fd = min(im.fade, d / 3)
+        fades = f",fade=t=in:st=0:d={fd:.3f}:alpha=1,fade=t=out:st={d - fd:.3f}:d={fd:.3f}:alpha=1" if fd > 0 else ""
+        filters.append(f"[{k}:v]format=rgba{fades},setpts=PTS-STARTPTS+{a:.3f}/TB[im{n}]")
+        filters.append(f"[{V}][im{n}]overlay=0:0:eof_action=pass:enable='between(t,{a:.3f},{a + d:.3f})'[VI{n}]")
+        V = f"VI{n}"
+
     # global video fades
     vf = []
     if st.fade_in > 0:
@@ -352,6 +390,45 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         else:
             filters.append(f"[{A}][vobus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
         A = "Avo"
+
+    # stings: short music cues anchored to segments, mixed at full level (music ducks under them)
+    stings = []
+    for m in p.stings:
+        span = sting_span(layout, m)
+        if span is None:
+            warnings.append(f"sting {m.id}: its segments are gone")
+        elif not p.resolve(m.file).exists():
+            warnings.append(f"sting file not found: {m.file}")
+        elif span[1] - span[0] > 0.1:
+            stings.append((m, span))
+    if stings:
+        labels = []
+        for n, (m, (t0, t1)) in enumerate(stings):
+            length = t1 - t0
+            seek = ["-ss", f"{m.start:.3f}"] if m.start > 0 else []
+            km = add_input(seek + ["-t", f"{length:.3f}", "-i", str(p.resolve(m.file))])
+            fi, fo = min(m.fade_in, length / 2), min(m.fade_out, length / 2)
+            chain = [AUDIO_FMT, "asetpts=PTS-STARTPTS", f"atrim=duration={length:.3f}", f"apad=whole_dur={length:.3f}",
+                     f"volume={m.volume}"]
+            if fi > 0:
+                chain.append(f"afade=t=in:st=0:d={fi:.3f}")
+            if fo > 0:
+                chain.append(f"afade=t=out:st={length - fo:.3f}:d={fo:.3f}")
+            chain += [f"adelay={int(t0 * 1000)}:all=1", f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
+            filters.append(f"[{km}:a]{','.join(chain)}[st{n}]")
+            labels.append(f"st{n}")
+        if len(labels) == 1:
+            filters.append(f"[{labels[0]}]anull[stbus]")
+        else:
+            filters.append("".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[stbus]")
+        if any(m.duck for m, _ in stings):
+            # duck the cue bus under speech in the clips (same sidechain as the background music)
+            filters.append(f"[{A}]asplit[Akeep][Askey]")
+            filters.append("[stbus][Askey]sidechaincompress=threshold=0.04:ratio=5:attack=150:release=900:makeup=1[stducked]")
+            filters.append("[Akeep][stducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Ast]")
+        else:
+            filters.append(f"[{A}][stbus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Ast]")
+        A = "Ast"
 
     # music
     if p.music.file:

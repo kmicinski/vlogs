@@ -1,6 +1,6 @@
 #!/bin/bash
 # KrisVideos launcher: start the local server (if not already running) and open the GUI.
-REPO="/Users/kmicinski/projects/krisvideos"
+REPO="/Users/kkmicins/projects/vlogs"
 PORT=8765
 URL="http://127.0.0.1:$PORT"
 LOG="$HOME/Library/Logs/krisvideos.log"
