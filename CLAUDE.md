@@ -43,6 +43,21 @@ in the player (`paintLayers`, drag/resize in `layerPointer`). Server `commit()` 
 `edits.follow_content(before, after)` so pictures and voiceovers stay on their frames through any
 clip edit (except raw script saves); CLI trim/rm/move do the same.
 
+Picture in picture: a clip segment may carry `pip:` (`Pip`: `clip`, `offset`, `box` x/y/w[/h] fractions,
+`fit`, `shape` round|rect|circle, `hidden`) and `box:` (where the main picture goes; None = whole frame).
+pip time = main source time + `offset`, so trims/splits never touch it; `edits.swap_pip` exchanges the
+two (shifting in/out/markers by the offset), `edits.pip_layout(seg, corner|corner-large|stacked|hidden,
+(W, H), aspect, pos)` sets the standard layouts (the JS `pipLayoutBoxes` mirrors it). `render.py` places
+the main in its box (scale + pad) and overlays the inset (Pillow mask PNG + `alphamerge`, shadow PNG).
+Screen takes: the recorder's *Screen* tab records the shared screen and the camera as two
+MediaRecorders in one session (`record/start` body `pip: {...}`, chunks with `?track=pip`,
+`record/{id}/sync` posts the start offset); `finalize_recording` ingests both (`REC_<id>-screen.mp4`,
+`REC_<id>-cam.mp4`) and builds the segment. GUI: `VP.syncPip` shows the inset from its proxy in
+`#pipBox` (drag/resize → `PATCH segments/{id}` `pip: {box}`); inspector `pipInspectorHtml` uses
+`pip_layout: "corner:br"`, `pip_swap`, `pip: null`. CLI: `vlog pip`; `vlog show` prints `pip=…`.
+When Kris says "show the screen big and me small" → `pip_layout corner` (or `--swap` first if the
+camera is the main clip); "put me on top" → `stacked`; "just the screen" → `hidden`.
+
 Timeline edits in output time live in `edits.py` (`split_segment`, `insert_index_at`, `title_at`,
 `cut_range`, `keep_range`, `set_in`): they keep overlays on their frames and move voiceovers with
 their pictures. Server: `POST /split` `/cut` `/keep`; `POST /segments` takes `in`/`out` and
@@ -73,6 +88,13 @@ exists, `project_json` reports the source itself as `proxy_url` for `media.brows
 sidechain ducking of clip audio; music ducking keys off that bus. Level matching uses cached
 per-file LUFS (`cache/*.loud.json`, `media.measure_loudness`) with ±12 dB gain toward
 `audio.target_lufs`. `fit: cover` clips are excluded from the auto-orientation vote.
+Clip `channel:` (auto | stereo | left | right | mix): `media.audio_analysis` measures per-channel RMS with
+the LUFS pass (`cache/<name>.loud.json`, `one_sided`), `media.effective_channel` resolves `auto` (a one-sided
+take → that channel to both ears, via `media.CHANNEL_PAN` in render.py's clip audio chain; LUFS for the
+gain are measured on that result, `cache/<name>.loud.<ch>.json`); the live player routes the element through
+Web Audio (`VP.route`) and the inspector has a *Channels* select. When Kris says "my mic only recorded on
+the right / the audio is only in one ear" → `vlog set PROJ sN channel=right` (auto usually already did it;
+`vlog show` prints `audio=auto→right to both ears`).
 
 ## Development
 - `uv sync`; run with `.venv/bin/vlog ...`; GUI: `.venv/bin/vlog serve --port 8799`.

@@ -335,3 +335,46 @@ def render_layer(cache_dir: Path, w: int, h: int, image: Path, box: tuple | None
     frame.alpha_composite(layer)
     frame.save(out)
     return out
+
+
+def render_pip_mask(cache_dir: Path, pw: int, ph: int, shape: str, radius: int) -> Path:
+    """Grayscale alpha mask for an inset of pw×ph pixels: rounded corners, a circle/ellipse, or plain."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _key("pipmask1", pw, ph, shape, radius)
+    out = cache_dir / f"pipmask_{key}.png"
+    if out.exists():
+        return out
+    mask = Image.new("L", (pw, ph), 0)
+    d = ImageDraw.Draw(mask)
+    if shape == "circle":
+        d.ellipse([0, 0, pw - 1, ph - 1], fill=255)
+    elif shape == "rect":
+        d.rectangle([0, 0, pw - 1, ph - 1], fill=255)
+    else:
+        d.rounded_rectangle([0, 0, pw - 1, ph - 1], radius=radius, fill=255)
+    mask.save(out)
+    return out
+
+
+def render_pip_shadow(cache_dir: Path, w: int, h: int, left: int, top: int, pw: int, ph: int, shape: str, radius: int) -> Path:
+    """Transparent full-frame PNG with a soft drop shadow under where an inset goes, so it reads as
+    sitting on top of the video (same look as pictures over the video)."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    key = _key("pipshadow1", w, h, left, top, pw, ph, shape, radius)
+    out = cache_dir / f"pipshadow_{key}.png"
+    if out.exists():
+        return out
+    short = min(w, h)
+    blur = max(2, int(short * 0.012))
+    dy = int(short * 0.006)
+    shadow = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(shadow)
+    rect = [left, top + dy, left + pw, top + ph + dy]
+    if shape == "circle":
+        d.ellipse(rect, fill=(0, 0, 0, 110))
+    elif shape == "rect":
+        d.rectangle(rect, fill=(0, 0, 0, 110))
+    else:
+        d.rounded_rectangle(rect, radius=radius, fill=(0, 0, 0, 110))
+    shadow.filter(ImageFilter.GaussianBlur(blur)).save(out)
+    return out

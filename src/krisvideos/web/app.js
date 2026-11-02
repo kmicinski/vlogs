@@ -54,6 +54,12 @@ function popover(anchor, items) {
 }
 function closePopover() { const el = $('#popover'); el.classList.add('hidden'); if (el._onDown) { document.removeEventListener('mousedown', el._onDown); el._onDown = null; } }
 const field = (label, inner) => `<div class="field"><label>${label}</label>${inner}</div>`;
+// the Channels select of a clip: what `auto` does to this file is spelled out
+const channelOptions = s => {
+  const auto = s.one_sided ? `Auto: only the ${s.one_sided} channel has sound → copied to both ears` : s.lufs == null && !s.media ? 'Auto' : 'Auto: stereo as recorded';
+  return [['auto', auto], ['stereo', 'Stereo as recorded'], ['left', 'Left channel to both ears'], ['right', 'Right channel to both ears'], ['mix', 'Mix both to mono']]
+    .map(([v, l]) => `<option value="${v}" ${(s.channel || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('');
+};
 const gainFactor = s => { if (!P.match_levels || s.lufs == null) return 1; return Math.pow(10, clamp(P.target_lufs - s.lufs, -12, 12) / 20); };
 
 // ================================================================== projects
@@ -86,7 +92,7 @@ function setProject(p) {
   AUD.projectChanged(); VP.projectChanged();
   if (P.final && !P.final.stale) { $('#doneBar').classList.remove('hidden'); $('#doneBar .msg').textContent = `Exported ${P.final.path.split('/').pop()} · ${(P.final.size / 1e6).toFixed(1)} MB`; }
   else $('#doneBar').classList.add('hidden');
-  const pending = P.timeline.filter(s => s.kind === 'clip' && !s.missing && (!s.proxy_url || !s.thumb_url)).length;
+  const pending = P.timeline.filter(s => s.kind === 'clip' && !s.missing && (!s.proxy_url || !s.thumb_url || (s.pip && !s.pip.missing && !s.pip.proxy_url))).length;
   clearTimeout(setProject._t); if (pending) setProject._t = setTimeout(refresh, 2000);
 }
 async function refresh() { if (P) setProject(await api('GET', `/api/projects/${P.name}`)); }
@@ -157,7 +163,50 @@ const VP = (() => {
   let rendered = false;
   const useRendered = () => !!(P && P.preview && !P.preview.stale);
   const setSrc = (v, url) => { if (v.dataset.url !== url) { v.dataset.url = url; v.src = url; v.load(); } };
-  function reset() { for (const v of videos) { v.pause(); v.removeAttribute('src'); v.dataset.url = ''; v.load(); v.classList.add('hidden'); } cards.forEach(c => c.classList.add('hidden')); owner.clear(); paintLayers(-1); }
+  // channel routing for one-sided takes (a mic on the right channel only): the element plays through Web
+  // Audio and the chosen channel is copied to both ears, like render.py's pan filter. An element is hooked
+  // the first time a clip needs it and keeps playing through the context from then on.
+  const MIX = { stereo: [[1, 0], [0, 1]], left: [[1, 0], [1, 0]], right: [[0, 1], [0, 1]], mix: [[.5, .5], [.5, .5]] };   // [ear][source channel]
+  let actx = null; const routes = new Map();
+  function route(el, mode) {
+    mode = MIX[mode] ? mode : 'stereo';
+    let r = routes.get(el);
+    if (!r) {
+      if (mode === 'stereo') return;
+      try {
+        actx = actx || new AudioContext();
+        const src = actx.createMediaElementSource(el), sp = actx.createChannelSplitter(2), mg = actx.createChannelMerger(2);
+        src.connect(sp); mg.connect(actx.destination);
+        const gains = [[null, null], [null, null]];
+        for (let o = 0; o < 2; o++) for (let i = 0; i < 2; i++) { const g = actx.createGain(); sp.connect(g, i); g.connect(mg, 0, o); gains[o][i] = g; }
+        r = { gains, mode: '' }; routes.set(el, r);
+      } catch (e) { console.warn('channel routing unavailable', e); routes.set(el, { gains: null, mode }); return; }
+    }
+    if (actx && actx.state === 'suspended') actx.resume().catch(() => { });
+    if (!r.gains || r.mode === mode) return;
+    r.mode = mode;
+    for (let o = 0; o < 2; o++) for (let i = 0; i < 2; i++) r.gains[o][i].gain.value = MIX[mode][o][i];
+  }
+  function reset() { for (const v of videos) { v.pause(); v.removeAttribute('src'); v.dataset.url = ''; v.load(); v.classList.add('hidden'); } cards.forEach(c => c.classList.add('hidden')); owner.clear(); paintLayers(-1); syncPip(null); }
+  // the inset (picture in picture) of the clip on screen, from its proxy, in sync with the clip
+  function syncPip(s, t, opacity = 1, z = 1) {
+    const box = $('#pipBox'), v = $('#vP');
+    const pip = s && s.kind === 'clip' && s.placed && s.pip && !s.pip.hidden && !s.pip.missing ? s.pip : null;
+    const url = pip && (pip.proxy_url || pip.src_url);
+    if (!url) { box.classList.add('hidden'); box.dataset.seg = ''; if (!v.paused) v.pause(); return; }
+    setSrc(v, url);
+    const want = Math.max(0, (s.in || 0) + (t - s.placed.start) * (s.speed || 1) + (pip.offset || 0));
+    v.playbackRate = clamp(s.speed || 1, 0.25, 4); v.muted = true;
+    if (Math.abs(v.currentTime - want) > (playing ? 0.3 : 0.04) || v.dataset.seg !== s.id) { try { v.currentTime = want; } catch { } v.dataset.seg = s.id; }
+    if (playing && v.paused) v.play().catch(() => { });
+    if (!playing && !v.paused) v.pause();
+    const [W, H] = canvasWH(), cr = $('#canvas').getBoundingClientRect();
+    box.className = `pipbox ${pip.shape || 'round'}${sel === s.id ? ' sel' : ''}`;
+    box.style.borderRadius = pip.shape === 'circle' ? '50%' : pip.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width, cr.height) * 0.02)}px`;
+    boxStyle(box, pip.box, W, H, pipAspect(pip.media), pip.shape);
+    v.style.objectFit = pip.fit === 'contain' ? 'contain' : 'cover';
+    box.style.opacity = opacity; box.style.zIndex = z; box.dataset.seg = s.id;
+  }
   // pictures over the video: one element per visible picture, positioned like the render does
   const lyrEls = new Map();
   function paintLayers(t) {
@@ -238,8 +287,10 @@ const VP = (() => {
     const want = (s.in || 0) + (t - s.placed.start) * (s.speed || 1);
     el.playbackRate = clamp(s.speed || 1, 0.25, 4);
     el.style.objectFit = s.fit === 'cover' ? 'cover' : 'contain';
+    mainBoxStyle(el, s.box);
     el.muted = !!s.mute || !playing;
     el.volume = clamp((s.volume ?? 1) * gainFactor(s) * weight * duck, 0, 1);
+    route(el, s.channel_effective);
     const drift = Math.abs(el.currentTime - want);
     if (drift > (playing ? 0.3 : 0.04) || el.dataset.seg !== s.id) { try { el.currentTime = want; } catch { } el.dataset.seg = s.id; }
     if (playing && el.paused) el.play().catch(() => { });
@@ -251,7 +302,8 @@ const VP = (() => {
     paintLayers(t);
     if (rendered) {
       cards.forEach(c => c.classList.add('hidden')); captions(null); videos[1].classList.add('hidden');
-      const v = videos[0]; setSrc(v, P.preview.url); v.classList.remove('hidden'); v.style.opacity = 1; v.style.objectFit = 'contain'; v.muted = false; v.volume = 1; v.playbackRate = 1;
+      syncPip(null);
+      const v = videos[0]; setSrc(v, P.preview.url); v.classList.remove('hidden'); v.style.opacity = 1; v.style.objectFit = 'contain'; mainBoxStyle(v, null); v.muted = false; v.volume = 1; v.playbackRate = 1; route(v, 'stereo');
       if (hard || Math.abs(v.currentTime - t) > 0.25) { try { v.currentTime = t; } catch { } }
       return;
     }
@@ -267,9 +319,11 @@ const VP = (() => {
       const a = present(s, t, oA, 1 - frac, n, duck), b = present(n, t, oB, frac, s, duck);
       b.classList.add('top'); a.classList.remove('top'); active.push(a, b);
       captions(frac < 0.5 ? s : n, frac < 0.5 ? L.off : t - n.placed.start);
+      if (frac < 0.5) syncPip(s, t, oA, 1); else syncPip(n, t, oB, 3);
     } else {
       const a = present(s, t, 1, 1, null, duck); a.classList.remove('top'); active.push(a);
       captions(s, L.off);
+      syncPip(s, t, 1, 1);
       // preload the next clip into the spare video element
       if (n && n.kind === 'clip' && (n.proxy_url || n.src_url) && s.placed.end - t < 2.5) {
         const spare = videos.find(v => v !== a); const nu = n.proxy_url || n.src_url;
@@ -280,13 +334,13 @@ const VP = (() => {
   }
   function showSource(s, srcTime) {   // trim-handle drag: show an arbitrary source frame
     const el = layerFor(s, null); const url = s.proxy_url || s.src_url; if (!url) return;
-    cards.forEach(c => c.classList.add('hidden')); videos.forEach(v => v.classList.toggle('hidden', v !== el)); paintLayers(-1);
-    setSrc(el, url); el.pause(); el.muted = true; el.style.opacity = 1; el.style.objectFit = s.fit === 'cover' ? 'cover' : 'contain';
+    cards.forEach(c => c.classList.add('hidden')); videos.forEach(v => v.classList.toggle('hidden', v !== el)); paintLayers(-1); syncPip(null);
+    setSrc(el, url); el.pause(); el.muted = true; el.style.opacity = 1; el.style.objectFit = s.fit === 'cover' ? 'cover' : 'contain'; mainBoxStyle(el, s.box);
     try { el.currentTime = srcTime; } catch { } el.dataset.seg = '';
   }
-  function pauseAll() { videos.forEach(v => v.pause()); AUD.pause(); }
+  function pauseAll() { videos.forEach(v => v.pause()); $('#vP').pause(); AUD.pause(); }
   const mainVideo = () => videos[0];
-  return { sync, showSource, pauseAll, reset, projectChanged, fitCanvas, isRendered: () => rendered, mainVideo };
+  return { sync, showSource, pauseAll, reset, projectChanged, fitCanvas, isRendered: () => rendered, mainVideo, channelRoutes: () => [...routes].map(([el, r]) => el.id + ":" + (r.gains ? r.mode : "unavailable")) };
 })();
 
 function play() {
@@ -400,7 +454,7 @@ function renderTimeline() {
     b.className = `block ${s.kind}${s.missing ? ' missing' : ''}${s.id === sel ? ' selected' : ''}${s.kind === 'clip' && !s.missing && !s.proxy_url ? ' pending' : ''}`;
     b.style.left = `${blk.x0}px`; b.style.width = `${w}px`; b.dataset.id = s.id; b.draggable = true;
     const xf = s.placed.transition !== 'cut' ? '<div class="xf"></div>' : '';
-    const meta = `<div class="meta">${fmt(s.placed.duration)}${s.speed && s.speed !== 1 ? ` ×${s.speed}` : ''}${s.mute ? ' 🔇' : ''}${s.fit === 'cover' ? ' ⤢' : ''}</div>`;
+    const meta = `<div class="meta">${fmt(s.placed.duration)}${s.speed && s.speed !== 1 ? ` ×${s.speed}` : ''}${s.mute ? ' 🔇' : ''}${s.fit === 'cover' ? ' ⤢' : ''}${s.pip && !s.pip.hidden ? ' ⧉' : ''}</div>`;
     if (s.kind === 'title') {
       const black = !s.title && !s.image && (s.bg || '').toLowerCase() === '#000000';
       b.classList.toggle('img', !!s.image_url); b.classList.toggle('black', black);
@@ -676,8 +730,10 @@ function renderInspector() {
       `<div class="field"><label>Text overlays</label><div id="ovList"></div><button class="link" id="ovAdd" style="align-self:flex-start">+ Add overlay at playhead</button></div>` +
       field('Speed', `<div class="inline"><input type="range" data-k="speed" min="0.25" max="4" step="0.25" value="${s.speed || 1}"><span id="speedLbl" style="width:34px">${s.speed || 1}×</span></div>`) +
       field('Fit', `<select data-k="fit"><option value="contain" ${s.fit !== 'cover' ? 'selected' : ''}>Letterbox (show everything)</option><option value="cover" ${s.fit === 'cover' ? 'selected' : ''}>Crop to fill</option></select>`) +
+      pipInspectorHtml(s) +
       `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
-      field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`);
+      field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`) +
+      (m.has_audio ? field('Channels', `<select data-k="channel">${channelOptions(s)}</select>`) : '');
   }
   html += field('Transition in', `<div class="inline"><select data-k="transition">${trOpts}</select><input type="number" data-k="transition_duration" step="0.1" min="0.1" max="3" value="${s.transition_duration ?? ''}" placeholder="${P.style.transition_duration}s" style="flex:0 0 64px"></div>`);
   html += `<div class="sep"></div><div class="actions"><button class="link" id="segUp" title="[">← Move</button><button class="link" id="segDown" title="]">Move →</button><button class="link" id="segDup">Duplicate</button><span class="spacer"></span><button class="link danger" id="segDelete">Delete</button></div>`;
@@ -693,6 +749,7 @@ function renderInspector() {
   if ($('#imgPick')) $('#imgPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'image' }); if (r.paths[0]) await patchSeg(s.id, { image: r.paths[0] }); });
   if ($('#imgClear')) $('#imgClear').onclick = () => patchSeg(s.id, { image: '' });
   if ($('#muteChk')) $('#muteChk').onchange = e => patchSeg(s.id, { mute: e.target.checked });
+  if (s.kind === 'clip') bindPipInspector(s);
   if ($('#segTrim')) $('#segTrim').onclick = () => openTrimmer([s.clip], { segId: s.id });
   $$('[data-mkgo]', el).forEach(b => b.onclick = () => { stop(); seek(+b.dataset.mkgo, true); });
   $$('[data-mkrm]', el).forEach(b => b.onclick = () => patchSeg(s.id, { markers: (s.markers || []).filter(m => Math.abs(m - +b.dataset.mkrm) > 1e-4) }));
@@ -707,6 +764,27 @@ function renderInspector() {
     await refresh();
   });
   if (s.kind === 'clip') renderOverlays(s);
+}
+// picture in picture: the inset's layout (small / large corner, stacked, hidden), corner, shape, swap
+function pipInspectorHtml(s) {
+  const pp = s.pip;
+  if (!pp) return `<div class="field"><label>Picture in picture</label><button class="link" id="pipAdd" style="align-self:flex-start">+ Put another clip in a box over this one…</button></div>`;
+  const [W, H] = canvasWH(), lay = pipLayoutOf(s), anchor = pipAnchorOf(s);
+  return `<div class="field"><label>Picture in picture</label>
+    <div class="insp-img">${pp.thumb_url ? `<img src="${pp.thumb_url}">` : ''}<span class="sub" title="${esc(pp.src)}">${esc(pp.src.replace(/^clips\//, ''))}${pp.missing ? ' <b style="color:var(--danger)">missing</b>' : ''}</span><span class="spacer"></span><button class="link" id="pipSwap" title="Show the inset big and this clip in the box instead">⇄ Swap</button><button class="link muted" id="pipRm">Remove</button></div>
+    <div class="seg" id="pipLayout">${pipLayoutNames(W, H).map(([k, l]) => `<button data-k="${k}" class="${k === lay ? 'on' : ''}">${l}</button>`).join('')}</div>
+    ${!pp.hidden && !(s.box && pp.box[3] != null) ? `<div class="inline" style="margin-top:8px"><div class="grid9" id="pipPos">${POS9.map(p => `<button data-p="${p}" class="${p === anchor ? 'on' : ''}"></button>`).join('')}</div><span class="muted" style="font-size:11.5px;line-height:1.4">or drag it on the video;<br>drag a corner to resize</span></div>` : ''}
+    ${!pp.hidden ? `<div class="seg" id="pipShape" style="margin-top:8px"><button data-v="round" class="${pp.shape === 'round' ? 'on' : ''}">Rounded</button><button data-v="rect" class="${pp.shape === 'rect' ? 'on' : ''}">Square corners</button><button data-v="circle" class="${pp.shape === 'circle' ? 'on' : ''}">Circle</button></div>` : ''}
+  </div>`;
+}
+function bindPipInspector(s) {
+  const lay = pipLayoutOf(s), anchor = pipAnchorOf(s);
+  if ($('#pipAdd')) $('#pipAdd').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'files' }); if (r.paths[0]) { await patchSeg(s.id, { pip: { clip: r.paths[0] }, pip_layout: 'corner:br' }); toast('Inset added: drag it on the video, or pick a layout'); } });
+  if ($('#pipSwap')) $('#pipSwap').onclick = () => patchSeg(s.id, { pip_swap: true });
+  if ($('#pipRm')) $('#pipRm').onclick = () => patchSeg(s.id, { pip: null, box: null });
+  $$('#pipLayout button').forEach(b => b.onclick = () => patchSeg(s.id, { pip_layout: b.dataset.k + (b.dataset.k.startsWith('corner') && anchor ? ':' + anchor : '') }));
+  $$('#pipPos button').forEach(b => b.onclick = () => patchSeg(s.id, { pip_layout: `${lay === 'corner-large' ? 'corner-large' : 'corner'}:${b.dataset.p}` }));
+  $$('#pipShape button').forEach(b => b.onclick = () => patchSeg(s.id, { pip: { shape: b.dataset.v } }));
 }
 function renderOverlays(s) {
   const box = $('#ovList');
@@ -770,6 +848,7 @@ $('#addBtn').onclick = e => popover(e.currentTarget, [
   { label: 'From Immich…', fn: () => openLibrary('immich') },
   { label: 'From files…', fn: () => openLibrary('files') },
   { label: 'Record camera…', k: 'R', fn: () => openRecorder('clip') },
+  { label: 'Record screen (+ camera)…', fn: () => openRecorder('screen') },
   { label: 'Record voiceover…', fn: () => openRecorder('voiceover') },
   '-',
   { label: 'Title card', fn: addTitleSheet },
@@ -875,6 +954,48 @@ window.addEventListener('drop', e => {
 const imgOf = id => (P && id ? (P.images || []).find(x => x.id === id) : null);
 const IMG_SIZES = [['full', 'Full screen', null], ['large', 'Large', 0.8], ['half', 'Half', 0.5], ['small', 'Small', 0.32]];
 const POS9 = ['tl', 't', 'tr', 'l', 'c', 'r', 'bl', 'b', 'br'];
+// ---- picture in picture (a second clip in a box over a clip): layout math shared by the player,
+// the inspector and the recorder preview. Boxes are [x, y, w, h] fractions of the frame (centre and
+// size; h null = the picture's own aspect). Mirrors edits.pip_layout on the server.
+const canvasWH = () => (P && P.layout) ? [P.layout.width, P.layout.height] : [1920, 1080];
+const pipAspect = m => (m && m.width && m.height) ? m.height / m.width : 9 / 16;   // height / width of the inset's picture
+function pipAnchorBox(w, pos, W, H, aspect, m = 0.04) {
+  const hf = w * W / H * aspect, i = Math.max(0, POS9.indexOf(pos)), col = i % 3, row = Math.floor(i / 3);
+  return [[m + w / 2, 0.5, 1 - m - w / 2][col], [m + hf / 2, 0.5, 1 - m - hf / 2][row], w, null].map(v => v == null ? null : +v.toFixed(4));
+}
+function pipLayoutBoxes(name, pos, W, H, aspect) {   // -> { box: main clip's box or null, pip: inset box, shape }
+  const portrait = H > W;
+  if (name === 'stacked') {
+    if (!portrait) return { box: [0.69, 0.5, 0.62, 1], pip: [0.19, 0.5, 0.38, 1], shape: 'rect' };
+    const hc = +(W / H).toFixed(4);
+    return { box: [0.5, +((1 + hc) / 2).toFixed(4), 1, +(1 - hc).toFixed(4)], pip: [0.5, +(hc / 2).toFixed(4), 1, hc], shape: 'rect' };
+  }
+  const w = name === 'corner-large' ? (portrait ? 0.6 : 0.45) : (portrait ? 0.42 : 0.3);
+  return { box: null, pip: pipAnchorBox(w, pos || 'br', W, H, aspect), shape: 'round' };
+}
+const pipLayoutNames = (W, H) => [['corner', 'Small inset'], ['corner-large', 'Large inset'], ['stacked', H > W ? 'Stacked' : 'Side by side'], ['hidden', 'Hide inset']];
+function pipLayoutOf(s) {      // which standard layout a clip + inset currently is in ('' = custom)
+  const pp = s.pip; if (!pp) return '';
+  if (pp.hidden) return 'hidden';
+  const [W, H] = canvasWH(), portrait = H > W;
+  if (s.box && pp.box[3] != null) return 'stacked';
+  if (pp.box[3] != null) return '';
+  const w = pp.box[2];
+  return Math.abs(w - (portrait ? 0.42 : 0.3)) < 0.01 ? 'corner' : Math.abs(w - (portrait ? 0.6 : 0.45)) < 0.01 ? 'corner-large' : '';
+}
+function pipAnchorOf(s) {
+  const pp = s.pip; if (!pp || pp.box[3] != null) return null;
+  const [W, H] = canvasWH(), ar = pipAspect(pp.media);
+  return POS9.find(p => { const [ax, ay] = pipAnchorBox(pp.box[2], p, W, H, ar); return Math.abs(ax - pp.box[0]) < 0.01 && Math.abs(ay - pp.box[1]) < 0.01; }) || null;
+}
+const boxH = (box, W, H, aspect, shape) => box[3] != null ? box[3] : box[2] * W / H * (shape === 'circle' ? 1 : aspect);
+function boxStyle(el, box, W, H, aspect, shape) {   // position an absolutely placed element (centre-anchored) in a box
+  el.style.left = `${box[0] * 100}%`; el.style.top = `${box[1] * 100}%`; el.style.width = `${box[2] * 100}%`; el.style.height = `${boxH(box, W, H, aspect, shape) * 100}%`;
+}
+function mainBoxStyle(el, box, mirror = false, W = null, H = null) {   // a <video> that normally fills its container, placed in a box (or back to full)
+  if (box) { if (W == null) [W, H] = canvasWH(); boxStyle(el, box, W, H, 9 / 16); el.style.right = el.style.bottom = 'auto'; el.style.transform = `translate(-50%, -50%)${mirror ? ' scaleX(-1)' : ''}`; }
+  else { el.style.left = el.style.top = el.style.width = el.style.height = el.style.right = el.style.bottom = ''; el.style.transform = mirror ? 'scaleX(-1)' : ''; }
+}
 function imgHeightFrac(L, w) {   // the picture's height as a fraction of the frame height, at width fraction w
   const fw = (P.layout && P.layout.width) || 1920, fh = (P.layout && P.layout.height) || 1080;
   return w * fw / fh * ((L.ih || 9) / (L.iw || 16));
@@ -1018,6 +1139,40 @@ function layerPointer(e, id) {
   };
   el.addEventListener('pointermove', move); el.addEventListener('pointerup', up); el.addEventListener('pointercancel', up);
 }
+// dragging the inset on the video moves it; its corners resize it from the opposite corner (aspect kept)
+$('#pipBox').addEventListener('pointerdown', e => {
+  if (e.button !== 0 || !P) return;
+  const box = $('#pipBox'), id = box.dataset.seg, s = P.timeline.find(x => x.id === id); if (!s || !s.pip) return;
+  e.preventDefault(); e.stopPropagation(); stop();
+  if (sel !== id) select(id);
+  const cr = $('#canvas').getBoundingClientRect(), cw = cr.width, ch = cr.height, [W, H] = canvasWH();
+  const handle = e.target.closest('.rz'), x0 = e.clientX, y0 = e.clientY, b0 = [...s.pip.box], ar = pipAspect(s.pip.media);
+  const hfOf = w => boxH([0, 0, w, b0[3] != null ? b0[3] * w / b0[2] : null], W, H, ar, s.pip.shape);
+  try { box.setPointerCapture(e.pointerId); } catch { }
+  let moved = false;
+  const move = ev => {
+    let [x, y, w] = b0;
+    if (handle) {
+      const c = handle.dataset.c, sx = c.includes('l') ? -1 : 1, sy = c.includes('t') ? -1 : 1;
+      const ox = x - sx * w / 2, oy = y - sy * hfOf(w) / 2;
+      const px = (ev.clientX - cr.left) / cw, py = (ev.clientY - cr.top) / ch;
+      w = clamp(Math.max(sx * (px - ox), sy * (py - oy) * w / hfOf(w)), 0.08, 1);
+      x = ox + sx * w / 2; y = oy + sy * hfOf(w) / 2;
+    } else {
+      x += (ev.clientX - x0) / cw; y += (ev.clientY - y0) / ch;
+      const hf = hfOf(w), m = 0.04, tol = 0.012;       // snap to the centre lines and to the margin
+      for (const cx of [0.5, m + w / 2, 1 - m - w / 2]) if (Math.abs(x - cx) < tol) { x = cx; break; }
+      for (const cy of [0.5, m + hf / 2, 1 - m - hf / 2]) if (Math.abs(y - cy) < tol) { y = cy; break; }
+    }
+    moved = true; s.pip.box = [x, y, w, b0[3] != null ? hfOf(w) : null];
+    boxStyle(box, s.pip.box, W, H, ar, s.pip.shape);
+  };
+  const up = () => {
+    box.removeEventListener('pointermove', move); box.removeEventListener('pointerup', up); box.removeEventListener('pointercancel', up);
+    if (moved) { const [x, y, w, h] = s.pip.box; patchSeg(id, { pip: { box: { x: +x.toFixed(4), y: +y.toFixed(4), w: +w.toFixed(4), h: h == null ? null : +h.toFixed(4) } } }); }
+  };
+  box.addEventListener('pointermove', move); box.addEventListener('pointerup', up); box.addEventListener('pointercancel', up);
+});
 function renderImageInspector(el, L, close) {
   const sk = !L.box ? 'full' : (IMG_SIZES.find(z => z[2] && Math.abs(z[2] - L.box[2]) < 0.01) || [''])[0], anchor = currentAnchor(L);
   el.innerHTML = `<h3>Picture <span class="sub" title="${esc(L.file)}">${esc(L.file.split('/').pop())}</span>${close}</h3>` +
@@ -1335,7 +1490,13 @@ function showHelp() {
 }
 
 // ================================================================== recorder (streams chunks to disk as it goes)
-const REC = { stream: null, recorder: null, mode: 'clip', ctx: null, raf: 0, start: 0, playFrom: 0, timer: 0, session: null, seq: 0, queue: Promise.resolve(), bytes: 0, failed: 0, chunks: [], known: null };
+const REC = { stream: null, screen: null, recorder: null, recorder2: null, mode: 'clip', ctx: null, raf: 0, start: 0, playFrom: 0, timer: 0, session: null, seq: 0, seq2: 0, queue: Promise.resolve(), queue2: Promise.resolve(), bytes: 0, failed: 0, chunks: [], known: null, pending: 0, t0: {} };
+// Screen takes: what is big and what sits in the box. The layout is only the starting point: it can
+// be changed on the clip afterwards (inspector ▸ Picture in picture, or drag the inset on the video).
+const REC_LAYOUTS = { 'screen-corner': { main: 'screen', pip: 'cam', layout: 'corner' }, 'cam-corner': { main: 'cam', pip: 'screen', layout: 'corner-large' }, 'stacked': { main: 'screen', pip: 'cam', layout: 'stacked' }, 'screen-only': { main: 'screen', pip: null, layout: null } };
+const recRoles = () => REC_LAYOUTS[lsGet('kv.recLayout', 'screen-corner')] || REC_LAYOUTS['screen-corner'];
+const recIsScreen = () => REC.mode === 'screen';
+const isRecording = () => !!(REC.recorder && REC.recorder.state === 'recording');
 function pickMime(kind) {
   const c = kind === 'voiceover' ? ['audio/mp4;codecs=mp4a.40.2', 'audio/mp4', 'audio/webm;codecs=opus', 'audio/webm']
     : ['video/mp4;codecs=avc1.640028,mp4a.40.2', 'video/mp4;codecs=avc1.42E01E,mp4a.40.2', 'video/mp4', 'video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm'];
@@ -1347,10 +1508,19 @@ async function openRecorder(mode = 'clip') {
   const portrait = P.layout && P.layout.orientation === 'portrait';
   REC.mode = mode;
   sheet(`<div id="recBox">
-    <div class="inline" style="margin-bottom:12px"><h2 style="margin:0">Record</h2><span class="spacer"></span><div class="tabs" style="margin:0"><button class="tab ${mode === 'clip' ? 'active' : ''}" data-rm="clip">Camera clip</button><button class="tab ${mode === 'voiceover' ? 'active' : ''}" data-rm="voiceover">Voiceover</button></div></div>
+    <div class="inline" style="margin-bottom:12px"><h2 style="margin:0">Record</h2><span class="spacer"></span><div class="tabs" style="margin:0"><button class="tab ${mode === 'clip' ? 'active' : ''}" data-rm="clip">Camera clip</button><button class="tab ${mode === 'screen' ? 'active' : ''}" data-rm="screen">Screen</button><button class="tab ${mode === 'voiceover' ? 'active' : ''}" data-rm="voiceover">Voiceover</button></div></div>
     <video id="recPreview" autoplay muted playsinline class="${portrait ? 'portrait' : ''}"></video>
+    <div id="recStage" class="recstage hidden" style="aspect-ratio:${canvasWH()[0]}/${canvasWH()[1]};width:min(100%, calc(42vh * ${(canvasWH()[0] / canvasWH()[1]).toFixed(4)}))"><video id="recMain" autoplay muted playsinline></video><div id="recPipBox" class="pipbox hidden"><video id="recPip" autoplay muted playsinline></video></div><div id="recShareHint" class="sharehint">Choose a screen or window to share.<br><small>Share a window (not the whole screen) if this app would otherwise be in the recording.</small></div></div>
     <div class="meter"><div class="lvl" id="recLvl"></div></div>
     <div id="micWarn" class="micwarn hidden"></div>
+    <div id="recScreenOpts" class="hidden">
+      ${field('Screen', '<div class="inline"><button class="pill" id="recShare">Choose screen or window…</button><span id="recShareLbl" class="muted"></span></div>')}
+      <div class="inline" style="align-items:flex-start;gap:18px">
+        ${field('Layout', `<div class="seg" id="recLayout">${[['screen-corner', 'Screen · me in a corner'], ['cam-corner', 'Me · screen in a corner'], ['stacked', portrait ? 'Stacked: me on top' : 'Side by side'], ['screen-only', 'Screen only']].map(([k, l]) => `<button data-k="${k}" class="${lsGet('kv.recLayout', 'screen-corner') === k ? 'on' : ''}">${l}</button>`).join('')}</div>`)}
+        ${field('Corner', `<div class="grid9" id="recPos">${POS9.map(p => `<button data-p="${p}" class="${lsGet('kv.recPos', 'br') === p ? 'on' : ''}"></button>`).join('')}</div>`)}
+        ${field('Sound', '<label class="check" style="margin:4px 0 0"><input type="checkbox" id="recSys"> include computer sound</label>')}
+      </div>
+    </div>
     <div class="recgrid">
       ${field('Camera', '<select id="recCam"></select>')}${field('Microphone', '<select id="recMic"></select>')}
       ${field('Quality', '<select id="recQ"><option value="1080">1080p</option><option value="720">720p</option><option value="2160">4K (if supported)</option></select>')}
@@ -1361,7 +1531,11 @@ async function openRecorder(mode = 'clip') {
     <div class="recctl"><button class="recbtn" id="recGo"><i></i></button><span id="recTime">0:00.0</span><button class="pill sm" id="recMark" disabled title="Drop a marker where you'll want to show pictures (Space)">◆ Marker <kbd>space</kbd></button><span id="recMarks"></span><span id="recMicBadge" class="hidden">⚠ not a good mic</span><span id="recStatus" class="muted"></span><span class="spacer"></span><button class="pill" id="recClose">Close</button></div>
   </div>`, { wide: true });
   $('#recClose').onclick = closeRecorder;
-  $$('[data-rm]').forEach(b => b.onclick = () => { if (REC.recorder && REC.recorder.state === 'recording') return; $$('[data-rm]').forEach(x => x.classList.toggle('active', x === b)); REC.mode = b.dataset.rm; applyRecMode(); startPreview(); });
+  $$('[data-rm]').forEach(b => b.onclick = () => { if (isRecording()) return; $$('[data-rm]').forEach(x => x.classList.toggle('active', x === b)); REC.mode = b.dataset.rm; if (!recIsScreen()) stopScreen(); applyRecMode(); startPreview(); });
+  $('#recShare').onclick = () => chooseScreen();
+  $$('#recLayout button').forEach(b => b.onclick = () => { if (isRecording()) return; lsSet('kv.recLayout', b.dataset.k); $$('#recLayout button').forEach(x => x.classList.toggle('on', x === b)); startPreview(); });
+  $$('#recPos button').forEach(b => b.onclick = () => { if (isRecording()) return; lsSet('kv.recPos', b.dataset.p); $$('#recPos button').forEach(x => x.classList.toggle('on', x === b)); applyRecLayout(); });
+  $('#recMirror').addEventListener('change', applyRecLayout);
   $('#recQ').onchange = startPreview; $('#recMirror').onchange = e => $('#recPreview').classList.toggle('nomirror', !e.target.checked);
   $('#recGo').onclick = () => { $('#recGo').blur(); REC.recorder && REC.recorder.state === 'recording' ? stopRecording() : startRecording(); };
   $('#recMark').onclick = () => { $('#recMark').blur(); recMarker(); };
@@ -1437,17 +1611,89 @@ async function refreshDevices() {
   updateMicWarn();
 }
 if (navigator.mediaDevices) navigator.mediaDevices.addEventListener('devicechange', () => refreshDevices().catch(() => { }));
-function applyRecMode() { const vo = REC.mode === 'voiceover'; $('#recPreview').classList.toggle('hidden', vo); $('#recCam').closest('.field').classList.toggle('hidden', vo); $('#recQ').closest('.field').classList.toggle('hidden', vo); $('#recVoHint').classList.toggle('hidden', !vo); $('#recVoAt').textContent = fmt(T); }
+function applyRecMode() {
+  const vo = REC.mode === 'voiceover', sc = recIsScreen();
+  $('#recPreview').classList.toggle('hidden', vo || sc); $('#recStage').classList.toggle('hidden', !sc); $('#recScreenOpts').classList.toggle('hidden', !sc);
+  $('#recCam').closest('.field').classList.toggle('hidden', vo); $('#recQ').closest('.field').classList.toggle('hidden', vo); $('#recCover').closest('label').classList.toggle('hidden', sc);
+  $('#recVoHint').classList.toggle('hidden', !vo); $('#recVoAt').textContent = fmt(T);
+  if (sc) applyRecLayout();
+}
+// ---- screen takes: the shared screen/window and the camera, previewed in the chosen layout
+async function chooseScreen() {
+  if (isRecording()) return;
+  stopScreen();
+  try {
+    REC.screen = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: { ideal: 30 }, width: { max: 1920 }, height: { max: 1200 } }, audio: true, selfBrowserSurface: 'exclude', surfaceSwitching: 'include', systemAudio: 'include' });
+  } catch (e) { if (e.name !== 'NotAllowedError') toast('Could not share the screen: ' + e.message, true); applyRecLayout(); return; }
+  const vt = REC.screen.getVideoTracks()[0];
+  vt.onended = () => {           // "Stop sharing" in the browser's bar
+    if (isRecording() && recIsScreen()) { flashWarn('Screen sharing stopped', 'Recording stopped; the take so far is saved'); stopRecording(); }
+    REC.screen = null; applyRecLayout();
+  };
+  applyRecLayout();
+}
+function stopScreen() { if (REC.screen) { REC.screen.getTracks().forEach(t => t.stop()); REC.screen = null; } }
+function screenLabel() {
+  const vt = REC.screen && REC.screen.getVideoTracks()[0]; if (!vt) return '';
+  const st = vt.getSettings(), kind = { monitor: 'Screen', window: 'Window', browser: 'Tab' }[st.displaySurface] || 'Screen';
+  return `${kind} · ${st.width}×${st.height}${REC.screen.getAudioTracks().length ? ' · sound available' : ''}`;
+}
+function recSources() {        // the live tracks for the main picture and the inset in the chosen layout
+  const r = recRoles(), cam = REC.stream && REC.stream.getVideoTracks()[0], scr = REC.screen && REC.screen.getVideoTracks()[0];
+  const pick = role => role === 'cam' ? cam : role === 'screen' ? scr : null;
+  return { roles: r, main: pick(r.main), pip: pick(r.pip), mainIsCam: r.main === 'cam', pipIsCam: r.pip === 'cam' };
+}
+const trackAspect = (tr, dflt = 9 / 16) => { const s = tr && tr.getSettings(); return s && s.width && s.height ? s.height / s.width : dflt; };
+function recLayoutBoxes() {    // -> { box, pip, shape } for the current layout, canvas and inset aspect (null pip = no inset)
+  const src = recSources(); if (!src.roles.pip) return { box: null, pip: null, shape: 'round', aspect: 9 / 16 };
+  const [W, H] = canvasWH(), aspect = trackAspect(src.pip, src.pipIsCam ? 9 / 16 : 10 / 16);
+  return { ...pipLayoutBoxes(src.roles.layout, lsGet('kv.recPos', 'br'), W, H, aspect), aspect };
+}
+function applyRecLayout() {
+  if (!$('#recStage') || !recIsScreen()) return;
+  const src = recSources(), L = recLayoutBoxes(), [W, H] = canvasWH(), mirror = $('#recMirror').checked;
+  const main = $('#recMain'), pipBox = $('#recPipBox'), pipV = $('#recPip');
+  const lbl = $('#recShareLbl'); if (lbl) lbl.textContent = screenLabel();
+  const mainStream = src.main ? new MediaStream([src.main]) : null;
+  if ((main.srcObject && main.srcObject.getVideoTracks()[0]) !== src.main) main.srcObject = mainStream;
+  main.style.objectFit = src.mainIsCam ? 'cover' : 'contain';
+  mainBoxStyle(main, L.box, mirror && src.mainIsCam, W, H);
+  $('#recShareHint').classList.toggle('hidden', !!REC.screen);
+  $('#recPos').closest('.field').classList.toggle('hidden', !(src.roles.layout || '').startsWith('corner'));
+  $('#recSys').closest('.field').classList.toggle('hidden', !(REC.screen && REC.screen.getAudioTracks().length));
+  if (src.pip && L.pip) {
+    if ((pipV.srcObject && pipV.srcObject.getVideoTracks()[0]) !== src.pip) pipV.srcObject = new MediaStream([src.pip]);
+    pipBox.className = `pipbox ${L.shape}`; pipBox.classList.remove('hidden');
+    const cr = $('#recStage').getBoundingClientRect();
+    pipBox.style.borderRadius = L.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width || 300, cr.height || 300) * 0.02)}px`;
+    boxStyle(pipBox, L.pip, W, H, L.aspect, L.shape);
+    pipV.style.transform = mirror && src.pipIsCam ? 'scaleX(-1)' : '';
+  } else { pipBox.classList.add('hidden'); pipV.srcObject = null; }
+}
+function recAudioTrack() {     // the microphone, mixed with the computer's sound when asked for
+  const mic = REC.stream && REC.stream.getAudioTracks()[0];
+  const sys = recIsScreen() && REC.screen && $('#recSys') && $('#recSys').checked ? REC.screen.getAudioTracks()[0] : null;
+  if (!sys) return mic || null;
+  try {
+    REC.ctx = REC.ctx || new AudioContext(); REC.ctx.resume && REC.ctx.resume();
+    const dest = REC.ctx.createMediaStreamDestination();
+    if (mic) REC.ctx.createMediaStreamSource(new MediaStream([mic])).connect(dest);
+    REC.ctx.createMediaStreamSource(new MediaStream([sys])).connect(dest);
+    return dest.stream.getAudioTracks()[0];
+  } catch (e) { console.warn('audio mix failed', e); return mic || null; }
+}
 async function startPreview() {
   stopStream(); const q = +$('#recQ').value;
+  const needCam = REC.mode === 'clip' || (recIsScreen() && !!recRoles().pip);
   const constraints = { audio: { deviceId: $('#recMic').value ? { exact: $('#recMic').value } : undefined, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 },
-    video: REC.mode === 'voiceover' ? false : { deviceId: $('#recCam').value ? { exact: $('#recCam').value } : undefined, width: { ideal: q === 2160 ? 3840 : q === 720 ? 1280 : 1920 }, height: { ideal: q === 2160 ? 2160 : q }, frameRate: { ideal: 30 } } };
+    video: !needCam ? false : { deviceId: $('#recCam').value ? { exact: $('#recCam').value } : undefined, width: { ideal: q === 2160 ? 3840 : q === 720 ? 1280 : 1920 }, height: { ideal: q === 2160 ? 2160 : q }, frameRate: { ideal: 30 } } };
   try { REC.stream = await navigator.mediaDevices.getUserMedia(constraints); } catch (e) { $('#recStatus').textContent = 'cannot open device: ' + e.message; updateMicWarn(); return; }
   if (!$('#recPreview')) { stopStream(); return; }
   updateMicWarn();
   $('#recPreview').srcObject = REC.stream;
+  if (recIsScreen()) applyRecLayout();
   const vt = REC.stream.getVideoTracks()[0];
-  $('#recStatus').textContent = vt ? `${vt.getSettings().width}×${vt.getSettings().height}` : 'audio only';
+  $('#recStatus').textContent = vt ? `${vt.getSettings().width}×${vt.getSettings().height}` : recIsScreen() ? '' : 'audio only';
   try {
     REC.ctx = REC.ctx || new AudioContext(); const src = REC.ctx.createMediaStreamSource(REC.stream); const an = REC.ctx.createAnalyser(); an.fftSize = 1024; src.connect(an); const buf = new Float32Array(an.fftSize);
     const tickM = () => { an.getFloatTimeDomainData(buf); let s = 0; for (const x of buf) s += x * x; const db = 20 * Math.log10(Math.sqrt(s / buf.length) || 1e-6); const el = $('#recLvl'); if (el) el.style.width = `${clamp((db + 60) / 60 * 100, 0, 100)}%`; REC.raf = requestAnimationFrame(tickM); };
@@ -1455,22 +1701,50 @@ async function startPreview() {
   } catch { }
 }
 function stopStream() { cancelAnimationFrame(REC.raf); if (REC.stream) { REC.stream.getTracks().forEach(t => t.stop()); REC.stream = null; } }
-function closeRecorder() { if (REC.recorder && REC.recorder.state === 'recording') return toast('Stop the recording first'); stopStream(); closeSheet(); }
+function closeRecorder() { if (isRecording()) return toast('Stop the recording first'); stopStream(); stopScreen(); closeSheet(); }
 window.addEventListener('beforeunload', e => { if (REC.recorder && REC.recorder.state === 'recording') { e.preventDefault(); e.returnValue = ''; } });
 async function startRecording() {
   if (!REC.stream) return toast('No input device', true);
-  const mime = pickMime(REC.mode);
+  const mime = pickMime(REC.mode === 'voiceover' ? 'voiceover' : 'clip');
   REC.playFrom = T;
-  try { const r = await api('POST', `/api/projects/${P.name}/record/start`, { kind: REC.mode, at: REC.playFrom, fit: $('#recCover').checked ? 'cover' : 'contain', mime }); REC.session = r.id; }
+  // what gets recorded: the camera/mic stream, or for a screen take the shared screen (+ the camera as a
+  // second stream, the inset) with the mic (+ computer sound) on both so either can be the main picture later
+  let mainStream = REC.stream, pipStream = null, body = { kind: REC.mode, at: REC.playFrom, fit: $('#recCover').checked ? 'cover' : 'contain', mime };
+  if (recIsScreen()) {
+    if (!REC.screen) return toast('Choose a screen or window first', true);
+    const src = recSources(), L = recLayoutBoxes();
+    if (!src.main) return toast(src.roles.main === 'cam' ? 'No camera' : 'No screen', true);
+    const audio = recAudioTrack();
+    mainStream = new MediaStream([src.main, ...(audio ? [audio] : [])]);
+    if (src.pip) pipStream = new MediaStream([src.pip, ...(audio ? [audio.clone()] : [])]);
+    const boxObj = b => b ? { x: b[0], y: b[1], w: b[2], h: b[3] } : null;
+    body = { kind: 'clip', at: REC.playFrom, fit: src.mainIsCam ? 'cover' : 'contain', mime, name: src.roles.main, box: boxObj(L.box),
+             pip: pipStream ? { name: src.roles.pip, mime, box: boxObj(L.pip), shape: L.shape, fit: 'cover' } : null };
+  }
+  try { const r = await api('POST', `/api/projects/${P.name}/record/start`, body); REC.session = r.id; }
   catch (e) { return toast('Could not start a recording session: ' + e.message, true); }
-  REC.seq = 0; REC.bytes = 0; REC.failed = 0; REC.chunks = []; REC.queue = Promise.resolve(); REC.markers = [];
+  REC.seq = REC.seq2 = 0; REC.bytes = 0; REC.failed = 0; REC.chunks = []; REC.queue = REC.queue2 = Promise.resolve(); REC.markers = []; REC.t0 = {};
   if ($('#recMark')) { $('#recMark').disabled = false; $('#recMarks').textContent = ''; }
-  REC.recorder = new MediaRecorder(REC.stream, { mimeType: mime || undefined, videoBitsPerSecond: 16_000_000, audioBitsPerSecond: 192_000 });
+  const opts = { mimeType: mime || undefined, videoBitsPerSecond: 16_000_000, audioBitsPerSecond: 192_000 };
+  REC.recorder = new MediaRecorder(mainStream, opts);
   REC.recorder.ondataavailable = e => { if (!e.data.size) return; REC.chunks.push(e.data); const seq = REC.seq++; REC.queue = REC.queue.then(() => sendChunk(seq, e.data)); };
-  REC.recorder.onstop = finishRecording;
+  REC.pending = pipStream ? 2 : 1;
+  const oneStopped = () => { if (--REC.pending <= 0) finishRecording(); };
+  REC.recorder.onstop = oneStopped;
+  REC.recorder2 = null;
+  if (pipStream) {
+    REC.recorder2 = new MediaRecorder(pipStream, opts);
+    REC.recorder2.ondataavailable = e => { if (!e.data.size) return; const seq = REC.seq2++; REC.queue2 = REC.queue2.then(() => sendChunk(seq, e.data, 0, 'pip')); };
+    REC.recorder2.onstop = oneStopped;
+    // the two streams start a few ms apart: tell the server so the inset plays in sync
+    const sync = () => { if (REC.t0.main != null && REC.t0.pip != null) api('POST', `/api/projects/${P.name}/record/${REC.session}/sync`, { offset: -(REC.t0.pip - REC.t0.main) / 1000 }).catch(() => { }); };
+    REC.recorder.onstart = () => { REC.t0.main = performance.now(); sync(); };
+    REC.recorder2.onstart = () => { REC.t0.pip = performance.now(); sync(); };
+  }
   REC.start = performance.now();
   if (REC.mode === 'voiceover') { seek(REC.playFrom, true); play(); }
   REC.recorder.start(500);
+  if (REC.recorder2) REC.recorder2.start(500);
   $('#recGo').classList.add('on');
   const micLabel = selectedMicLabel(), q = micQuality(micLabel);
   if (q !== 'good') { flashWarn('⚠ Not using a good mic', q === 'none' ? 'No microphone is connected' : `Recording with “${micLabel}”`); $('#recMicBadge').classList.remove('hidden'); }
@@ -1478,9 +1752,9 @@ async function startRecording() {
   if (audioTrack) audioTrack.onended = () => { if (REC.recorder && REC.recorder.state === 'recording') { flashWarn('⚠ Microphone disconnected', 'Recording stopped; the take so far is saved'); stopRecording(); } };
   REC.timer = setInterval(() => { const el = $('#recTime'); if (!el) return; el.textContent = fmt((performance.now() - REC.start) / 1000); $('#recStatus').textContent = REC.failed ? `⚠ ${REC.failed} chunk(s) not saved yet` : `saved ${(REC.bytes / 1e6).toFixed(1)} MB`; if (REC.mode === 'voiceover' && !playing) stopRecording(); }, 250);
 }
-async function sendChunk(seq, blob, attempt = 0) {
-  try { const r = await api('POST', `/api/projects/${P.name}/record/${REC.session}/chunk?seq=${seq}`, blob); REC.bytes = r.bytes; REC.failed = 0; }
-  catch (e) { if (attempt < 5 && e.status !== 409) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); return sendChunk(seq, blob, attempt + 1); } REC.failed++; }
+async function sendChunk(seq, blob, attempt = 0, track = 'main') {
+  try { const r = await api('POST', `/api/projects/${P.name}/record/${REC.session}/chunk?seq=${seq}&track=${track}`, blob); if (track === 'main') REC.bytes = r.bytes; REC.failed = 0; }
+  catch (e) { if (attempt < 5 && e.status !== 409) { await new Promise(r => setTimeout(r, 500 * (attempt + 1))); return sendChunk(seq, blob, attempt + 1, track); } REC.failed++; }
 }
 // Space during a recording: a marker at this moment of the take (or, for narration, on the clip playing)
 function recMarker() {
@@ -1498,18 +1772,18 @@ window.addEventListener('keydown', e => {
   if (!e.repeat) recMarker();
 }, true);
 window.addEventListener('keyup', e => { if (e.key === ' ' && REC.recorder && REC.recorder.state === 'recording') { e.preventDefault(); e.stopPropagation(); } }, true);
-function stopRecording() { clearInterval(REC.timer); if ($('#recMark')) $('#recMark').disabled = true; $('#recGo') && $('#recGo').classList.remove('on'); $('#recMicBadge') && $('#recMicBadge').classList.add('hidden'); if (REC.mode === 'voiceover') stop(); if (REC.recorder && REC.recorder.state === 'recording') REC.recorder.stop(); }
+function stopRecording() { clearInterval(REC.timer); if ($('#recMark')) $('#recMark').disabled = true; $('#recGo') && $('#recGo').classList.remove('on'); $('#recMicBadge') && $('#recMicBadge').classList.add('hidden'); if (REC.mode === 'voiceover') stop(); if (REC.recorder2 && REC.recorder2.state === 'recording') REC.recorder2.stop(); if (REC.recorder && REC.recorder.state === 'recording') REC.recorder.stop(); }
 async function finishRecording() {
   const secs = (performance.now() - REC.start) / 1000;
   if ($('#recStatus')) $('#recStatus').textContent = 'finishing…';
-  await REC.queue;
+  await REC.queue; await REC.queue2;
   if (secs < 0.5) { await api('DELETE', `/api/projects/${P.name}/recordings/${REC.session}`).catch(() => { }); return toast('Too short, discarded'); }
   try {
     const r = await api('POST', `/api/projects/${P.name}/record/${REC.session}/finish`);
     setProject(r.project);
     const nm = r.markers ? ` · ${r.markers} marker${r.markers > 1 ? 's' : ''} to add pictures at` : '';
-    toast((REC.mode === 'voiceover' ? `Voiceover added at ${fmt(REC.playFrom)}` : 'Recording added to the timeline') + nm);
-    if (r.id && REC.mode === 'clip') { select(r.id); const s = seg(); if (s && s.placed) seek(s.placed.start, true); }
+    toast((REC.mode === 'voiceover' ? `Voiceover added at ${fmt(REC.playFrom)}` : recIsScreen() ? 'Screen take added to the timeline · change its layout in the inspector' : 'Recording added to the timeline') + nm);
+    if (r.id && REC.mode !== 'voiceover') { select(r.id); const s = seg(); if (s && s.placed) seek(s.placed.start, true); }
     if ($('#recStatus')) { $('#recStatus').textContent = 'saved'; $('#recTime').textContent = '0:00.0'; }
   } catch (e) {
     toast('Save failed: ' + e.message + ' — trying again', true);

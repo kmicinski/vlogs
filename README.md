@@ -78,13 +78,26 @@ for that spot (they're placed one after another from the marker), or jump betwee
 
 - **Camera clip**: a talking-head segment that lands on the timeline like any other clip.
   "Crop to fill frame" (default for portrait vlogs) center-crops a 16:9 camera into 9:16.
+- **Screen**: share a screen or a window (the browser's picker; the *Screen* tab) and talk over
+  it. Pick a layout before you start: *Screen · me in a corner*, *Me · screen in a corner*,
+  *Stacked* (portrait: you in a square on top, the screen below; landscape: side by side) or
+  *Screen only*. The screen and the camera are recorded as **two synced clips**, so the layout
+  is only a starting point: select the clip afterwards and change it in the inspector
+  (*Picture in picture*: small / large inset, corner, stacked, hide, rounded / square / circle,
+  **⇄ Swap** to make the other one big), or drag the inset around on the video and pull a
+  corner to resize it. Split the clip (`S`) to change the layout partway through. Tick
+  *include computer sound* to record what the Mac is playing along with your mic (if the
+  share offers it). Any clip can get an inset: *+ Put another clip in a box over this one…*.
 - **Voiceover**: the preview plays from the playhead while you talk. The narration becomes a
   layer on the *Narration* lane under the timeline, starting at that time; clip audio is
   ducked under your voice. Wear headphones. Narration layers are `voiceovers:` in the YAML.
 
 Audio mixing: every clip and voiceover is measured (LUFS) on import and auto-gained toward
 a common level (*Match clip & voice levels*), music ducks under speech, and the final mix
-is loudness-normalized. Per-clip volume/mute and fit are in the inspector.
+is loudness-normalized. Per-clip volume/mute and fit are in the inspector. A take whose mic only
+reached one channel (a DJI Mic plugged into the right input) is detected on import and that channel
+is copied to both ears, in the live player and the render; the inspector's *Channels* select overrides
+it (stereo as recorded, left or right to both ears, mix to mono) — `channel:` in the YAML.
 
 The record sheet warns, loudly, when the selected microphone isn't a good one (a webcam or
 computer mic instead of the DJI Mic Mini, a Yeti or an audio interface), and switches to a good
@@ -129,10 +142,19 @@ timeline:
 - clip: clips/IMG_4830.MOV
   speed: 1.5
   mute: true
+- clip: clips/IMG_4831.MOV
+  channel: right                        # the mic was only on the right: copy it to both ears
+                                        # (auto by default: a one-sided take is detected and mirrored)
   overlays:
   - {text: look at this dog, at: 1.5, for: 3, style: big, position: center}
 - clip: clips/REC_20261023-183012.mp4   # recorded in the app
   fit: cover                            # crop to fill instead of letterbox
+- clip: clips/REC_20261030-104452-screen.mp4   # a screen take: the screen, with the camera in a box over it
+  pip: {clip: clips/REC_20261030-104452-cam.mp4, box: {x: 0.82, y: 0.84, w: 0.3}, shape: round}
+                                        # pip time = clip source time + offset; h omitted = the camera's own aspect
+- clip: clips/REC_20261030-104452-screen.mp4   # the same take, stacked: screen in the lower box, camera square on top
+  box: {x: 0.5, y: 0.78, w: 1, h: 0.44}
+  pip: {clip: clips/REC_20261030-104452-cam.mp4, box: {x: 0.5, y: 0.28, w: 1, h: 0.5625}, shape: rect}
 voiceovers:
 - {file: audio/VO_20261023-183401.m4a, at: 0:12, volume: 1.0, duck_clips: true}
 images:                                 # pictures over the video; box = centre x/y + width as fractions of the frame
@@ -155,7 +177,10 @@ vlog cut PROJ 0:12 0:15                    cut out that stretch of the output ti
 vlog keep PROJ 0:12 0:15                   trim the clip(s) there so only that stretch remains
 vlog caption PROJ s3 "coffee first" [--at 2 --dur 3]
 vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true transition=fade
+vlog set PROJ s3 channel=right             # one-channel mic: right (or left) to both ears; mix; stereo; auto
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
+vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos br] [--shape round|rect|circle] [--swap] [--rm]
+                                           a clip in a box over s3 (picture in picture); --swap makes the inset the big one
 vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --at v1 to remove)
 vlog sting PROJ song.mp3 --from s1 --to s3 [--start 0:06.5] [--volume 0.7]   (`intro` = the configured song; rm --id m1)
 vlog preview PROJ [--open] · vlog render PROJ [--open] · vlog serve [--open]

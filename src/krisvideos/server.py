@@ -22,7 +22,7 @@ from .cli import new_project as make_project, masthead_rel, sting_rel
 from .edits import title_at
 from .config import Config
 from .probe import is_video, probe
-from .project import Overlay, Project, Segment, Voiceover
+from .project import CHANNELS, Overlay, Pip, Project, Segment, Voiceover, box4
 from .timeutil import parse_time
 
 WEB = Path(__file__).parent / "web"
@@ -282,6 +282,19 @@ def create_app(cfg: Config) -> FastAPI:
     def media_url(p: Project, rel: str) -> str:
         return f"/media/{p.name}/{rel}"
 
+    def pip_json(p: Project, pip: Pip) -> dict:
+        f = p.resolve(pip.src)
+        try:
+            info = probe(f, p.cache_dir) if f.exists() else None
+        except Exception:
+            info = None
+        st = media.media_status(p, pip.src)
+        return {"src": pip.src, "offset": pip.offset, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
+                "hidden": pip.hidden, "media": info.to_dict() if info else None, "missing": info is None,
+                "proxy_url": media_url(p, f"cache/{Path(pip.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, pip.src) if media.browser_playable(info) else None),
+                "thumb_url": media_url(p, f"cache/{Path(pip.src).name}.thumb.jpg") if st["thumb"] else None,
+                "src_url": media_url(p, pip.src) if f.exists() else None}
+
     def project_json(p: Project) -> dict:
         p.extra.pop("__before", None)
         h = HISTORY.get(p)
@@ -316,6 +329,7 @@ def create_app(cfg: Config) -> FastAPI:
                 d["placed"] = pl.to_dict()
             if s.kind == "clip":
                 info = infos.get(s.src)
+                f = p.resolve(s.src)
                 d["media"] = info.to_dict() if info else None
                 d["missing"] = info is None
                 st = media.media_status(p, s.src)
@@ -323,7 +337,12 @@ def create_app(cfg: Config) -> FastAPI:
                 d["proxy_url"] = media_url(p, f"cache/{Path(s.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, s.src) if media.browser_playable(info) else None)
                 d["thumb_url"] = media_url(p, f"cache/{Path(s.src).name}.thumb.jpg") if st["thumb"] else None
                 d["src_url"] = media_url(p, s.src)
-                d["lufs"] = _cached_lufs(p, s.src)
+                d["channel"] = s.channel
+                d["one_sided"] = media.one_sided(f, p.cache_dir) if info else None
+                d["channel_effective"] = media.effective_channel(f, p.cache_dir, s.channel, compute=False) if info else "stereo"
+                d["lufs"] = media.cached_loudness(f, p.cache_dir, s.channel) if info else None
+                d["box"] = list(s.box) if s.box else None
+                d["pip"] = pip_json(p, s.pip) if s.pip else None
             segs.append(d)
         vos = []
         for v in p.voiceovers:
@@ -368,7 +387,7 @@ def create_app(cfg: Config) -> FastAPI:
             st = media.media_status(p, rel)
             clips.append({
                 "src": rel, "name": f.name, "media": info,
-                "in_timeline": any(s.src == rel for s in p.timeline),
+                "in_timeline": any(s.src == rel or (s.pip is not None and s.pip.src == rel) for s in p.timeline),
                 "thumb_url": media_url(p, f"cache/{f.name}.thumb.jpg") if st["thumb"] else None,
                 "proxy_url": media_url(p, f"cache/{f.name}.proxy.mp4") if st["proxy"] else (media_url(p, rel) if info and media.browser_playable(probe(f, p.cache_dir)) else None),
             })
@@ -612,8 +631,51 @@ def create_app(cfg: Config) -> FastAPI:
                 setattr(s, k, float(v))
             elif k == "mute":
                 s.mute = bool(v)
+            elif k == "channel":
+                s.channel = v if v in CHANNELS else "auto"
+                if p.resolve(s.src).exists():      # measure the loudness of what will be heard (fast, audio only)
+                    media.measure_loudness(p.resolve(s.src), p.cache_dir, s.channel)
             elif k == "fit":
                 s.fit = "cover" if v == "cover" else "contain"
+            elif k == "box":
+                s.box = box4(v) if v else None
+            elif k == "pip":
+                # a dict merges into the inset (clip/src, offset, box, fit, shape, hidden); null removes it.
+                # A new clip given as an absolute path is imported into clips/ first.
+                if not v:
+                    s.pip = None
+                else:
+                    base = s.pip.to_dict() if s.pip else {}
+                    base.update(v if isinstance(v, dict) else {"clip": str(v)})
+                    src = base.get("clip") or base.get("src")
+                    if not src:
+                        raise HTTPException(400, "an inset needs a clip")
+                    if Path(src).expanduser().is_absolute():
+                        src = media.import_file(p, Path(src))
+                        media.prepare_async(p, src)
+                    elif not p.resolve(src).exists():
+                        raise HTTPException(400, f"missing {src}")
+                    base["clip"] = src
+                    base.pop("src", None)
+                    s.pip = Pip.from_dict(base)
+            elif k == "pip_swap":
+                if v:
+                    edits.swap_pip(s)
+            elif k == "pip_layout":
+                # one of edits.PIP_LAYOUTS, optionally "corner:br" to pick the corner
+                if s.pip is not None:
+                    name, _, pos = str(v).partition(":")
+                    pf = p.resolve(s.pip.src)
+                    try:
+                        pinfo = probe(pf, p.cache_dir)
+                        aspect = pinfo.height / pinfo.width if pinfo.width and pinfo.height else 9 / 16
+                    except Exception:
+                        aspect = 9 / 16
+                    layout = render.compute_layout(p)
+                    try:
+                        edits.pip_layout(s, name, (layout.width, layout.height), aspect, pos or None)
+                    except ValueError as e:
+                        raise HTTPException(400, str(e))
             elif k in ("bg", "fg"):
                 setattr(s, k, v or None)
             elif k == "kicker":
@@ -767,10 +829,19 @@ def create_app(cfg: Config) -> FastAPI:
         part = rec_dir(p) / f"{m['id']}.part"
         if not part.exists() or part.stat().st_size < 1000:
             raise HTTPException(400, "recording is empty")
+        stamp = m["id"] + (f"-{m['name']}" if m.get("name") else "")
         try:
-            rel = media.ingest_recording(p, part, m["kind"], m["id"], container=m.get("ext", "webm"))
+            rel = media.ingest_recording(p, part, m["kind"], stamp, container=m.get("ext", "webm"))
         except Exception as e:
             raise HTTPException(500, f"could not convert recording: {e}")
+        # a screen + camera take: the second stream becomes the clip's inset (picture in picture)
+        pm, pip_rel = m.get("pip"), None
+        ppart = rec_dir(p) / f"{m['id']}.pip.part"
+        if pm and m["kind"] != "voiceover" and ppart.exists() and ppart.stat().st_size >= 1000:
+            try:
+                pip_rel = media.ingest_recording(p, ppart, "clip", f"{m['id']}-{pm.get('name') or 'pip'}", container=pm.get("ext", "webm"))
+            except Exception as e:
+                print(f"[record] inset stream of {m['id']} could not be converted: {e}")
         p = load(p.name)
         marks = sorted(max(0.0, float(t)) for t in m.get("markers") or [])
         if m["kind"] == "voiceover":
@@ -799,9 +870,17 @@ def create_app(cfg: Config) -> FastAPI:
                 seg.fit = m["fit"]
             if seg is not None and marks:
                 seg.markers = [round(t, 3) for t in marks]
+            if seg is not None:
+                seg.box = box4(m.get("box")) if m.get("box") else None
+                if pip_rel:
+                    seg.pip = Pip(src=pip_rel, offset=round(float(pm.get("offset") or 0), 3), box=box4(pm.get("box")) or (0.82, 0.84, 0.3, None),
+                                  fit=pm.get("fit") or "cover", shape=pm.get("shape") or "round")
+                elif seg.box and not pm:
+                    seg.box = None
             new_id = seg.id if seg else None
         commit(p)
         part.unlink(missing_ok=True)
+        ppart.unlink(missing_ok=True)
         (rec_dir(p) / f"{m['id']}.json").unlink(missing_ok=True)
         return {"added": rel, "id": new_id, "markers": len(marks), "project": project_json(p)}
 
@@ -812,28 +891,54 @@ def create_app(cfg: Config) -> FastAPI:
         mime = str(body.get("mime") or "video/webm")
         m = {"id": rid, "kind": body.get("kind", "clip"), "at": float(body.get("at") or 0), "fit": body.get("fit", ""),
              "add": bool(body.get("add", True)), "mime": mime, "ext": "mp4" if "mp4" in mime else "webm",
-             "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0, "markers": []}
+             "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0, "markers": [],
+             "name": str(body.get("name") or ""), "box": body.get("box") or None}
         (rec_dir(p) / f"{rid}.part").write_bytes(b"")
+        pb = body.get("pip")
+        if isinstance(pb, dict):      # a second stream (the camera over a screen recording, or the other way round)
+            pmime = str(pb.get("mime") or mime)
+            m["pip"] = {"name": str(pb.get("name") or "pip"), "mime": pmime, "ext": "mp4" if "mp4" in pmime else "webm",
+                        "box": pb.get("box") or None, "fit": pb.get("fit") or "cover", "shape": pb.get("shape") or "round",
+                        "offset": 0.0, "bytes": 0, "seq": 0}
+            (rec_dir(p) / f"{rid}.pip.part").write_bytes(b"")
         rec_save_manifest(p, m)
         return {"id": rid}
 
     @app.post("/api/projects/{name}/record/{rid}/chunk")
-    async def record_chunk(name: str, rid: str, request: Request, seq: int = 0):
+    async def record_chunk(name: str, rid: str, request: Request, seq: int = 0, track: str = "main"):
+        """Append a chunk of the take (`track=pip` for the second stream of a screen + camera take).
+        The body is read first: from here on there is no await, so a main chunk and an inset chunk
+        arriving together cannot interleave their read-modify-write of the shared manifest."""
+        data = await request.body()
         p = load(name)
         m = rec_manifest(p, rid)
-        if seq != m["seq"]:
-            if seq < m["seq"]:
-                return {"bytes": m["bytes"], "seq": m["seq"], "dup": True}
-            raise HTTPException(409, f"expected chunk {m['seq']}, got {seq}")
-        data = await request.body()
-        with open(rec_dir(p) / f"{rid}.part", "ab") as f:
+        t = m if track != "pip" else m.get("pip")
+        if t is None:
+            raise HTTPException(404, "this session has no inset stream")
+        if seq != t["seq"]:
+            if seq < t["seq"]:
+                return {"bytes": t["bytes"], "seq": t["seq"], "dup": True}
+            raise HTTPException(409, f"expected chunk {t['seq']}, got {seq}")
+        with open(rec_dir(p) / (f"{rid}.pip.part" if track == "pip" else f"{rid}.part"), "ab") as f:
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
-        m["bytes"] += len(data)
-        m["seq"] = seq + 1
+        t["bytes"] += len(data)
+        t["seq"] = seq + 1
         rec_save_manifest(p, m)
-        return {"bytes": m["bytes"], "seq": m["seq"]}
+        return {"bytes": t["bytes"], "seq": t["seq"]}
+
+    @app.post("/api/projects/{name}/record/{rid}/sync")
+    def record_sync(name: str, rid: str, body: dict):
+        """How far the inset stream started after the main one (seconds): stored as the inset's
+        offset so the two play in sync."""
+        p = load(name)
+        m = rec_manifest(p, rid)
+        if m.get("pip") is None:
+            raise HTTPException(404, "this session has no inset stream")
+        m["pip"]["offset"] = round(float(body.get("offset") or 0), 3)
+        rec_save_manifest(p, m)
+        return {"ok": True}
 
     @app.post("/api/projects/{name}/record/{rid}/finish")
     def record_finish(name: str, rid: str):
@@ -863,7 +968,8 @@ def create_app(cfg: Config) -> FastAPI:
                 continue
             part = rec_dir(p) / f"{m['id']}.part"
             size = part.stat().st_size if part.exists() else 0
-            m["bytes"] = size
+            ppart = rec_dir(p) / f"{m['id']}.pip.part"
+            m["bytes"] = size + (ppart.stat().st_size if ppart.exists() else 0)
             m["recoverable"] = size >= 1000
             out.append(m)
         return out
@@ -872,6 +978,7 @@ def create_app(cfg: Config) -> FastAPI:
     def recordings_discard(name: str, rid: str):
         p = load(name)
         (rec_dir(p) / f"{rid}.part").unlink(missing_ok=True)
+        (rec_dir(p) / f"{rid}.pip.part").unlink(missing_ok=True)
         (rec_dir(p) / f"{rid}.json").unlink(missing_ok=True)
         return {"ok": True}
 

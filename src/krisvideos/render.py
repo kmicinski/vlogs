@@ -17,7 +17,7 @@ from typing import Callable
 
 from . import media, titles
 from .probe import MediaInfo, probe
-from .project import Overlay, Project, Segment
+from .project import Overlay, Pip, Project, Segment
 
 AUDIO_FMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
 CANVAS = {"portrait": (1080, 1920), "landscape": (1920, 1080), "square": (1080, 1080)}
@@ -90,14 +90,14 @@ def probe_project(p: Project) -> dict[str, MediaInfo]:
 def pick_orientation(p: Project, infos: dict[str, MediaInfo]) -> str:
     if p.output.orientation != "auto":
         return p.output.orientation
-    # Vote by total duration. Clips set to crop-to-fill (e.g. webcam recordings) adapt to any
-    # canvas, so they only vote when nothing else does.
+    # Vote by total duration. Clips set to crop-to-fill (e.g. webcam recordings) and clips placed in
+    # a box (screen + camera layouts) adapt to any canvas, so they only vote when nothing else does.
     votes = {"contain": [0.0, 0.0], "cover": [0.0, 0.0]}
     for s in p.timeline:
         if s.kind == "clip" and s.src in infos:
             info = infos[s.src]
             dur = (info.duration if s.out is None else s.out) - s.in_
-            votes[s.fit if s.fit == "cover" else "contain"][0 if info.portrait else 1] += max(0.0, dur)
+            votes["cover" if (s.fit == "cover" or s.box) else "contain"][0 if info.portrait else 1] += max(0.0, dur)
     por, land = votes["contain"] if sum(votes["contain"]) > 0 else votes["cover"]
     if por == 0 and land == 0:
         return "landscape"
@@ -182,6 +182,26 @@ def _fit(iw: int, ih: int, W: int, H: int) -> tuple[int, int]:
     return _even(iw * r), _even(ih * r)
 
 
+def region(box: tuple | None, W: int, H: int, aspect: float | None = None) -> tuple[int, int, int, int]:
+    """Pixel rectangle (left, top, width, height) for a box given as frame fractions (centre x/y,
+    width, height). A missing height follows `aspect` (height / width of the picture)."""
+    if not box:
+        return 0, 0, W, H
+    x, y, w, h = box
+    bw = max(2, _even(w * W))
+    bh = max(2, _even(h * H)) if h is not None else max(2, _even(bw * (aspect if aspect else H / W)))
+    return int(round(x * W - bw / 2)), int(round(y * H - bh / 2)), bw, bh
+
+
+def pip_rect(pip: Pip, info: MediaInfo, W: int, H: int) -> tuple[int, int, int, int]:
+    aspect = info.height / info.width if info.width and info.height else 9 / 16
+    left, top, pw, ph = region(pip.box, W, H, aspect)
+    if pip.shape == "circle":
+        ph = pw
+        top = int(round(pip.box[1] * H - ph / 2))
+    return left, top, pw, ph
+
+
 def _atempo(speed: float) -> str:
     """Chain atempo filters so every factor stays in [0.5, 100]."""
     parts = []
@@ -257,19 +277,66 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             vchain = ["setpts=PTS-STARTPTS"]
             if s.speed != 1.0:
                 vchain.append(f"setpts=PTS/{s.speed}")
-            fw, fh = _fit(info.width, info.height, W, H)
+            # the picture fills the frame, or the box it was given (screen + camera layouts)
+            bx, by, bw, bh = region(s.box, W, H)
+            fw, fh = _fit(info.width, info.height, bw, bh)
             if info.hdr and hdr_mode != "none":
                 any_hdr = True
                 vchain.append(_hdr_chain(hdr_mode, fw, fh).rstrip(","))
             if s.fit == "cover":
-                vchain.append(f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=bicubic,crop={W}:{H}")
+                vchain.append(f"scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bicubic,crop={bw}:{bh}")
+                fw, fh = bw, bh
             else:
                 vchain.append(f"scale={fw}:{fh}:flags=bicubic")
-                if (fw, fh) != (W, H):
-                    vchain.append(f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=black")
+            if (fw, fh) != (W, H):
+                vchain.append(f"pad={W}:{H}:{bx + (bw - fw) // 2}:{by + (bh - fh) // 2}:color=black")
             vchain.append(f"setsar=1,format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
             filters.append(f"[{k}:v]{','.join(vchain)}[vb{i}]")
             cur = f"vb{i}"
+            # picture in picture: a second clip in a box over this one, in sync (pip time = source time + offset)
+            pip, pinfo = s.pip, None
+            if pip and not pip.hidden:
+                ppath = p.resolve(pip.src)
+                if not ppath.exists():
+                    warnings.append(f"inset clip not found: {pip.src}")
+                else:
+                    pinfo = probe(ppath, p.cache_dir)
+                    if not pinfo.has_video:
+                        pinfo = None
+            if pinfo is not None:
+                px, py, pw, ph = pip_rect(pip, pinfo, W, H)
+                pin = pl.src_in + pip.offset
+                seek = ["-ss", f"{pin:.3f}"] if pin > 0 else []
+                kp = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
+                pchain = ["setpts=PTS-STARTPTS"]
+                if pin < 0:            # the inset's file starts after the clip's in point: hold its first frame until then
+                    pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
+                if s.speed != 1.0:
+                    pchain.append(f"setpts=PTS/{s.speed}")
+                if pinfo.hdr and hdr_mode != "none":
+                    any_hdr = True
+                    pchain.append(_hdr_chain(hdr_mode, *_fit(pinfo.width, pinfo.height, pw, ph)).rstrip(","))
+                if pip.fit == "contain":
+                    qw, qh = _fit(pinfo.width, pinfo.height, pw, ph)
+                    pchain.append(f"scale={qw}:{qh}:flags=bicubic,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black")
+                else:
+                    pchain.append(f"scale={pw}:{ph}:force_original_aspect_ratio=increase:flags=bicubic,crop={pw}:{ph}")
+                pchain.append(f"setsar=1,format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
+                radius = max(2, int(min(W, H) * 0.02))
+                if pip.shape in ("round", "circle"):
+                    km = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
+                                    "-i", str(titles.render_pip_mask(p.cache_dir, pw, ph, pip.shape, radius))])
+                    filters.append(f"[{kp}:v]{','.join(pchain)}[pv{i}]")
+                    filters.append(f"[{km}:v]format=gray,fps={FPS}[pm{i}]")
+                    filters.append(f"[pv{i}][pm{i}]alphamerge[pa{i}]")
+                else:
+                    filters.append(f"[{kp}:v]{','.join(pchain)}[pa{i}]")
+                ks = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
+                                "-i", str(titles.render_pip_shadow(p.cache_dir, W, H, px, py, pw, ph, pip.shape, radius))])
+                filters.append(f"[{cur}][{ks}:v]overlay=0:0:eof_action=pass[ps{i}]")
+                # eof_action=repeat: if the inset's file ends early its last frame stays up
+                filters.append(f"[ps{i}][pa{i}]overlay={px}:{py}:eof_action=repeat[pp{i}]")
+                cur = f"pp{i}"
             # captions/overlays
             ovs = list(s.overlays)
             if s.caption:
@@ -293,12 +360,15 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             # audio
             if info.has_audio and not s.mute and s.volume > 0:
                 achain = ["asetpts=PTS-STARTPTS"]
+                ch = media.effective_channel(src, p.cache_dir, s.channel)
+                if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
+                    achain.append(media.CHANNEL_PAN[ch])
                 if s.speed != 1.0:
                     achain.append(_atempo(s.speed))
                 achain.append(AUDIO_FMT)
                 gain = 0.0
                 if p.audio.match_levels:
-                    gain = media.level_gain_db(media.measure_loudness(src, p.cache_dir), p.audio.target_lufs)
+                    gain = media.level_gain_db(media.measure_loudness(src, p.cache_dir, ch), p.audio.target_lufs)
                 if s.volume != 1.0 or abs(gain) > 0.1:
                     achain.append(f"volume={s.volume}*{10 ** (gain / 20):.4f}")
                 achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")

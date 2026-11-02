@@ -342,3 +342,21 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 .recctl > * { white-space: nowrap; }
 #recStatus { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 #recMarks { font-size: 15px; }
+
+/* picture in picture: a second clip in a box over the current one (player + recorder preview) */
+.pipbox { position: absolute; transform: translate(-50%, -50%); overflow: hidden; background: #000; box-shadow: 0 4px 18px rgba(0,0,0,.35); touch-action: none; }
+.pipbox video { position: relative !important; inset: auto !important; width: 100%; height: 100%; object-fit: cover; display: block; }
+.pipbox.rect { border-radius: 0 !important; }
+.pipbox.circle { border-radius: 50% !important; }
+#pipBox { z-index: 1; cursor: move; pointer-events: auto; }
+#pipBox.sel { outline: 2px solid var(--accent); outline-offset: 2px; }
+#pipBox .rz { position: absolute; width: 14px; height: 14px; background: #fff; border: 2px solid var(--accent); border-radius: 4px; display: none; z-index: 1; }
+#pipBox.sel .rz { display: block; }
+#pipBox .rz.tl { left: 0; top: 0; cursor: nwse-resize; } #pipBox .rz.br { right: 0; bottom: 0; cursor: nwse-resize; }
+#pipBox .rz.tr { right: 0; top: 0; cursor: nesw-resize; } #pipBox .rz.bl { left: 0; bottom: 0; cursor: nesw-resize; }
+.recstage { position: relative; width: 100%; background: #000; border-radius: 12px; overflow: hidden; margin: 0 auto; }
+.recstage video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; display: block; }
+.recstage .sharehint { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #aaa; text-align: center; pointer-events: none; padding: 20px; line-height: 1.5; }
+.recstage .pipbox { pointer-events: none; }
+#recScreenOpts { margin-top: 10px; }
+#recScreenOpts .seg button { padding: 5px 8px; }

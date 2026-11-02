@@ -11,7 +11,9 @@ A project folder looks like:
 Segment types in `timeline`:
   - title:  a full-frame title card (text, subtitle, kicker, duration; optional background `image`)
             an `image:` entry with no text is a plain image card (e.g. the show's masthead)
-  - clip:   a slice of a media file (in/out, speed, mute, caption, overlays)
+  - clip:   a slice of a media file (in/out, speed, mute, caption, overlays); optionally placed in a
+            `box` on the frame and with a `pip` (a second clip in a box over it, e.g. the camera over
+            a screen recording) that plays in sync with it
 """
 from __future__ import annotations
 
@@ -32,6 +34,10 @@ def _slug(s: str) -> str:
     s = re.sub(r"[^a-zA-Z0-9]+", "-", s.strip()).strip("-").lower()
     return s or "untitled"
 
+
+# segment.channel values: auto (mirror a one-sided take, else stereo), stereo (as recorded), left / right
+# (that channel to both ears), mix (both channels summed to mono)
+CHANNELS = ("auto", "stereo", "left", "right", "mix")
 
 @dataclass
 class Overlay:
@@ -133,6 +139,57 @@ class ImageLayer:
         return d
 
 
+def box4(v) -> tuple | None:
+    """A box on the frame as (x, y, w, h): centre x/y and width as fractions of the frame, and the
+    height (None = follows the picture's own aspect). Accepts a dict or a 3/4-list."""
+    if isinstance(v, dict):
+        h = v.get("h")
+        return (float(v.get("x", 0.5)), float(v.get("y", 0.5)), float(v.get("w", 0.4)), None if h in (None, "") else float(h))
+    if isinstance(v, (list, tuple)) and len(v) in (3, 4):
+        vals = [None if x is None else float(x) for x in v]
+        return (vals[0], vals[1], vals[2], vals[3] if len(vals) == 4 else None)
+    return None
+
+
+def box_dict(b) -> dict:
+    d = {"x": round(b[0], 4), "y": round(b[1], 4), "w": round(b[2], 4)}
+    if len(b) > 3 and b[3] is not None:
+        d["h"] = round(b[3], 4)
+    return d
+
+
+@dataclass
+class Pip:
+    """A second picture shown in a box over a clip (picture in picture): the camera over a screen
+    recording, or the screen over the camera. It plays in sync with the clip: `offset` is added to
+    the clip's source time to get this file's time, so trims and splits never need to touch it."""
+    src: str                                # project-relative (clips/REC_..-cam.mp4)
+    offset: float = 0.0
+    box: tuple = (0.82, 0.84, 0.3, None)    # centre x/y, width, height (None = the picture's own aspect)
+    fit: str = "cover"                      # cover (crop to the box) | contain
+    shape: str = "round"                    # round | rect | circle
+    hidden: bool = False                    # keep it but don't show it (the clip fills the frame)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Pip":
+        return cls(src=str(d.get("clip") or d.get("src")), offset=float(parse_time(d.get("offset", 0) or 0)),
+                   box=box4(d.get("box")) or (0.82, 0.84, 0.3, None), fit=str(d.get("fit") or "cover"),
+                   shape=str(d.get("shape") or "round"), hidden=bool(d.get("hidden", False)))
+
+    def to_dict(self) -> dict:
+        d: dict[str, Any] = {"clip": self.src}
+        if self.offset:
+            d["offset"] = round(self.offset, 3)
+        d["box"] = box_dict(self.box)
+        if self.fit != "cover":
+            d["fit"] = self.fit
+        if self.shape != "round":
+            d["shape"] = self.shape
+        if self.hidden:
+            d["hidden"] = True
+        return d
+
+
 @dataclass
 class Sting:
     """A short music cue laid over a run of segments (e.g. the intro masthead + date card).
@@ -186,10 +243,14 @@ class Segment:
     speed: float = 1.0
     mute: bool = False
     volume: float = 1.0
+    channel: str = "auto"           # auto | stereo | left | right | mix: which channel(s) to hear (left/right: that
+                                    # channel copied to both ears, for a mic plugged into one side; auto = detect)
     caption: str | None = None      # convenience: a lower-third shown for the whole clip
     fit: str = "contain"            # contain (letterbox) | cover (crop to fill the canvas)
     overlays: list[Overlay] = field(default_factory=list)
     markers: list[float] = field(default_factory=list)   # moments to come back to (source-clip seconds)
+    box: tuple | None = None        # where the picture goes on the frame (x, y, w, h fractions); None = the whole frame
+    pip: Pip | None = None          # a second picture in a box over this one (camera over a screen recording)
     # title fields
     text: str = ""
     subtitle: str = ""
@@ -214,10 +275,15 @@ class Segment:
             seg.speed = float(d.get("speed", 1.0) or 1.0)
             seg.mute = bool(d.get("mute", False))
             seg.volume = float(d.get("volume", 1.0))
+            seg.channel = str(d.get("channel") or "auto")
+            if seg.channel not in CHANNELS:
+                seg.channel = "auto"
             seg.caption = d.get("caption")
             seg.fit = str(d.get("fit") or "contain")
             seg.overlays = [Overlay.from_dict(o) for o in d.get("overlays", []) or []]
             seg.markers = sorted(float(parse_time(x)) for x in d.get("markers") or [])
+            seg.box = box4(d.get("box"))
+            seg.pip = Pip.from_dict(d["pip"]) if isinstance(d.get("pip"), dict) and (d["pip"].get("clip") or d["pip"].get("src")) else None
         elif "title" in d or "image" in d:
             seg = cls(kind="title", text=str(d.get("title") or ""))
             seg.subtitle = str(d.get("subtitle") or "")
@@ -251,6 +317,8 @@ class Segment:
                 d["mute"] = True
             if self.volume != 1.0:
                 d["volume"] = self.volume
+            if self.channel != "auto":
+                d["channel"] = self.channel
             if self.caption:
                 d["caption"] = self.caption
             if self.fit != "contain":
@@ -259,6 +327,10 @@ class Segment:
                 d["overlays"] = [o.to_dict() for o in self.overlays]
             if self.markers:
                 d["markers"] = [round(x, 3) for x in self.markers]
+            if self.box:
+                d["box"] = box_dict(self.box)
+            if self.pip:
+                d["pip"] = self.pip.to_dict()
         else:
             if self.text or not self.image:
                 d["title"] = self.text

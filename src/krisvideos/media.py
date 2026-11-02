@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from .probe import MediaInfo, probe
-from .project import Project
+from .project import CHANNELS, Project
 
 PROXY_H = 540
 _pool = ThreadPoolExecutor(max_workers=2)
@@ -122,7 +122,7 @@ def prepare_async(p: Project, src_rel: str) -> None:
 def prepare(p: Project, src_rel: str) -> None:
     make_thumbnail(p, src_rel)
     make_proxy(p, src_rel)
-    measure_loudness(p.resolve(src_rel), p.cache_dir)
+    measure_loudness(p.resolve(src_rel), p.cache_dir, "auto")    # + one-sided detection
 
 
 def media_status(p: Project, src_rel: str) -> dict:
@@ -137,20 +137,39 @@ def browser_playable(info: MediaInfo | None) -> bool:
 
 # --------------------------------------------------------------------------- loudness
 
-def measure_loudness(path: Path, cache_dir: Path | None = None) -> float | None:
-    """Integrated loudness (LUFS) of a file's audio via ffmpeg loudnorm; cached. None if no/silent audio."""
-    import json, re
-    path = Path(path)
-    cache = (cache_dir / (path.name + ".loud.json")) if cache_dir else None
-    if cache and cache.exists():
+# pan filters that copy one channel to both ears / sum both to mono (segment.channel)
+CHANNEL_PAN = {
+    "left": "pan=stereo|c0=c0|c1=c0",
+    "right": "pan=stereo|c0=c1|c1=c1",
+    "mix": "pan=stereo|c0=0.5*c0+0.5*c1|c1=0.5*c0+0.5*c1",
+}
+ONE_SIDED_DB = 20.0     # a channel this far below the other (and the other above -45 dB RMS) is "dead"
+
+
+def _loud_cache(path: Path, cache_dir: Path | None, channel: str = "stereo") -> Path | None:
+    if not cache_dir:
+        return None
+    return cache_dir / (path.name + (".loud.json" if channel == "stereo" else f".loud.{channel}.json"))
+
+
+def _read_cache(f: Path | None, path: Path) -> dict | None:
+    import json
+    if f and f.exists():
         try:
-            d = json.loads(cache.read_text())
+            d = json.loads(f.read_text())
             if d.get("size") == path.stat().st_size:
-                return d.get("lufs")
+                return d
         except Exception:
             pass
+    return None
+
+
+def _audio_stats(path: Path, af: str) -> tuple[float | None, list[float]]:
+    """One ffmpeg pass over the audio: (integrated LUFS or None if silent, per-channel RMS dB)."""
+    import json, re
     r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-vn", "-i", str(path), "-af",
-                        "loudnorm=print_format=json", "-f", "null", "-"], capture_output=True, text=True)
+                        af + "astats=measure_overall=none:measure_perchannel=RMS_level,loudnorm=print_format=json",
+                        "-f", "null", "-"], capture_output=True, text=True)
     lufs: float | None = None
     m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
     if m:
@@ -159,10 +178,84 @@ def measure_loudness(path: Path, cache_dir: Path | None = None) -> float | None:
             lufs = v if v > -60 else None
         except Exception:
             lufs = None
+    rms = []
+    for v in re.findall(r"Channel: \d+\s*\n.*?RMS level dB: (\S+)", r.stderr, re.S):
+        try:
+            rms.append(max(-120.0, float(v)))
+        except ValueError:
+            rms.append(-120.0)
+    return lufs, rms
+
+
+def audio_analysis(path: Path, cache_dir: Path | None = None) -> dict:
+    """Loudness (LUFS) and per-channel RMS (dB) of a file's audio as recorded; cached in
+    cache/<name>.loud.json. `one_sided` is "left"/"right" when only that channel carries sound (a mic
+    plugged into one channel), else None. lufs is None for no/silent audio."""
+    import json
+    path = Path(path)
+    cache = _loud_cache(path, cache_dir)
+    d = _read_cache(cache, path)
+    if d and "rms" in d:
+        return d
+    lufs, rms = _audio_stats(path, "")
+    side = None
+    if len(rms) == 2:
+        l, r = rms
+        if l > -45 and r < l - ONE_SIDED_DB:
+            side = "left"
+        elif r > -45 and l < r - ONE_SIDED_DB:
+            side = "right"
+    d = {"size": path.stat().st_size, "lufs": lufs, "rms": [round(x, 1) for x in rms], "one_sided": side}
+    if cache:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(d))
+    return d
+
+
+def effective_channel(path: Path, cache_dir: Path | None, channel: str = "auto", compute: bool = True) -> str:
+    """What a segment's `channel` setting means for this file: stereo | left | right | mix.
+    auto → the live channel of a one-sided take, else stereo; left/right/mix on a mono file → stereo.
+    compute=False only looks at the cache (unknown → stereo)."""
+    path = Path(path)
+    d = (audio_analysis(path, cache_dir) if compute else _read_cache(_loud_cache(path, cache_dir), path)) or {}
+    if channel in CHANNEL_PAN:
+        return channel if len(d.get("rms") or [0, 0]) >= 2 else "stereo"
+    if channel == "stereo":
+        return "stereo"
+    return d.get("one_sided") or "stereo"
+
+
+def measure_loudness(path: Path, cache_dir: Path | None = None, channel: str = "stereo") -> float | None:
+    """Integrated loudness (LUFS) of a file's audio *as it will be heard* for `channel` (see
+    effective_channel); cached. None if no/silent audio."""
+    import json
+    path = Path(path)
+    ch = effective_channel(path, cache_dir, channel)
+    if ch == "stereo":
+        return audio_analysis(path, cache_dir).get("lufs")
+    cache = _loud_cache(path, cache_dir, ch)
+    d = _read_cache(cache, path)
+    if d:
+        return d.get("lufs")
+    lufs, _ = _audio_stats(path, CHANNEL_PAN[ch] + ",")
     if cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache.write_text(json.dumps({"size": path.stat().st_size, "lufs": lufs}))
     return lufs
+
+
+def cached_loudness(path: Path, cache_dir: Path | None, channel: str = "auto") -> float | None:
+    """measure_loudness from the cache only (None when not measured yet)."""
+    path = Path(path)
+    ch = effective_channel(path, cache_dir, channel, compute=False)
+    d = _read_cache(_loud_cache(path, cache_dir, ch), path)
+    return d.get("lufs") if d else None
+
+
+def one_sided(path: Path, cache_dir: Path | None) -> str | None:
+    """The only live channel of a file ("left"/"right") from the cache; None if stereo or not measured."""
+    d = _read_cache(_loud_cache(Path(path), cache_dir), Path(path))
+    return d.get("one_sided") if d else None
 
 
 def level_gain_db(lufs: float | None, target: float, limit: float = 12.0) -> float:
@@ -232,8 +325,9 @@ def ingest_recording(p: Project, blob: Path, kind: str, stamp: str, container: s
     if r.returncode != 0 and has_audio:  # audio track may be unusable in a truncated file; keep the video
         cmd[cmd.index("-af"):cmd.index("-af") + 8] = ["-an"]
         r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
-        raise RuntimeError(r.stderr[-500:])
+    if r.returncode != 0 or not dst.exists() or dst.stat().st_size < 1000:
+        dst.unlink(missing_ok=True)
+        raise RuntimeError(r.stderr[-500:] or "empty output")
     rel = f"clips/{dst.name}"
     probe(dst, p.cache_dir)
     try:

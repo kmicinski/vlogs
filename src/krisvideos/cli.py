@@ -275,9 +275,50 @@ def cmd_set(cfg, a):
             v = None if v in ("none", "end", "") else parse_time(v)
         elif k == "image":
             v = None if v in ("none", "") else v
+        elif k == "channel":
+            from .project import CHANNELS
+            if v not in CHANNELS:
+                sys.exit(f"channel must be one of {', '.join(CHANNELS)}")
         elif isinstance(cur, float):
             v = float(v)
         setattr(s, k, v)
+    p.save()
+    print("ok")
+
+
+def cmd_pip(cfg, a):
+    """Picture in picture: a second clip in a box over a clip (the camera over a screen recording)."""
+    from .probe import probe
+    from .project import Pip, box4
+    p = _project(cfg, a.project)
+    s = _seg(p, a.seg)
+    if s.kind != "clip":
+        sys.exit("insets go on clips")
+    if a.rm:
+        s.pip = None
+        s.box = None
+    else:
+        if a.file:
+            s.pip = Pip(src=_import(p, Path(a.file)), offset=parse_time(a.offset) if a.offset else 0.0)
+        if s.pip is None:
+            sys.exit(f"{s.id} has no inset: give it a clip file")
+        if a.offset and not a.file:
+            s.pip.offset = parse_time(a.offset)
+        if a.swap:
+            edits.swap_pip(s)
+        if a.shape:
+            s.pip.shape = a.shape
+        if a.box:
+            s.pip.box = box4([float(x) if x not in ("", "none") else None for x in a.box.split(",")]) or s.pip.box
+        if a.layout or a.pos:
+            layout = render.compute_layout(p)
+            try:
+                pi = probe(p.resolve(s.pip.src), p.cache_dir)
+                aspect = pi.height / pi.width if pi.width and pi.height else 9 / 16
+            except Exception:
+                aspect = 9 / 16
+            name = a.layout or ("corner" if s.pip.box[3] is None and not s.pip.hidden else "corner")
+            edits.pip_layout(s, name, (layout.width, layout.height), aspect, a.pos)
     p.save()
     print("ok")
 
@@ -442,6 +483,9 @@ def cmd_show(cfg, a):
                 desc += f" x{s.speed}"
             if s.mute:
                 desc += " muted"
+            ch = media.effective_channel(p.resolve(s.src), p.cache_dir, s.channel, compute=False)
+            if s.channel != "auto" or ch != "stereo":
+                desc += f"  audio={s.channel}" + (f"→{ch} to both ears" if ch in ("left", "right") else "→mono" if ch == "mix" else "")
             if s.caption:
                 desc += f"  caption={s.caption!r}"
             for ov in s.overlays:
@@ -449,6 +493,13 @@ def cmd_show(cfg, a):
             mk = [pl.start + (x - pl.src_in) / (s.speed or 1.0) for x in s.markers if pl.src_in - 1e-3 <= x <= pl.src_out + 1e-3]
             if mk:
                 desc += "  markers@" + ",".join(fmt_time(t) for t in mk)
+            if s.box:
+                desc += f"  box x={s.box[0]:.2f} y={s.box[1]:.2f} w={s.box[2]:.2f}" + (f" h={s.box[3]:.2f}" if s.box[3] is not None else "")
+            if s.pip:
+                b = s.pip.box
+                desc += f"  pip={s.pip.src}" + (" (hidden)" if s.pip.hidden else f" box x={b[0]:.2f} y={b[1]:.2f} w={b[2]:.2f}" + (f" h={b[3]:.2f}" if b[3] is not None else "") + (f" {s.pip.shape}" if s.pip.shape != "round" else ""))
+                if s.pip.offset:
+                    desc += f" offset={s.pip.offset:+.3f}"
         print(f"  {s.id:>4}  {fmt_time(pl.start):>7} - {fmt_time(pl.end):<7} {desc}{tr}")
     for v in p.voiceovers:
         print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}")
@@ -517,6 +568,7 @@ def main(argv=None):
     s = sub.add_parser("trim"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("--in", dest="in_"); s.add_argument("--out"); s.set_defaults(fn=cmd_trim)
     s = sub.add_parser("set"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("pairs", nargs="+"); s.set_defaults(fn=cmd_set)
     s = sub.add_parser("rm"); s.add_argument("project"); s.add_argument("seg"); s.set_defaults(fn=cmd_rm)
+    s = sub.add_parser("pip", help="a second clip in a box over a clip (camera over a screen recording)"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("file", nargs="?", help="the inset's clip (omit to change an existing inset)"); s.add_argument("--layout", choices=list(edits.PIP_LAYOUTS), help="corner | corner-large | stacked | hidden"); s.add_argument("--pos", choices=list(edits.PIP_POSITIONS), help="corner for the corner layouts"); s.add_argument("--shape", choices=["round", "rect", "circle"]); s.add_argument("--box", help="x,y,w[,h] fractions of the frame (centre and size)"); s.add_argument("--offset", help="inset time = clip source time + offset"); s.add_argument("--swap", action="store_true", help="exchange the clip and its inset"); s.add_argument("--rm", action="store_true", help="remove the inset"); s.set_defaults(fn=cmd_pip)
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("music"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_music)
     s = sub.add_parser("voiceover"); s.add_argument("project"); s.add_argument("file", help="audio file, or 'rm' with --at ID"); s.add_argument("--at", help="timeline time (or voiceover id with rm)"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_voiceover)

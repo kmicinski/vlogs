@@ -121,6 +121,86 @@ def follow_content(before: Project, p: Project) -> None:
                 m.at = round(max(0.0, where(m.at)), 3)
 
 
+def swap_pip(seg: Segment) -> None:
+    """Exchange a clip and its inset: the inset's file becomes the main picture and vice versa. The
+    in/out points and markers move by the sync offset so the same moments stay on screen; the boxes
+    stay where they are (the big region stays big, the small one small)."""
+    pip = seg.pip
+    if pip is None:
+        return
+    off = pip.offset
+    seg.src, pip.src = pip.src, seg.src
+    seg.in_ = max(0.0, seg.in_ + off)
+    if seg.out is not None:
+        seg.out = max(seg.in_, seg.out + off)
+    seg.markers = sorted(round(max(0.0, m + off), 3) for m in seg.markers)
+    pip.offset = round(-off, 3) + 0.0      # (+ 0.0: never -0.0)
+    seg.channel = "auto"                  # the audio now comes from the other file
+
+
+PIP_LAYOUTS = ("corner", "corner-large", "stacked", "hidden")
+PIP_POSITIONS = ("tl", "t", "tr", "l", "c", "r", "bl", "b", "br")
+
+
+def pip_layout(seg: Segment, name: str, canvas: tuple[int, int], pip_aspect: float = 9 / 16, pos: str | None = None) -> None:
+    """Arrange a clip and its inset in one of the standard layouts (fractions of a W×H canvas).
+    corner / corner-large: the clip fills the frame, the inset sits in a corner (`pos`: tl … br).
+    stacked: on a portrait canvas the inset is a square across the top and the clip sits below it;
+    on a landscape canvas the inset is a tall column on the left and the clip fills the right.
+    hidden: the clip fills the frame and the inset is kept but not shown."""
+    pip = seg.pip
+    if pip is None:
+        return
+    W, H = canvas
+    portrait = H > W
+    if name == "hidden":
+        pip.hidden = True
+        seg.box = None
+        return
+    pip.hidden = False
+    if name == "stacked":
+        if portrait:
+            hc = round(W / H, 4)                       # a square: as tall (in frame fractions) as it is wide
+            pip.box = (0.5, round(hc / 2, 4), 1.0, hc)
+            seg.box = (0.5, round((1 + hc) / 2, 4), 1.0, round(1 - hc, 4))
+        else:
+            pip.box = (0.19, 0.5, 0.38, 1.0)
+            seg.box = (0.69, 0.5, 0.62, 1.0)
+        pip.fit, pip.shape = "cover", "rect"
+        return
+    w = {"corner": 0.42 if portrait else 0.3, "corner-large": 0.6 if portrait else 0.45}.get(name)
+    if w is None:
+        raise ValueError(f"unknown layout {name!r} (one of {', '.join(PIP_LAYOUTS)})")
+    seg.box = None
+    pip.fit = "cover"
+    if pip.shape == "rect":
+        pip.shape = "round"
+    pos = pos or pip_anchor(pip.box, pip_aspect, canvas) or "br"
+    pip.box = pip_anchor_box(w, pos, pip_aspect, canvas)
+
+
+def pip_anchor_box(w: float, pos: str, pip_aspect: float, canvas: tuple[int, int], margin: float = 0.04) -> tuple:
+    """The box (x, y, w, None) that puts an inset of width `w` at a 3×3 grid position with a margin."""
+    W, H = canvas
+    hf = w * W / H * pip_aspect                        # its height as a fraction of the frame height
+    i = max(0, PIP_POSITIONS.index(pos) if pos in PIP_POSITIONS else 8)
+    col, row = i % 3, i // 3
+    x = (margin + w / 2, 0.5, 1 - margin - w / 2)[col]
+    y = (margin + hf / 2, 0.5, 1 - margin - hf / 2)[row]
+    return (round(x, 4), round(y, 4), round(w, 4), None)
+
+
+def pip_anchor(box: tuple, pip_aspect: float, canvas: tuple[int, int]) -> str | None:
+    """Which grid position (if any) an inset box is currently anchored at."""
+    if not box or box[3] is not None:
+        return None
+    for pos in PIP_POSITIONS:
+        bx, by, _, _ = pip_anchor_box(box[2], pos, pip_aspect, canvas)
+        if abs(bx - box[0]) < 0.01 and abs(by - box[1]) < 0.01:
+            return pos
+    return None
+
+
 def split_segment(p: Project, pl: render.Placed, off: float) -> Segment:
     """Split the clip `pl` at `off` output-seconds into it. The first half keeps the id (and the
     caption); returns the new second half, which follows with a plain cut."""
