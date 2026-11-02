@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import edits, media, render
+from . import edits, media, render, titles
 from .cli import new_project as make_project, masthead_rel, sting_rel
 from .edits import title_at
 from .config import Config
@@ -223,10 +223,8 @@ _IMG_SIZE: dict[tuple, tuple[int, int]] = {}
 def _image_size(path: Path) -> tuple[int, int]:
     key = (str(path), path.stat().st_mtime_ns)
     if key not in _IMG_SIZE:
-        from PIL import Image
         try:
-            with Image.open(path) as im:
-                _IMG_SIZE[key] = im.size
+            _IMG_SIZE[key] = titles.image_size(path)
         except Exception:
             _IMG_SIZE[key] = (0, 0)
     return _IMG_SIZE[key]

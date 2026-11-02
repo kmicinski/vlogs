@@ -448,8 +448,8 @@ def cmd_image(cfg, a):
         shutil.copy2(src, dst)
     size = SIZES[a.size] if a.size in SIZES else float(a.size)
     layout = render.compute_layout(p)
-    with Image.open(dst) as im:
-        box = image_box(size, a.pos, layout.width, layout.height, *im.size)
+    from .titles import image_size
+    box = image_box(size, a.pos, layout.width, layout.height, *image_size(dst))
     m = p.add_image(f"assets/{dst.name}", parse_time(a.at or 0), a.dur, box=box)
     p.save()
     print(f"added {m.id}")

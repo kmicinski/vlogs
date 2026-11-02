@@ -5,7 +5,7 @@ import hashlib
 from functools import lru_cache
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFilter, ImageFont
+from PIL import Image, ImageOps, ImageDraw, ImageFilter, ImageFont
 
 FONT_DIRS = [Path("/System/Library/Fonts"), Path("/Library/Fonts"), Path.home() / "Library/Fonts",
              Path("/System/Library/Fonts/Supplemental")]
@@ -119,10 +119,29 @@ def _key(*parts) -> str:
     return hashlib.sha1("|".join(str(p) for p in parts).encode()).hexdigest()[:16]
 
 
+def load_image(path: Path) -> Image.Image:
+    """Open a picture the way a browser shows it: EXIF orientation applied (a phone photo shot upright is
+    stored sideways with a rotation tag), as RGBA."""
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im) or im
+        return im.convert("RGBA")
+
+
+def image_size(path: Path) -> tuple[int, int]:
+    """(width, height) as displayed, i.e. after EXIF orientation."""
+    with Image.open(path) as im:
+        try:
+            o = im.getexif().get(0x0112, 1)
+        except Exception:
+            o = 1
+        w, h = im.size
+        return (h, w) if o in (5, 6, 7, 8) else (w, h)
+
+
 def _image_background(w: int, h: int, image: Path, fit: str) -> Image.Image:
     """Full-frame RGBA from a still image. contain = image fitted inside with a blurred, darkened
     copy filling the bars (so a 16:9 masthead still looks intentional on a 9:16 canvas); cover = crop."""
-    src = Image.open(image).convert("RGBA")
+    src = load_image(image)
     iw, ih = src.size
     if fit == "cover":
         r = max(w / iw, h / ih)
@@ -151,7 +170,7 @@ def render_title_card(cache_dir: Path, w: int, h: int, text: str, subtitle: str,
     `image` paints the background from a still (fit: contain | cover); text is optional then."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     img_key = f"{image}:{image.stat().st_mtime_ns}" if image is not None and image.exists() else ""
-    out = cache_dir / f"title_{_key('v5', w, h, text, subtitle, font, bg, fg, accent, date_line, layout, kicker, img_key, fit)}.png"
+    out = cache_dir / f"title_{_key('v6', w, h, text, subtitle, font, bg, fg, accent, date_line, layout, kicker, img_key, fit)}.png"
     if out.exists():
         return out
     if layout == "lower" and not image:
@@ -305,7 +324,7 @@ def render_layer(cache_dir: Path, w: int, h: int, image: Path, box: tuple | None
     copy of itself, or cropped to fill). In a box: transparent frame with the picture placed at
     (x, y) centre and w width (fractions of the frame), rounded corners and a soft shadow."""
     cache_dir.mkdir(parents=True, exist_ok=True)
-    key = _key("layer1", w, h, image, image.stat().st_mtime_ns, box and tuple(round(v, 4) for v in box), fit)
+    key = _key("layer2", w, h, image, image.stat().st_mtime_ns, box and tuple(round(v, 4) for v in box), fit)
     out = cache_dir / f"layer_{key}.png"
     if out.exists():
         return out
@@ -313,7 +332,7 @@ def render_layer(cache_dir: Path, w: int, h: int, image: Path, box: tuple | None
         _image_background(w, h, image, fit).save(out)
         return out
     x, y, bw = box
-    src = Image.open(image).convert("RGBA")
+    src = load_image(image)
     pw = max(2, round(bw * w))
     ph = max(2, round(pw * src.height / max(1, src.width)))
     pic = src.resize((pw, ph), Image.LANCZOS)
