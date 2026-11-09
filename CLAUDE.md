@@ -23,9 +23,20 @@ masthead image card → fade → black card (`bg: '#000000'`, its length = hold 
 card with kicker "Daily Vlogs". The masthead lives in config (`masthead_image`) and is copied to
 `<project>/assets/`. A camera take recorded with the playhead at a segment's start is inserted in
 front of that segment (so recording at 0:00 puts Kris before the masthead); otherwise it appends.
-`project.stings` are music cues anchored to segment ids (`from`/`to`, `start` offset into the file,
-fade in/out); `render.sting_span` maps them to timeline times; they are mixed before the music bus
-(so music ducks under them) and never duck clips. The intro sting comes from config `intro_sting`.
+`project.stings` are the music: cues anchored to segment ids (`from`/`to`, `start` offset into the
+file, fade in/out, `loop`, `credit` text + `credit_pos`/`credit_for`); `render.sting_span` maps them
+to timeline times; they are mixed before the (legacy, looping) music bus and never duck clips.
+`edits.split_segment`/`cut_range` keep a cue over both pieces of a split clip; `edits.split_sting`
+splits a cue at a timeline time into two seamless pieces (splitting the clip there), `continue_sting`
+/`last_cue_with` pick a song up where it stopped. Server: `POST stings` takes `from`/`to`, `range:
+[a, b]` (splits the clips at both ends) or `whole: true`, plus `continue: true`; `POST stings/{id}/
+split {at}` and `/continue`. When Kris says "put music over 0:32 to 1:10" → `vlog sting PROJ song
+--range 0:32 1:10`; "split the music here" → `vlog sting PROJ split --id m1 --at T`; "the music
+should keep going into the next clip" → `--continue` or change `to`. A credit (license text) on a cue
+is drawn by `titles.render_credit` in a corner (`style.credit_position`/`credit_seconds` defaults)
+when the cue starts; `render.credit_spans` lists them. `project.music` (the green loop under
+everything) still exists for old projects; the GUI offers "Turn into music over the clips".
+The intro sting comes from config `intro_sting`.
 Projects live in `~/Vlogs/<name>/` (configurable: `vlog config`). Times in the YAML are
 *source-clip* seconds for `in`/`out`; `vlog title-at` takes *output-timeline* time.
 `in`/`out` accept `12.5` or `0:12.5`. Segment ids (`s3`) are stable; the GUI shows them in `vlog show`.
@@ -43,10 +54,18 @@ in the player (`paintLayers`, drag/resize in `layerPointer`). Server `commit()` 
 `edits.follow_content(before, after)` so pictures and voiceovers stay on their frames through any
 clip edit (except raw script saves); CLI trim/rm/move do the same.
 
-Picture in picture: a clip segment may carry `pip:` (`Pip`: `clip`, `offset`, `box` x/y/w[/h] fractions,
-`fit`, `shape` round|rect|circle, `hidden`) and `box:` (where the main picture goes; None = whole frame).
-pip time = main source time + `offset`, so trims/splits never touch it; `edits.swap_pip` exchanges the
-two (shifting in/out/markers by the offset), `edits.pip_layout(seg, corner|corner-large|stacked|hidden,
+Picture in picture: a clip segment may carry `pip:` (`Pip`: `clip`, `offset`, `speed`, `box` x/y/w[/h]
+fractions, `fit`, `shape` round|rect|circle, `hidden`) and `box:` (where the main picture goes; None =
+whole frame). pip time = `offset` + `speed` × main source time (`Pip.time`), so trims/splits never
+touch it and the inset can run at its own speed (a 4x timelapse in a frame); `edits.swap_pip` exchanges
+the two (mapping in/out/markers through offset/speed and keeping the piece's length),
+`edits.insert_pip(p, t, src, in, out, speed, layout, pos)` puts a video in a frame over the clip at
+timeline time `t` (splits the clip so the frame comes in at `t` and goes away when the in→out part
+ends); server `POST segments {kind: "pip", src, at_time, in, out, speed, layout: "corner:br"}`;
+CLI `vlog frame PROJ file --at 0:32 --in 0:05 --out 0:20 --speed 4`; the trimmer's target
+"In a frame over the clip at the playhead" uses it. Clip `speed` takes any positive number
+(GUI: log slider 0.1–1000× + typed number); above `render.MUTE_ABOVE` (20×) the clip's audio is
+dropped; the live player steps frames for clips faster than 16× (`VP.drive`). `edits.pip_layout(seg, corner|corner-large|stacked|hidden,
 (W, H), aspect, pos)` sets the standard layouts (the JS `pipLayoutBoxes` mirrors it). `render.py` places
 the main in its box (scale + pad) and overlays the inset (Pillow mask PNG + `alphamerge`, shadow PNG).
 Screen takes: the recorder's *Screen* tab records the shared screen and the camera as two

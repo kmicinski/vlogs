@@ -10,12 +10,16 @@
     vlog keep PROJECT 0:12 0:15              trim the clip(s) there so only that stretch remains
     vlog caption PROJECT SEG "Text"          lower-third over a segment (SEG = id like s3, or index)
     vlog trim PROJECT SEG --in 0:03 --out 0:14
-    vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade
+    vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade (speed: any number, 60 = a minute per second)
     vlog rm PROJECT SEG                      remove a segment
     vlog move PROJECT SEG INDEX              reorder
     vlog music PROJECT FILE [--volume 0.18]
     vlog voiceover PROJECT FILE --at 0:12          narration layer at a timeline time (GUI can record these)
-    vlog sting PROJECT song.mp3 --from s1 --to s3 [--start 0:06.5]   music cue over those segments (fades in/out)
+    vlog sting PROJECT song.mp3 --from s1 --to s3 [--start 0:06.5] [--loop] [--credit "Music: …"]   music over those segments
+    vlog sting PROJECT song.mp3 --range 0:32 1:10    music over that stretch (the clips are split at both ends)
+    vlog sting PROJECT song.mp3 --continue --from s5  pick the song up where its last cue stopped
+    vlog sting PROJECT split --id m1 --at 0:45        split a cue at a timeline time (two pieces that play on)
+    vlog frame PROJECT clip.mp4 --at 0:32 [--in 0:05 --out 0:20] [--speed 4] [--pos br]   video in a frame over the clip there
     vlog image PROJECT pic.jpg --at 0:12 [--for 3] [--size full|large|half|small] [--pos tr]   picture over the video
     vlog show PROJECT                        print the timeline
     vlog preview PROJECT [--open]            fast half-res render -> out/preview.mp4
@@ -304,6 +308,10 @@ def cmd_pip(cfg, a):
             sys.exit(f"{s.id} has no inset: give it a clip file")
         if a.offset and not a.file:
             s.pip.offset = parse_time(a.offset)
+        if a.speed:
+            s.pip.speed = max(0.01, float(a.speed))
+        if a.in_ is not None:          # where in its file the inset is at the clip's in point
+            s.pip.offset = round(parse_time(a.in_) - s.pip.speed * s.in_, 3) + 0.0
         if a.swap:
             edits.swap_pip(s)
         if a.shape:
@@ -374,6 +382,14 @@ def cmd_voiceover(cfg, a):
     print("ok")
 
 
+def _file_duration(p: Project, rel: str) -> float | None:
+    from .probe import probe
+    try:
+        return probe(p.resolve(rel), p.cache_dir).duration
+    except Exception:
+        return None
+
+
 def cmd_sting(cfg, a):
     import shutil
     p = _project(cfg, a.project)
@@ -381,11 +397,22 @@ def cmd_sting(cfg, a):
         if not a.id:
             sys.exit("vlog sting PROJ rm --id m1")
         p.stings = [m for m in p.stings if m.id != a.id]
+    elif a.file == "split":
+        if not a.id or not a.at:
+            sys.exit("vlog sting PROJ split --id m1 --at 0:45")
+        m = p.sting(a.id)
+        try:
+            m2 = edits.split_sting(p, m, parse_time(a.at), _file_duration(p, m.file))
+        except ValueError as e:
+            sys.exit(str(e))
+        print(f"split {m.id} → {m.id} + {m2.id}")
     else:
         if a.file == "intro":
             rel = sting_rel(p, cfg)
             if not rel:
                 sys.exit("no intro sting configured (vlog config intro_sting=/path/to/song.mp3)")
+        elif not Path(a.file).expanduser().is_absolute() and p.resolve(a.file).exists():
+            rel = a.file                                  # a song already in the project (audio/…)
         else:
             src = Path(a.file).expanduser().resolve()
             if not src.exists():
@@ -395,10 +422,20 @@ def cmd_sting(cfg, a):
             if not dst.exists():
                 shutil.copy2(src, dst)
             rel = f"audio/{dst.name}"
-        frm = _seg(p, a.from_seg) if a.from_seg else (p.timeline[0] if p.timeline else None)
-        if frm is None:
+        if not p.timeline:
             sys.exit("timeline is empty")
-        to = _seg(p, a.to_seg) if a.to_seg else frm
+        if a.range:
+            t0, t1 = sorted(parse_time(x) for x in a.range)
+            ia = edits.insert_index_at(p, t0)
+            ib = edits.insert_index_at(p, t1)
+            if ib <= ia:
+                ib = ia + 1
+            frm, to = p.timeline[ia], p.timeline[min(ib, len(p.timeline)) - 1]
+        elif a.whole:
+            frm, to = p.timeline[0], p.timeline[-1]
+        else:
+            frm = _seg(p, a.from_seg) if a.from_seg else p.timeline[0]
+            to = _seg(p, a.to_seg) if a.to_seg else frm
         kw = {}
         if a.start is not None:
             kw["start"] = parse_time(a.start)
@@ -406,9 +443,44 @@ def cmd_sting(cfg, a):
             kw["volume"] = a.volume
         if a.no_duck:
             kw["duck"] = False
-        p.add_sting(rel, frm.id, to.id, **kw)
+        if a.loop:
+            kw["loop"] = True
+        if a.credit:
+            kw["credit"] = a.credit
+        if a.credit_pos:
+            kw["credit_pos"] = a.credit_pos
+        if getattr(a, "cont", False) and "start" not in kw:
+            prev = edits.last_cue_with(p, rel, frm.id)
+            if prev is None:
+                sys.exit(f"no earlier music cue uses {rel}")
+            m = edits.continue_sting(p, prev, frm.id, to.id, _file_duration(p, rel))
+            for k, v in kw.items():
+                setattr(m, k, v)
+        else:
+            m = p.add_sting(rel, frm.id, to.id, **kw)
+        print(f"{m.id}: {rel} over {m.from_id}..{m.to_id}")
     p.save()
     print("ok")
+
+
+def cmd_frame(cfg, a):
+    """A video in a frame (picture in picture) over the clip at a timeline time, for the length of
+    its in→out part at the given speed."""
+    from .probe import probe
+    p = _project(cfg, a.project)
+    src = _import(p, Path(a.file))
+    try:
+        pi = probe(p.resolve(src), p.cache_dir)
+        aspect = pi.height / pi.width if pi.width and pi.height else 9 / 16
+    except Exception:
+        aspect = 9 / 16
+    try:
+        seg = edits.insert_pip(p, parse_time(a.at or 0), src, parse_time(a.in_ or 0), parse_time(a.out) if a.out else None,
+                               a.speed or 1.0, a.layout or "corner", a.pos, aspect)
+    except ValueError as e:
+        sys.exit(str(e))
+    p.save()
+    print(f"{seg.id}: {src} in a frame over {seg.src}" + (f" at x{a.speed:g}" if a.speed and a.speed != 1 else ""))
 
 
 SIZES = {"full": None, "large": 0.8, "half": 0.5, "small": 0.32}
@@ -500,6 +572,8 @@ def cmd_show(cfg, a):
                 desc += f"  pip={s.pip.src}" + (" (hidden)" if s.pip.hidden else f" box x={b[0]:.2f} y={b[1]:.2f} w={b[2]:.2f}" + (f" h={b[3]:.2f}" if b[3] is not None else "") + (f" {s.pip.shape}" if s.pip.shape != "round" else ""))
                 if s.pip.offset:
                     desc += f" offset={s.pip.offset:+.3f}"
+                if s.pip.speed != 1:
+                    desc += f" x{s.pip.speed:g}"
         print(f"  {s.id:>4}  {fmt_time(pl.start):>7} - {fmt_time(pl.end):<7} {desc}{tr}")
     for v in p.voiceovers:
         print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}")
@@ -509,7 +583,7 @@ def cmd_show(cfg, a):
     for m in p.stings:
         span = render.sting_span(layout, m)
         when = f"{fmt_time(span[0]):>7} - {fmt_time(span[1]):<7}" if span else "   (segments gone)   "
-        print(f"  {m.id:>4}  {when} STING  {m.file} @{fmt_time(m.start)} over {m.from_id}..{m.to_id} vol={m.volume}{'' if m.duck else ' no-duck'}")
+        print(f"  {m.id:>4}  {when} MUSIC  {m.file} @{fmt_time(m.start)} over {m.from_id}..{m.to_id} vol={m.volume}{'' if m.duck else ' no-duck'}{' loop' if m.loop else ''}{' credit=' + repr(m.credit.splitlines()[0]) if m.credit else ''}")
     if p.music.file:
         print(f"  music: {p.music.file} vol={p.music.volume} duck={p.music.duck}")
 
@@ -568,11 +642,12 @@ def main(argv=None):
     s = sub.add_parser("trim"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("--in", dest="in_"); s.add_argument("--out"); s.set_defaults(fn=cmd_trim)
     s = sub.add_parser("set"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("pairs", nargs="+"); s.set_defaults(fn=cmd_set)
     s = sub.add_parser("rm"); s.add_argument("project"); s.add_argument("seg"); s.set_defaults(fn=cmd_rm)
-    s = sub.add_parser("pip", help="a second clip in a box over a clip (camera over a screen recording)"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("file", nargs="?", help="the inset's clip (omit to change an existing inset)"); s.add_argument("--layout", choices=list(edits.PIP_LAYOUTS), help="corner | corner-large | stacked | hidden"); s.add_argument("--pos", choices=list(edits.PIP_POSITIONS), help="corner for the corner layouts"); s.add_argument("--shape", choices=["round", "rect", "circle"]); s.add_argument("--box", help="x,y,w[,h] fractions of the frame (centre and size)"); s.add_argument("--offset", help="inset time = clip source time + offset"); s.add_argument("--swap", action="store_true", help="exchange the clip and its inset"); s.add_argument("--rm", action="store_true", help="remove the inset"); s.set_defaults(fn=cmd_pip)
+    s = sub.add_parser("pip", help="a second clip in a box over a clip (camera over a screen recording)"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("file", nargs="?", help="the inset's clip (omit to change an existing inset)"); s.add_argument("--layout", choices=list(edits.PIP_LAYOUTS), help="corner | corner-large | stacked | hidden"); s.add_argument("--pos", choices=list(edits.PIP_POSITIONS), help="corner for the corner layouts"); s.add_argument("--shape", choices=["round", "rect", "circle"]); s.add_argument("--box", help="x,y,w[,h] fractions of the frame (centre and size)"); s.add_argument("--offset", help="inset time = offset + speed × clip source time"); s.add_argument("--speed", type=float, help="the inset's own speed (4 = a 4x timelapse in the frame)"); s.add_argument("--in", dest="in_", help="where in its file the inset is when the clip starts"); s.add_argument("--swap", action="store_true", help="exchange the clip and its inset"); s.add_argument("--rm", action="store_true", help="remove the inset"); s.set_defaults(fn=cmd_pip)
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("music"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_music)
     s = sub.add_parser("voiceover"); s.add_argument("project"); s.add_argument("file", help="audio file, or 'rm' with --at ID"); s.add_argument("--at", help="timeline time (or voiceover id with rm)"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_voiceover)
-    s = sub.add_parser("sting"); s.add_argument("project"); s.add_argument("file", help="audio file, 'intro' for the configured one, or 'rm' with --id"); s.add_argument("--from", dest="from_seg"); s.add_argument("--to", dest="to_seg"); s.add_argument("--start", help="offset into the file"); s.add_argument("--volume", type=float); s.add_argument("--no-duck", action="store_true", help="don't lower it under speech"); s.add_argument("--id"); s.set_defaults(fn=cmd_sting)
+    s = sub.add_parser("sting", help="music over segments (anchored to them, splits with them)"); s.add_argument("project"); s.add_argument("file", help="audio file, 'intro' for the configured one, 'split' with --id/--at, or 'rm' with --id"); s.add_argument("--from", dest="from_seg"); s.add_argument("--to", dest="to_seg"); s.add_argument("--range", nargs=2, metavar=("START", "END"), help="timeline times: the clips are split there"); s.add_argument("--whole", action="store_true", help="over the whole vlog"); s.add_argument("--start", help="offset into the file"); s.add_argument("--continue", dest="cont", action="store_true", help="start where the last cue with this song stopped"); s.add_argument("--volume", type=float); s.add_argument("--no-duck", action="store_true", help="don't lower it under speech"); s.add_argument("--loop", action="store_true", help="repeat the song if the segments run longer"); s.add_argument("--credit", help="attribution shown in a corner when it starts"); s.add_argument("--credit-pos", dest="credit_pos", choices=["tl", "tr", "bl", "br"]); s.add_argument("--at", help="with split: the timeline time"); s.add_argument("--id"); s.set_defaults(fn=cmd_sting)
+    s = sub.add_parser("frame", help="a video in a frame (picture in picture) over the clip at a timeline time"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--at", help="timeline time (default 0:00)"); s.add_argument("--in", dest="in_", help="start in the video"); s.add_argument("--out", help="end in the video (the frame goes away when it ends)"); s.add_argument("--speed", type=float, help="play the framed video at this speed (4 = 4x)"); s.add_argument("--layout", choices=list(edits.PIP_LAYOUTS)); s.add_argument("--pos", choices=list(edits.PIP_POSITIONS), help="corner"); s.set_defaults(fn=cmd_frame)
     s = sub.add_parser("image", help="a picture over the video for a few seconds"); s.add_argument("project"); s.add_argument("file", help="image file, or 'rm' with --id"); s.add_argument("--at", help="timeline time"); s.add_argument("--for", dest="dur", type=float, default=3.0); s.add_argument("--size", default="full", help="full | large | half | small | a fraction of the frame width"); s.add_argument("--pos", default="c", help="tl t tr l c r bl b br"); s.add_argument("--id"); s.set_defaults(fn=cmd_image)
     s = sub.add_parser("undo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_undo)
     s = sub.add_parser("redo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=lambda c, a: cmd_undo(c, a, True))

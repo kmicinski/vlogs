@@ -360,3 +360,21 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 .recstage .pipbox { pointer-events: none; }
 #recScreenOpts { margin-top: 10px; }
 #recScreenOpts .seg button { padding: 5px 8px; }
+
+/* ---------- music credits in the player (small attribution text in a corner, like render.py's overlay) */
+#creditLayer { position: absolute; inset: 0; pointer-events: none; z-index: 4; }
+.credit { position: absolute; max-width: 48%; margin: 5%; line-height: 1.3; color: #fff; font-weight: 500; text-shadow: 0 1px 2px rgba(0,0,0,.8), 0 0 6px rgba(0,0,0,.5); white-space: normal; }
+.credit.tl { left: 0; top: 0; } .credit.tr { right: 0; top: 0; text-align: right; } .credit.bl { left: 0; bottom: 0; } .credit.br { right: 0; bottom: 0; text-align: right; }
+/* ---------- the song strip in the music inspector: the whole song, with the part that plays as a window */
+.songstrip { position: relative; height: 44px; border-radius: 6px; background: #2a2622; overflow: hidden; cursor: grab; user-select: none; touch-action: none; }
+.songstrip img { position: absolute; left: 0; top: 4px; width: 100%; height: 36px; opacity: .55; pointer-events: none; }
+.songstrip .win { position: absolute; top: 0; bottom: 0; background: rgba(255, 196, 140, .28); border-left: 2px solid #ffb061; border-right: 2px solid #ffb061; box-sizing: border-box; pointer-events: none; }
+.songstrip .win.wrap { border-left: none; border-right: 2px dashed #ffb061; opacity: .7; }
+.songstrip .t { position: absolute; bottom: 2px; font-size: 10px; color: rgba(255,255,255,.75); pointer-events: none; } .songstrip .t0 { left: 6px; } .songstrip .t1 { right: 6px; }
+.songstrip:active { cursor: grabbing; }
+/* ---------- speed: log slider + typed number */
+.speedctl { display: flex; align-items: center; gap: 6px; }
+.speedctl .sp-slider { flex: 1; min-width: 0; }
+.speedctl .sp-num { flex: 0 0 68px; width: 68px; text-align: right; }
+.speedctl .sp-x { flex: none; }
+textarea { width: 100%; resize: vertical; min-height: 54px; }

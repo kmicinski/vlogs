@@ -161,25 +161,33 @@ def box_dict(b) -> dict:
 @dataclass
 class Pip:
     """A second picture shown in a box over a clip (picture in picture): the camera over a screen
-    recording, or the screen over the camera. It plays in sync with the clip: `offset` is added to
-    the clip's source time to get this file's time, so trims and splits never need to touch it."""
+    recording, or the screen over the camera. It plays in sync with the clip: this file's time is
+    `offset + speed * (the clip's source time)`, so trims and splits never need to touch it."""
     src: str                                # project-relative (clips/REC_..-cam.mp4)
     offset: float = 0.0
     box: tuple = (0.82, 0.84, 0.3, None)    # centre x/y, width, height (None = the picture's own aspect)
     fit: str = "cover"                      # cover (crop to the box) | contain
     shape: str = "round"                    # round | rect | circle
     hidden: bool = False                    # keep it but don't show it (the clip fills the frame)
+    speed: float = 1.0                      # the inset's own speed, on top of the clip's (a 4x timelapse in a frame)
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pip":
         return cls(src=str(d.get("clip") or d.get("src")), offset=float(parse_time(d.get("offset", 0) or 0)),
                    box=box4(d.get("box")) or (0.82, 0.84, 0.3, None), fit=str(d.get("fit") or "cover"),
-                   shape=str(d.get("shape") or "round"), hidden=bool(d.get("hidden", False)))
+                   shape=str(d.get("shape") or "round"), hidden=bool(d.get("hidden", False)),
+                   speed=max(0.01, float(d.get("speed", 1.0) or 1.0)))
+
+    def time(self, src_t: float) -> float:
+        """The inset file's time at main-clip source time `src_t`."""
+        return self.offset + self.speed * src_t
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"clip": self.src}
         if self.offset:
             d["offset"] = round(self.offset, 3)
+        if self.speed != 1.0:
+            d["speed"] = self.speed
         d["box"] = box_dict(self.box)
         if self.fit != "cover":
             d["fit"] = self.fit
@@ -190,10 +198,16 @@ class Pip:
         return d
 
 
+CREDIT_POSITIONS = ("tl", "tr", "bl", "br")
+
+
 @dataclass
 class Sting:
-    """A short music cue laid over a run of segments (e.g. the intro masthead + date card).
-    Anchored to segment ids so it follows the segments when the timeline changes."""
+    """A music cue laid over a run of segments: the intro song over the masthead + date card, or a
+    track under a few clips. Anchored to segment ids so it follows the segments when the timeline
+    changes (splitting a clip keeps the music over both halves). `start` picks where in the song it
+    begins; `loop` repeats the song when the segments run longer; `credit` is the attribution shown
+    in a corner when it first comes in."""
     file: str                       # project-relative (audio/sting.mp3) or absolute
     from_id: str = ""               # first segment it plays over
     to_id: str = ""                 # last segment (default: same as from_id)
@@ -202,15 +216,23 @@ class Sting:
     fade_in: float = 0.6
     fade_out: float = 1.0           # fades out as the next segment cuts in
     duck: bool = True               # lower it while clips have speech (like the background music)
+    loop: bool = False              # repeat the song if the segments run longer than it
+    credit: str = ""                # attribution text (multi-line ok) shown when the cue starts
+    credit_pos: str = ""            # tl | tr | bl | br (default: style.credit_position)
+    credit_for: float | None = None # seconds it stays up (default: style.credit_seconds)
     id: str = ""
     note: str = ""
 
     @classmethod
     def from_dict(cls, d: dict, idx: int) -> "Sting":
+        cf = d.get("credit_for")
         return cls(file=str(d["file"]), from_id=str(d.get("from") or ""), to_id=str(d.get("to") or d.get("from") or ""),
                    start=parse_time(d.get("start", 0)), volume=float(d.get("volume", 0.7)),
                    fade_in=float(d.get("fade_in", 0.6)), fade_out=float(d.get("fade_out", 1.0)),
-                   duck=bool(d.get("duck", True)), id=str(d.get("id") or f"m{idx+1}"), note=str(d.get("note") or ""))
+                   duck=bool(d.get("duck", True)), loop=bool(d.get("loop", False)),
+                   credit=str(d.get("credit") or ""), credit_pos=str(d.get("credit_pos") or ""),
+                   credit_for=None if cf in (None, "") else float(cf),
+                   id=str(d.get("id") or f"m{idx+1}"), note=str(d.get("note") or ""))
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"file": self.file, "from": self.from_id}
@@ -226,6 +248,14 @@ class Sting:
             d["fade_out"] = self.fade_out
         if not self.duck:
             d["duck"] = False
+        if self.loop:
+            d["loop"] = True
+        if self.credit:
+            d["credit"] = self.credit
+        if self.credit_pos:
+            d["credit_pos"] = self.credit_pos
+        if self.credit_for is not None:
+            d["credit_for"] = self.credit_for
         if self.note:
             d["note"] = self.note
         d["id"] = self.id
@@ -384,6 +414,8 @@ class Style:
     fade_in: float = 0.5            # fade from black at start
     fade_out: float = 0.8           # fade to black at end
     title_fade: float = 0.4         # title cards fade their text in/out
+    credit_position: str = "tl"     # where music credits appear: tl | tr | bl | br
+    credit_seconds: float = 6.0     # how long a music credit stays up
 
 
 @dataclass
@@ -393,6 +425,7 @@ class Music:
     duck: bool = True               # lower music under speech
     start: float = 0.0              # offset into music file
     fade_out: float = 3.0
+    credit: str = ""                # attribution shown in a corner when the vlog starts
 
 
 @dataclass

@@ -54,6 +54,21 @@ function popover(anchor, items) {
 }
 function closePopover() { const el = $('#popover'); el.classList.add('hidden'); if (el._onDown) { document.removeEventListener('mousedown', el._onDown); el._onDown = null; } }
 const field = (label, inner) => `<div class="field"><label>${label}</label>${inner}</div>`;
+// speed: a log slider from 0.1× to 1000× (1× in the middle, detents at round numbers) plus a typed number
+// that takes any positive value. The browser can only *play* up to 16×; faster clips are stepped frame by frame.
+const SPEED_MIN = 0.1, SPEED_MAX = 1000, MUTE_ABOVE = 20;
+const speedToSlider = v => Math.round(clamp(Math.log10(Math.max(SPEED_MIN, Math.min(SPEED_MAX, +v || 1))) + 1, 0, 4) * 100);   // 0..400
+const sliderToSpeed = x => { const v = Math.pow(10, x / 100 - 1); return v >= 10 ? Math.round(v) : v >= 2 ? Math.round(v * 4) / 4 : Math.round(v * 20) / 20; };
+const fmtSpeed = v => { v = +v || 1; return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1).replace(/\.0$/, '') : (+v.toFixed(3)).toString()) + '×'; };
+const speedControl = (id, v) => `<div class="speedctl" id="${id}"><input type="range" class="sp-slider" min="0" max="400" step="1" value="${speedToSlider(v)}"><input type="number" class="sp-num" min="0.01" step="any" value="${+(+v || 1).toFixed(3)}"><span class="muted sp-x">×</span></div>`;
+function bindSpeed(id, onCommit) {
+  const box = $('#' + id); if (!box) return; const sl = $('.sp-slider', box), num = $('.sp-num', box);
+  sl.oninput = () => { num.value = sliderToSpeed(+sl.value); };
+  sl.onchange = () => onCommit(sliderToSpeed(+sl.value));
+  num.onchange = () => { const v = Math.max(0.01, +num.value || 1); sl.value = speedToSlider(v); onCommit(v); };
+  num.onkeydown = e => { if (e.key === 'Enter') num.blur(); };
+}
+const CORNERS = { tl: 'top left', tr: 'top right', bl: 'bottom left', br: 'bottom right' };
 // the Channels select of a clip: what `auto` does to this file is spelled out
 const channelOptions = s => {
   const auto = s.one_sided ? `Auto: only the ${s.one_sided} channel has sound → copied to both ears` : s.lufs == null && !s.media ? 'Auto' : 'Auto: stereo as recorded';
@@ -116,7 +131,7 @@ const AUD = (() => {
     reset();
     if (P.music && P.music.file) { music = document.createElement('audio'); music.src = `/api/projects/${P.name}/music`; music.loop = true; music.preload = 'auto'; document.body.appendChild(music); }
     for (const v of P.voiceovers || []) { if (!v.url) continue; const el = document.createElement('audio'); el.src = v.url; el.preload = 'auto'; document.body.appendChild(el); vos.push({ v, el }); }
-    for (const m of P.stings || []) { if (!m.url || m.at == null) continue; const el = document.createElement('audio'); el.src = m.url; el.preload = 'auto'; document.body.appendChild(el); stings.push({ m, el }); }
+    for (const m of P.stings || []) { if (!m.url || m.at == null) continue; const el = document.createElement('audio'); el.src = m.url; el.preload = 'auto'; el.loop = !!m.loop; document.body.appendChild(el); stings.push({ m, el }); }
   }
   // fade envelope of a sting at timeline time t (0..1)
   function stingEnv(m, t) {
@@ -139,7 +154,8 @@ const AUD = (() => {
     for (const { m, el } of stings) {
       const env = stingEnv(m, t), active = env > 0;
       if (active) stingActive = true;
-      const want = (m.start || 0) + (t - m.at), duck = (m.duck !== false && (speech || voActive)) ? 0.35 : 1;
+      let want = (m.start || 0) + (t - m.at); if (m.loop && el.duration) want = want % el.duration;
+      const duck = (m.duck !== false && (speech || voActive)) ? 0.35 : 1;
       if (play && active) { el.volume = clamp(m.volume * env * duck, 0, 1); if (el.paused || Math.abs(el.currentTime - want) > 0.35) { try { el.currentTime = Math.max(0, want); } catch { } el.play().catch(() => { }); } }
       else if (!el.paused) el.pause();
     }
@@ -187,7 +203,22 @@ const VP = (() => {
     r.mode = mode;
     for (let o = 0; o < 2; o++) for (let i = 0; i < 2; i++) r.gains[o][i].gain.value = MIX[mode][o][i];
   }
-  function reset() { for (const v of videos) { v.pause(); v.removeAttribute('src'); v.dataset.url = ''; v.load(); v.classList.add('hidden'); } cards.forEach(c => c.classList.add('hidden')); owner.clear(); paintLayers(-1); syncPip(null); }
+  function reset() { for (const v of videos) { v.pause(); v.removeAttribute('src'); v.dataset.url = ''; v.load(); v.classList.add('hidden'); } cards.forEach(c => c.classList.add('hidden')); owner.clear(); paintLayers(-1); paintCredits(-1); syncPip(null); }
+  // keep a <video> on `want` at `rate`: the browser plays up to 16×, anything faster is stepped frame by frame
+  function drive(el, rate, want, key) {
+    const fast = rate > 16;
+    try { el.playbackRate = fast ? 1 : clamp(rate, 0.0625, 16); } catch { }
+    const drift = Math.abs(el.currentTime - want);
+    if (fast) {
+      if (!el.paused) el.pause();
+      if (!el.seeking && (drift > 0.04 || el.dataset.seg !== key)) { try { el.currentTime = want; } catch { } el.dataset.seg = key; }
+      return true;
+    }
+    if (drift > (playing ? 0.3 : 0.04) || el.dataset.seg !== key) { try { el.currentTime = want; } catch { } el.dataset.seg = key; }
+    if (playing && el.paused) el.play().catch(() => { });
+    if (!playing && !el.paused) el.pause();
+    return false;
+  }
   // the inset (picture in picture) of the clip on screen, from its proxy, in sync with the clip
   function syncPip(s, t, opacity = 1, z = 1) {
     const box = $('#pipBox'), v = $('#vP');
@@ -195,17 +226,32 @@ const VP = (() => {
     const url = pip && (pip.proxy_url || pip.src_url);
     if (!url) { box.classList.add('hidden'); box.dataset.seg = ''; if (!v.paused) v.pause(); return; }
     setSrc(v, url);
-    const want = Math.max(0, (s.in || 0) + (t - s.placed.start) * (s.speed || 1) + (pip.offset || 0));
-    v.playbackRate = clamp(s.speed || 1, 0.25, 4); v.muted = true;
-    if (Math.abs(v.currentTime - want) > (playing ? 0.3 : 0.04) || v.dataset.seg !== s.id) { try { v.currentTime = want; } catch { } v.dataset.seg = s.id; }
-    if (playing && v.paused) v.play().catch(() => { });
-    if (!playing && !v.paused) v.pause();
+    // inset time = offset + inset speed × clip source time; it runs at its own speed on top of the clip's
+    const want = Math.max(0, (pip.offset || 0) + (pip.speed || 1) * ((s.in || 0) + (t - s.placed.start) * (s.speed || 1)));
+    v.muted = true;
+    drive(v, (s.speed || 1) * (pip.speed || 1), want, s.id);
     const [W, H] = canvasWH(), cr = $('#canvas').getBoundingClientRect();
     box.className = `pipbox ${pip.shape || 'round'}${sel === s.id ? ' sel' : ''}`;
     box.style.borderRadius = pip.shape === 'circle' ? '50%' : pip.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width, cr.height) * 0.02)}px`;
     boxStyle(box, pip.box, W, H, pipAspect(pip.media), pip.shape);
     v.style.objectFit = pip.fit === 'contain' ? 'contain' : 'cover';
     box.style.opacity = opacity; box.style.zIndex = z; box.dataset.seg = s.id;
+  }
+  // music credits: small attribution text in a corner while a song comes in (like render.py's credit overlay)
+  let creditKey = '';
+  function paintCredits(t) {
+    const host = $('#creditLayer'); if (!host) return;
+    const list = [];
+    if (P && !rendered && t >= 0) {
+      const def = CORNERS[P.style.credit_position] ? P.style.credit_position : 'tl', hold = P.style.credit_seconds || 6;
+      for (const m of P.stings || []) if (m.credit && m.at != null) list.push({ text: m.credit, at: m.at, d: m.credit_for || hold, pos: CORNERS[m.credit_pos] ? m.credit_pos : def });
+      if (P.music && P.music.file && P.music.credit) list.push({ text: P.music.credit, at: 0, d: hold, pos: def });
+    }
+    const live = list.filter(c => t >= c.at && t < c.at + c.d);
+    const cr = $('#canvas').getBoundingClientRect(); host.style.fontSize = `${Math.max(9, Math.min(cr.width, cr.height) * 0.024)}px`;
+    const key = live.map(c => c.pos + c.text).join('|');
+    if (key !== creditKey) { creditKey = key; host.innerHTML = live.map(c => `<div class="credit ${c.pos}">${esc(c.text).replace(/\n/g, '<br>')}</div>`).join(''); }
+    $$('.credit', host).forEach((el, i) => { const c = live[i], f = Math.min(0.4, c.d / 3), off = t - c.at; el.style.opacity = clamp(Math.min(off / f, (c.d - off) / f), 0, 1); });
   }
   // pictures over the video: one element per visible picture, positioned like the render does
   const lyrEls = new Map();
@@ -285,21 +331,17 @@ const VP = (() => {
     if (!url || s.missing) { el.classList.add('hidden'); return el; }
     setSrc(el, url);
     const want = (s.in || 0) + (t - s.placed.start) * (s.speed || 1);
-    el.playbackRate = clamp(s.speed || 1, 0.25, 4);
     el.style.objectFit = s.fit === 'cover' ? 'cover' : 'contain';
     mainBoxStyle(el, s.box);
-    el.muted = !!s.mute || !playing;
+    el.muted = !!s.mute || !playing || (s.speed || 1) > MUTE_ABOVE;
     el.volume = clamp((s.volume ?? 1) * gainFactor(s) * weight * duck, 0, 1);
     route(el, s.channel_effective);
-    const drift = Math.abs(el.currentTime - want);
-    if (drift > (playing ? 0.3 : 0.04) || el.dataset.seg !== s.id) { try { el.currentTime = want; } catch { } el.dataset.seg = s.id; }
-    if (playing && el.paused) el.play().catch(() => { });
-    if (!playing && !el.paused) el.pause();
+    drive(el, s.speed || 1, want, s.id);
     return el;
   }
   function sync(t, hard = false) {
     if (!P || !P.timeline.length) { reset(); captions(null); return; }
-    paintLayers(t);
+    paintLayers(t); paintCredits(t);
     if (rendered) {
       cards.forEach(c => c.classList.add('hidden')); captions(null); videos[1].classList.add('hidden');
       syncPip(null);
@@ -334,7 +376,7 @@ const VP = (() => {
   }
   function showSource(s, srcTime) {   // trim-handle drag: show an arbitrary source frame
     const el = layerFor(s, null); const url = s.proxy_url || s.src_url; if (!url) return;
-    cards.forEach(c => c.classList.add('hidden')); videos.forEach(v => v.classList.toggle('hidden', v !== el)); paintLayers(-1); syncPip(null);
+    cards.forEach(c => c.classList.add('hidden')); videos.forEach(v => v.classList.toggle('hidden', v !== el)); paintLayers(-1); paintCredits(-1); syncPip(null);
     setSrc(el, url); el.pause(); el.muted = true; el.style.opacity = 1; el.style.objectFit = s.fit === 'cover' ? 'cover' : 'contain'; mainBoxStyle(el, s.box);
     try { el.currentTime = srcTime; } catch { } el.dataset.seg = '';
   }
@@ -454,7 +496,7 @@ function renderTimeline() {
     b.className = `block ${s.kind}${s.missing ? ' missing' : ''}${s.id === sel ? ' selected' : ''}${s.kind === 'clip' && !s.missing && !s.proxy_url ? ' pending' : ''}`;
     b.style.left = `${blk.x0}px`; b.style.width = `${w}px`; b.dataset.id = s.id; b.draggable = true;
     const xf = s.placed.transition !== 'cut' ? '<div class="xf"></div>' : '';
-    const meta = `<div class="meta">${fmt(s.placed.duration)}${s.speed && s.speed !== 1 ? ` ×${s.speed}` : ''}${s.mute ? ' 🔇' : ''}${s.fit === 'cover' ? ' ⤢' : ''}${s.pip && !s.pip.hidden ? ' ⧉' : ''}</div>`;
+    const meta = `<div class="meta">${fmt(s.placed.duration)}${s.speed && s.speed !== 1 ? ` ${fmtSpeed(s.speed)}` : ''}${s.mute ? ' 🔇' : ''}${s.fit === 'cover' ? ' ⤢' : ''}${s.pip && !s.pip.hidden ? ' ⧉' : ''}</div>`;
     if (s.kind === 'title') {
       const black = !s.title && !s.image && (s.bg || '').toLowerCase() === '#000000';
       b.classList.toggle('img', !!s.image_url); b.classList.toggle('black', black);
@@ -499,10 +541,11 @@ function renderLanes() {
   }
   const stings = (P.stings || []).filter(m => m.at != null);
   if (stings.length) {
-    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = '<span class="lanelbl">sting</span>';
+    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = '<span class="lanelbl">music</span>';
     for (const m of stings) {
       const d = document.createElement('div'); d.className = 'st' + (m.id === selSting ? ' selected' : ''); const w = place(d, m.at, m.end);
-      d.innerHTML = `${m.url ? `<img src="/api/projects/${P.name}/wave?src=${encodeURIComponent(m.file)}&start=${m.start || 0}&end=${(m.start || 0) + (m.end - m.at)}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>♪ ${esc(m.file.split('/').pop())}</span>`;
+      d.title = `${m.file.split('/').pop()} · from ${fmt(m.start || 0)} in the song${m.loop ? ' · repeats' : ''}${m.credit ? ' · shows a credit' : ''}`;
+      d.innerHTML = `${m.url ? `<img src="/api/projects/${P.name}/wave?src=${encodeURIComponent(m.file)}&start=${m.start || 0}&end=${(m.start || 0) + (m.end - m.at)}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>♪ ${esc(m.file.split('/').pop())}${m.loop ? ' ⟳' : ''}${m.credit ? ' ©' : ''}</span>`;
       d.onclick = e => { e.stopPropagation(); selSting = m.id; sel = selVo = selImg = null; selMusic = false; renderTimeline(); renderInspector(); seek(m.at, true); }; l.appendChild(d);
     }
     lanes.appendChild(l);
@@ -677,6 +720,7 @@ const ctxActions = {
   addTitle: () => addTitleSheet(),
   record: () => openRecorder('clip'),
   music: () => { selMusic = true; sel = selVo = selSting = selImg = null; renderInspector(); renderTimeline(); if (!(P.music && P.music.file)) pickMusic(); },
+  musicMenu: () => musicMenu($('[data-act=musicMenu]')),
 };
 $$('#ctx [data-act]').forEach(b => b.onclick = () => ctxActions[b.dataset.act]());
 function titleAt(t) {
@@ -728,7 +772,7 @@ function renderInspector() {
       (segMarkers(s).length ? field('Markers', `<div class="mklist">${segMarkers(s).map(mk => `<span class="mkchip"><button class="link" data-mkgo="${mk.t}" title="Jump here">◆ ${fmt(mk.t)}</button><button class="link muted" data-mkrm="${mk.src}" title="Remove this marker">✕</button></span>`).join('')}</div>`) : '') +
       field('Caption', `<input type="text" data-k="caption" value="${esc(s.caption || '')}" placeholder="lower third for the whole clip">`) +
       `<div class="field"><label>Text overlays</label><div id="ovList"></div><button class="link" id="ovAdd" style="align-self:flex-start">+ Add overlay at playhead</button></div>` +
-      field('Speed', `<div class="inline"><input type="range" data-k="speed" min="0.25" max="4" step="0.25" value="${s.speed || 1}"><span id="speedLbl" style="width:34px">${s.speed || 1}×</span></div>`) +
+      field('Speed', speedControl('segSpeed', s.speed || 1) + `<span class="muted" style="font-size:11px">${(s.speed || 1) > MUTE_ABOVE ? `Faster than ${MUTE_ABOVE}×: the sound is dropped (timelapse).` : 'Drag for the usual speeds, or type any number — 60× turns a minute into a second.'}</span>`) +
       field('Fit', `<select data-k="fit"><option value="contain" ${s.fit !== 'cover' ? 'selected' : ''}>Letterbox (show everything)</option><option value="cover" ${s.fit === 'cover' ? 'selected' : ''}>Crop to fill</option></select>`) +
       pipInspectorHtml(s) +
       `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
@@ -742,13 +786,14 @@ function renderInspector() {
   $$('[data-k]', el).forEach(inp => {
     const k = inp.dataset.k;
     const commit = () => patchSeg(s.id, { [k]: inp.type === 'number' || inp.type === 'range' ? (inp.value === '' ? '' : +inp.value) : inp.value });
-    if (inp.type === 'range') { inp.oninput = () => { if (k === 'speed') $('#speedLbl').textContent = inp.value + '×'; }; inp.onchange = commit; }
+    if (inp.type === 'range') inp.onchange = commit;
     else { inp.onchange = commit; inp.onkeydown = e => { if (e.key === 'Enter') inp.blur(); }; }
   });
   if ($('#titleColorsReset')) $('#titleColorsReset').onclick = () => patchSeg(s.id, { bg: '', fg: '' });
   if ($('#imgPick')) $('#imgPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'image' }); if (r.paths[0]) await patchSeg(s.id, { image: r.paths[0] }); });
   if ($('#imgClear')) $('#imgClear').onclick = () => patchSeg(s.id, { image: '' });
   if ($('#muteChk')) $('#muteChk').onchange = e => patchSeg(s.id, { mute: e.target.checked });
+  bindSpeed('segSpeed', v => patchSeg(s.id, { speed: v }));
   if (s.kind === 'clip') bindPipInspector(s);
   if ($('#segTrim')) $('#segTrim').onclick = () => openTrimmer([s.clip], { segId: s.id });
   $$('[data-mkgo]', el).forEach(b => b.onclick = () => { stop(); seek(+b.dataset.mkgo, true); });
@@ -768,18 +813,22 @@ function renderInspector() {
 // picture in picture: the inset's layout (small / large corner, stacked, hidden), corner, shape, swap
 function pipInspectorHtml(s) {
   const pp = s.pip;
-  if (!pp) return `<div class="field"><label>Picture in picture</label><button class="link" id="pipAdd" style="align-self:flex-start">+ Put another clip in a box over this one…</button></div>`;
+  if (!pp) return `<div class="field"><label>Picture in picture</label><div class="inline"><button class="link" id="pipAdd">+ Put a video in a frame over this clip…</button><button class="link muted" id="pipLib" title="Pick a clip already in this project; in the trimmer choose “In a frame over the clip at the playhead”">from this project…</button></div></div>`;
   const [W, H] = canvasWH(), lay = pipLayoutOf(s), anchor = pipAnchorOf(s);
   return `<div class="field"><label>Picture in picture</label>
     <div class="insp-img">${pp.thumb_url ? `<img src="${pp.thumb_url}">` : ''}<span class="sub" title="${esc(pp.src)}">${esc(pp.src.replace(/^clips\//, ''))}${pp.missing ? ' <b style="color:var(--danger)">missing</b>' : ''}</span><span class="spacer"></span><button class="link" id="pipSwap" title="Show the inset big and this clip in the box instead">⇄ Swap</button><button class="link muted" id="pipRm">Remove</button></div>
     <div class="seg" id="pipLayout">${pipLayoutNames(W, H).map(([k, l]) => `<button data-k="${k}" class="${k === lay ? 'on' : ''}">${l}</button>`).join('')}</div>
     ${!pp.hidden && !(s.box && pp.box[3] != null) ? `<div class="inline" style="margin-top:8px"><div class="grid9" id="pipPos">${POS9.map(p => `<button data-p="${p}" class="${p === anchor ? 'on' : ''}"></button>`).join('')}</div><span class="muted" style="font-size:11.5px;line-height:1.4">or drag it on the video;<br>drag a corner to resize</span></div>` : ''}
     ${!pp.hidden ? `<div class="seg" id="pipShape" style="margin-top:8px"><button data-v="round" class="${pp.shape === 'round' ? 'on' : ''}">Rounded</button><button data-v="rect" class="${pp.shape === 'rect' ? 'on' : ''}">Square corners</button><button data-v="circle" class="${pp.shape === 'circle' ? 'on' : ''}">Circle</button></div>` : ''}
+    <div class="inline" style="margin-top:10px;align-items:flex-end"><div class="field" style="margin:0;flex:1"><label>Inset speed (on top of the clip's)</label>${speedControl('pipSpeed', pp.speed || 1)}</div><div class="field" style="margin:0;flex:0 0 86px"><label>Starts at (its own time)</label><input type="text" id="pipIn" value="${fmt((pp.offset || 0) + (pp.speed || 1) * (s.in || 0), 2)}" title="Where in its file the inset is when this clip starts"></div></div>
   </div>`;
 }
 function bindPipInspector(s) {
   const lay = pipLayoutOf(s), anchor = pipAnchorOf(s);
   if ($('#pipAdd')) $('#pipAdd').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'files' }); if (r.paths[0]) { await patchSeg(s.id, { pip: { clip: r.paths[0] }, pip_layout: 'corner:br' }); toast('Inset added: drag it on the video, or pick a layout'); } });
+  if ($('#pipLib')) $('#pipLib').onclick = () => { seek(s.placed.start, true); lsSet('kv.trWhere', 'frame'); openLibrary('clips'); };
+  bindSpeed('pipSpeed', v => patchSeg(s.id, { pip: { speed: v } }));
+  if ($('#pipIn')) { $('#pipIn').onchange = e => patchSeg(s.id, { pip_in: e.target.value }); $('#pipIn').onkeydown = e => { if (e.key === 'Enter') e.target.blur(); }; }
   if ($('#pipSwap')) $('#pipSwap').onclick = () => patchSeg(s.id, { pip_swap: true });
   if ($('#pipRm')) $('#pipRm').onclick = () => patchSeg(s.id, { pip: null, box: null });
   $$('#pipLayout button').forEach(b => b.onclick = () => patchSeg(s.id, { pip_layout: b.dataset.k + (b.dataset.k.startsWith('corner') && anchor ? ':' + anchor : '') }));
@@ -814,33 +863,66 @@ function renderVoInspector(el, v, close) {
 }
 function renderStingInspector(el, m, close) {
   const segOpt = cur => P.timeline.map(s => `<option value="${s.id}" ${s.id === cur ? 'selected' : ''}>${esc(s.kind === 'title' ? (s.title || (s.image ? s.image.split('/').pop() : 'black')) : s.clip.replace(/^clips\//, ''))}</option>`).join('');
-  el.innerHTML = `<h3>Music sting ${close}</h3><div class="muted" style="margin:-6px 0 12px">${esc(m.file.split('/').pop())}${m.at != null ? ` · plays ${fmt(m.at)} → ${fmt(m.end)}` : ' · <b style="color:var(--danger)">its segments are gone</b>'}${m.missing ? ' · <b style="color:var(--danger)">file missing</b>' : ''}</div>` +
-    field('From', `<select id="stFrom">${segOpt(m.from)}</select>`) + field('Through', `<select id="stTo">${segOpt(m.to)}</select>`) +
-    field('Start in the song', `<div class="inline"><input type="text" id="stStart" value="${fmt(m.start || 0, 2)}"><span class="muted">of ${fmt(m.file_duration || 0)}</span></div>`) +
+  const fd = m.file_duration || 0, len = m.at != null ? m.end - m.at : 0, st0 = m.start || 0;
+  const a = fd ? clamp(st0 / fd, 0, 1) : 0, w = fd ? clamp(len / fd, 0, 1 - a) : 0, wrap = m.loop && fd && st0 + len > fd ? clamp((st0 + len - fd) / fd, 0, 1) : 0;
+  const posBtn = (v, l, t) => `<button data-v="${v}" class="${(m.credit_pos || '') === v ? 'on' : ''}" title="${t}">${l}</button>`;
+  el.innerHTML = `<h3>Music ${close}</h3><div class="muted" style="margin:-6px 0 12px">${esc(m.file.split('/').pop())}${m.at != null ? ` · plays ${fmt(m.at)} → ${fmt(m.end)} (${fmt(len)})` : ' · <b style="color:var(--danger)">its segments are gone</b>'}${m.missing ? ' · <b style="color:var(--danger)">file missing</b>' : ''}</div>` +
+    (fd && m.url ? `<div class="field"><label>Which part of the song plays — drag the window to pick where it begins</label><div class="songstrip" id="songStrip"><img src="/api/projects/${P.name}/wave?src=${encodeURIComponent(m.file)}&start=0&end=${fd}&w=600&h=36&color=b8632a" draggable="false"><div class="win" style="left:${a * 100}%;width:${Math.max(0.5, w * 100)}%"></div>${wrap ? `<div class="win wrap" style="left:0;width:${wrap * 100}%"></div>` : ''}<span class="t t0">0:00</span><span class="t t1">${fmt(fd)}</span></div></div>` : '') +
+    field('Starts in the song at', `<div class="inline"><input type="text" id="stStart" value="${fmt(st0, 2)}"><span class="muted">of ${fmt(fd)}${fd && !m.loop && st0 + len > fd + 0.05 ? ' · <b>the song runs out before the clips do</b>' : ''}</span></div>`) +
+    `<div class="inline">${field('From', `<select id="stFrom">${segOpt(m.from)}</select>`)}${field('Through', `<select id="stTo">${segOpt(m.to)}</select>`)}</div>` +
     field('Volume', `<input type="range" id="stVol" min="0" max="1.5" step="0.05" value="${m.volume}">`) +
     `<div class="inline">${field('Fade in (s)', `<input type="number" id="stFi" step="0.1" min="0" value="${m.fade_in}">`)}${field('Fade out (s)', `<input type="number" id="stFo" step="0.1" min="0" value="${m.fade_out}">`)}</div>` +
     `<div class="check"><input type="checkbox" id="stDuck" ${m.duck !== false ? 'checked' : ''}><label for="stDuck">Lower it while people talk</label></div>` +
-    `<div class="sep"></div><div class="actions"><span class="spacer"></span><button class="link danger" id="stDel">Delete</button></div>`;
+    `<div class="check"><input type="checkbox" id="stLoop" ${m.loop ? 'checked' : ''}><label for="stLoop">Repeat the song if the clips run longer than it</label></div>` +
+    `<div class="field"><label>Credit shown in a corner when the music starts (license / attribution)</label><textarea id="stCredit" rows="3" placeholder="Music: Song by Artist&#10;CC BY 3.0 — link">${esc(m.credit || '')}</textarea></div>` +
+    (m.credit ? `<div class="inline" style="margin:-6px 0 12px"><div class="seg" id="stPos">${posBtn('', 'Default', `the vlog's default corner (${CORNERS[P.style.credit_position] || 'top left'}, Settings → This vlog)`)}${posBtn('tl', '↖', 'top left')}${posBtn('tr', '↗', 'top right')}${posBtn('bl', '↙', 'bottom left')}${posBtn('br', '↘', 'bottom right')}</div><input type="number" id="stCreditFor" step="0.5" min="0.5" value="${m.credit_for ?? ''}" placeholder="${P.style.credit_seconds || 6}" style="flex:0 0 64px" title="seconds on screen"><span class="muted">s on screen</span></div>` : '') +
+    `<div class="sep"></div><div class="actions"><button class="link" id="stSplit" title="Split the music at the playhead into two pieces that play on seamlessly (the clip under the playhead is split there too), so each piece can be faded, moved or deleted on its own">✂ Split at playhead</button><button class="link" id="stCont" title="Add the rest of the song over the next clip as its own piece">Continue over the next clip</button><span class="spacer"></span><button class="link danger" id="stDel">Delete</button></div>`;
   $('#inspClose').onclick = () => { selSting = null; renderTimeline(); renderInspector(); };
   const patch = body => guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/stings/${m.id}`, body)); });
   $('#stFrom').onchange = e => patch({ from: e.target.value }); $('#stTo').onchange = e => patch({ to: e.target.value });
   $('#stStart').onchange = e => patch({ start: e.target.value }); $('#stStart').onkeydown = e => { if (e.key === 'Enter') e.target.blur(); };
   $('#stVol').onchange = e => patch({ volume: +e.target.value });
   $('#stFi').onchange = e => patch({ fade_in: +e.target.value }); $('#stFo').onchange = e => patch({ fade_out: +e.target.value });
-  $('#stDuck').onchange = e => patch({ duck: e.target.checked });
+  $('#stDuck').onchange = e => patch({ duck: e.target.checked }); $('#stLoop').onchange = e => patch({ loop: e.target.checked });
+  $('#stCredit').onchange = e => patch({ credit: e.target.value });
+  $$('#stPos button').forEach(b => b.onclick = () => patch({ credit_pos: b.dataset.v }));
+  if ($('#stCreditFor')) $('#stCreditFor').onchange = e => patch({ credit_for: e.target.value === '' ? '' : +e.target.value });
+  $('#stSplit').onclick = () => guard(async () => { const p = await api('POST', `/api/projects/${P.name}/stings/${m.id}/split`, { at: T }); setProject(p); selSting = p.new_id; renderTimeline(); renderInspector(); toast('Music split: two pieces that play on from each other'); });
+  $('#stCont').onclick = () => guard(async () => { const p = await api('POST', `/api/projects/${P.name}/stings/${m.id}/continue`, {}); setProject(p); selSting = p.new_id; renderTimeline(); renderInspector(); const n = p.stings.find(x => x.id === p.new_id); if (n && n.at != null) seek(n.at, true); });
   $('#stDel').onclick = () => guard(async () => { setProject(await api('DELETE', `/api/projects/${P.name}/stings/${m.id}`)); selSting = null; renderInspector(); });
+  // the song strip: drag the window (or click elsewhere) to choose where in the song the music begins
+  const strip = $('#songStrip');
+  if (strip && fd) {
+    const win = $('.win', strip), t1 = $('.t1', strip);
+    dragOn(strip, {
+      down: e => { const r = strip.getBoundingClientRect(); const x = clamp((e.clientX - r.left) / r.width, 0, 1); const inWin = x >= a && x <= a + w; return { r, start0: inWin ? st0 : clamp(x * fd - len / 2, 0, Math.max(0, fd - (m.loop ? 0 : Math.min(len, fd)))), x0: x, cur: null }; },
+      move: (ev, c) => { const x = clamp((ev.clientX - c.r.left) / c.r.width, 0, 1); c.cur = clamp(c.start0 + (x - c.x0) * fd, 0, Math.max(0, fd - (m.loop ? 0 : Math.min(len, fd)))); win.style.left = `${c.cur / fd * 100}%`; $('#stStart').value = fmt(c.cur, 2); t1.textContent = `from ${fmt(c.cur, 1)}`; },
+      up: (ev, c) => { const v = c.cur != null ? c.cur : c.start0; if (Math.abs(v - st0) > 0.02) patch({ start: v }); },
+    });
+  }
 }
 function renderMusicInspector(el, close) {
   const m = P.music;
-  el.innerHTML = `<h3>Music ${close}</h3>` +
+  el.innerHTML = `<h3>Background loop ${close}</h3><p class="muted" style="margin:-6px 0 12px">One song looping under the whole vlog. For music you can split, fade and move with the clips, use <b>♫ Music</b> instead (or turn this one into that below).</p>` +
     field('File', `<div class="inline"><input type="text" id="muFile" value="${esc(m.file || '')}" placeholder="none"><button class="link" id="muPick">Choose…</button></div>`) +
     (m.file ? field('Volume', `<input type="range" id="muVol" min="0" max="1" step="0.02" value="${m.volume}">`) +
       `<div class="check"><input type="checkbox" id="muDuck" ${m.duck ? 'checked' : ''}><label for="muDuck">Duck under speech</label></div>` +
       field('Start offset into the song (s)', `<input type="number" id="muStart" step="1" min="0" value="${m.start}">`) +
-      `<div class="sep"></div><div class="actions"><span class="spacer"></span><button class="link danger" id="muRm">Remove music</button></div>` : '<p class="muted">Music loops under the whole vlog, ducks under speech, and fades out at the end.</p>');
+      `<div class="field"><label>Credit shown in a corner at the start (license / attribution)</label><textarea id="muCredit" rows="3" placeholder="Music: Song by Artist&#10;CC BY 3.0 — link">${esc(m.credit || '')}</textarea></div>` +
+      `<div class="sep"></div><div class="actions"><button class="link" id="muConvert" title="Replace the loop with a music cue over all the clips: it then splits with them, and each piece can be faded or removed">Turn into music over the clips</button><span class="spacer"></span><button class="link danger" id="muRm">Remove music</button></div>` : '');
   $('#inspClose').onclick = () => { selMusic = false; renderTimeline(); renderInspector(); };
   $('#muFile').onchange = e => patchProject({ music: { file: e.target.value } }); $('#muPick').onclick = pickMusic;
-  if (m.file) { $('#muVol').onchange = e => patchProject({ music: { volume: +e.target.value } }); $('#muDuck').onchange = e => patchProject({ music: { duck: e.target.checked } }); $('#muStart').onchange = e => patchProject({ music: { start: +e.target.value } }); $('#muRm').onclick = () => patchProject({ music: { file: '' } }).then(() => { selMusic = false; renderInspector(); }); }
+  if (m.file) {
+    $('#muVol').onchange = e => patchProject({ music: { volume: +e.target.value } }); $('#muDuck').onchange = e => patchProject({ music: { duck: e.target.checked } }); $('#muStart').onchange = e => patchProject({ music: { start: +e.target.value } });
+    $('#muCredit').onchange = e => patchProject({ music: { credit: e.target.value } });
+    $('#muRm').onclick = () => patchProject({ music: { file: '' } }).then(() => { selMusic = false; renderInspector(); });
+    $('#muConvert').onclick = () => guard(async () => {
+      const p = await api('POST', `/api/projects/${P.name}/stings`, { file: m.file, whole: true, loop: true, volume: m.volume, start: m.start || 0, duck: m.duck, fade_in: 1, fade_out: m.fade_out, credit: m.credit || '' });
+      setProject(p); const nid = p.new_id;
+      await patchProject({ music: { file: '', credit: '' } });
+      selMusic = false; selSting = nid; renderTimeline(); renderInspector(); toast('The loop is now music over the clips: split it at the playhead, fade each piece, or delete parts');
+    });
+  }
 }
 
 // ================================================================== add menu / library
@@ -854,27 +936,33 @@ $('#addBtn').onclick = e => popover(e.currentTarget, [
   { label: 'Title card', fn: addTitleSheet },
   { label: 'Picture over the video…', k: '⌘V pastes', fn: () => pickImages() },
   { label: 'Masthead card', fn: () => guard(async () => { const at = sel ? P.timeline.findIndex(s => s.id === sel) + 1 : null; const p = await api('POST', `/api/projects/${P.name}/segments`, { kind: 'masthead', at }); setProject(p); const ns = at == null ? p.timeline[p.timeline.length - 1] : p.timeline[at]; if (ns) { select(ns.id); seek(ns.placed.start, true); } }) },
-  { label: 'Music sting over selection…', fn: () => addSting(null) },
-  { label: 'Continue the intro song over selection', fn: () => addSting('intro') },
-  { label: 'Music…', fn: () => ctxActions.music() },
+  { label: 'Music…', fn: () => musicMenu($('#addBtn')) },
 ]);
-// A music cue over the selected segment(s). file = null picks a song; 'intro' continues the configured
-// intro song from where the last cue using it stopped (so the rest of the track comes in later).
-async function addSting(file) {
-  const s = seg(); if (!s) return toast('Select a clip first, then add the music over it');
+// Music goes over clips as cues anchored to them (the orange lane): over the marked range (I/O), the
+// selected clip, or the whole vlog. "Continue" picks up a song where its last cue stopped.
+function whereMusic() { return markRange() ? 'over the marked range' : seg() ? 'over the selected clip' : 'over the whole vlog'; }
+function musicMenu(anchor) {
+  const songs = [...new Set((P.stings || []).map(m => m.file))];
+  const items = [{ label: `Music ${whereMusic()}…`, fn: () => addMusic(null) }];
+  for (const f of songs) items.push({ label: `Continue “${f.split('/').pop()}” ${whereMusic()}`, fn: () => addMusic(f, true) });
+  if (!songs.some(f => /(^|\/)sting\.[a-z0-9]+$/i.test(f))) items.push({ label: `Continue the intro song ${whereMusic()}`, fn: () => addMusic('intro', true) });
+  items.push('-', { label: P.music && P.music.file ? 'Background loop settings…' : 'Background loop under everything (old style)…', fn: () => ctxActions.music() });
+  popover(anchor, items);
+}
+async function addMusic(file, cont = false) {
   await guard(async () => {
-    const body = { from: s.id, to: s.id };
-    if (file === 'intro') {
-      body.file = 'intro'; body.fade_in = 1.5; body.fade_out = 2;
-      const prev = (P.stings || []).filter(m => /(^|\/)sting\.[a-z0-9]+$/i.test(m.file) && m.at != null && m.end <= s.placed.start + 0.01).sort((a, b) => b.end - a.end)[0];
-      if (prev) body.start = (prev.start || 0) + (prev.end - prev.at);
-    } else {
-      const r = await api('POST', '/api/pick', { kind: 'music' }); if (!r.paths[0]) return;
-      body.file = r.paths[0];
-    }
+    const body = { continue: !!cont };
+    if (file) body.file = file;
+    else { const r = await api('POST', '/api/pick', { kind: 'music' }); if (!r.paths[0]) return; body.file = r.paths[0]; }
+    const s = seg(), range = markRange();
+    if (range) body.range = range;
+    else if (s) { body.from = s.id; body.to = s.id; }
+    else { body.whole = true; body.loop = true; body.volume = 0.35; body.fade_in = 1; body.fade_out = 3; }
+    if (cont) { body.fade_in = body.fade_in ?? 1.5; body.fade_out = body.fade_out ?? 2; }
     const p = await api('POST', `/api/projects/${P.name}/stings`, body);
-    setProject(p); selSting = p.stings[p.stings.length - 1].id; sel = null; renderTimeline(); renderInspector();
-    toast('Music added — set "Through" in the inspector to stretch it over more clips');
+    setProject(p); selSting = p.new_id; sel = null; clearMarks(); renderTimeline(); renderInspector();
+    const m = (p.stings || []).find(x => x.id === p.new_id); if (m && m.at != null) seek(m.at, true);
+    toast(range ? 'Music added over the marked range' : body.whole ? 'Music added over the whole vlog — split it at the playhead to shape it' : 'Music added — set "Through" in the inspector to stretch it over more clips');
   });
 }
 let immichVids = [], picked = new Set();
@@ -1226,7 +1314,7 @@ function openTrimmer(srcs, { segId = null } = {}) {
       <button class="link" id="trOut" title="End the part at the playhead (O)">Mark out <kbd>O</kbd></button>
       <span id="trSel"></span>
       <span class="spacer"></span>
-      ${edit ? '' : `<select id="trWhere" title="Where the part goes on the timeline"><option value="end" ${where === 'end' ? 'selected' : ''}>Add at the end</option><option value="playhead" ${where === 'playhead' ? 'selected' : ''}>Insert at the playhead</option></select>`}
+      ${edit ? '' : `<select id="trWhere" title="Where the part goes on the timeline"><option value="end" ${where === 'end' ? 'selected' : ''}>Add at the end</option><option value="playhead" ${where === 'playhead' ? 'selected' : ''}>Insert at the playhead</option><option value="frame" ${where === 'frame' ? 'selected' : ''}>In a frame over the clip at the playhead</option></select>`}
     </div>
     <div class="foot">
       ${edit ? `<span class="muted trhint">Drag the yellow handles, or play and press I / O.</span><span class="spacer"></span><button class="pill" id="trCancel">Cancel</button><button class="pill primary" id="trApply">Update clip <kbd>⏎</kbd></button>`
@@ -1325,12 +1413,14 @@ async function trAdd(more = false) {
   if (TR.in > 0.01) body.in = +TR.in.toFixed(3);
   if (TR.out < TR.dur - 0.01) body.out = +TR.out.toFixed(3);
   if (where === 'playhead') body.at_time = T;
+  if (where === 'frame') { body.kind = 'pip'; body.at_time = T; body.in = +TR.in.toFixed(3); body.out = +TR.out.toFixed(3); body.layout = 'corner:' + lsGet('kv.recPos', 'br'); }
   trPause();
   await guard(async () => {
     const p = await api('POST', `/api/projects/${P.name}/segments`, body);
     setProject(p); TR.added++;
     const ns = p.new_id && p.timeline.find(x => x.id === p.new_id);
     if (where === 'playhead' && ns && ns.placed) { T = ns.placed.end; updatePlayhead(); }   // the next part lands after this one
+    if (where === 'frame' && ns) { select(ns.id); T = ns.placed.end; updatePlayhead(); toast('In a frame over the clip — set its speed and corner in the inspector, or drag it on the video'); trNext(); return; }
     toast(`Added ${fmt(TR.out - TR.in)} to the timeline`);
     if (more) { const from = TR.out >= TR.dur - 0.1 ? 0 : TR.out; TR.in = from; TR.out = TR.dur; trSeek(from); trLoadUsed(); }
     else trNext();
@@ -1434,6 +1524,7 @@ async function openSettings(tab) {
       <div class="inline">${field('Orientation', `<select id="v_or">${opt(['auto', 'portrait', 'landscape', 'square'], o.orientation)}</select>`)}${field('Transitions', `<select id="v_tr">${opt(['cut', 'fade', 'dip'], st.transition)}</select>`)}${field('Length (s)', `<input type="number" id="v_trd" step="0.1" min="0.1" value="${st.transition_duration}">`)}</div>
       <div class="inline">${field('Fade in (s)', `<input type="number" id="v_fi" step="0.1" min="0" value="${st.fade_in}">`)}${field('Fade out (s)', `<input type="number" id="v_fo" step="0.1" min="0" value="${st.fade_out}">`)}${field('FPS', `<select id="v_fps">${opt([24, 30, 60], o.fps)}</select>`)}</div>
       ${field('Title cards', `<div class="inline"><input type="color" id="v_bg" value="${st.title_bg}" title="background"><input type="color" id="v_fg" value="${st.title_fg}" title="text"><input type="color" id="v_ac" value="${st.title_accent}" title="subtitle / accent"><input type="text" id="v_font" value="${esc(st.font)}" placeholder="font family"></div>`)}
+      <div class="inline">${field('Music credits appear', `<select id="v_cpos">${[['tl', 'top left'], ['tr', 'top right'], ['bl', 'bottom left'], ['br', 'bottom right']].map(([v, l]) => `<option value="${v}" ${(st.credit_position || 'tl') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`)}${field('for (s)', `<input type="number" id="v_csec" step="0.5" min="1" value="${st.credit_seconds ?? 6}">`)}</div>
       <div class="check"><input type="checkbox" id="v_norm" ${a.normalize ? 'checked' : ''}><label for="v_norm">Normalize final loudness</label></div>
       <div class="check"><input type="checkbox" id="v_match" ${a.match_levels ? 'checked' : ''}><label for="v_match">Match clip & voice levels</label></div>
       <div class="actions"><button class="link" id="openFolder">Open project folder</button><span class="spacer"></span><button class="link danger" id="delProj">Delete this vlog…</button></div>
@@ -1458,7 +1549,7 @@ async function openSettings(tab) {
   if (P) { $('#openFolder').onclick = () => api('POST', '/api/open', { path: P.folder }); $('#delProj').onclick = () => { if (!confirm(`Move “${P.name}” to the Trash?`)) return; guard(async () => { await api('DELETE', `/api/projects/${P.name}`); closeSheet(); localStorage.removeItem('kv.project'); P = null; await loadProjects(); }); }; }
   $('#s_ok').onclick = () => guard(async () => {
     await api('PUT', '/api/settings', { immich_url: $('#s_url').value, immich_api_key: $('#s_key').value, vlogs_dir: $('#s_dir').value, default_title_subtitle: $('#s_sub').value, default_title_kicker: $('#s_kick').value, masthead_image: $('#s_mast').value, intro_black_hold: +$('#s_hold').value || 0, intro_masthead_seconds: +$('#s_ms').value || 2.5, intro_title_seconds: +$('#s_ts').value || 2, intro_sting: $('#s_sting').value, intro_sting_start: parseTime($('#s_stingStart').value), intro_sting_volume: +$('#s_stingVol').value || 0, default_music: $('#s_music').value, default_orientation: $('#s_or').value, default_transition: $('#s_tr').value });
-    if (P) await api('PATCH', `/api/projects/${P.name}`, { title: $('#v_title').value, output: { orientation: $('#v_or').value, fps: +$('#v_fps').value }, style: { transition: $('#v_tr').value, transition_duration: +$('#v_trd').value, fade_in: +$('#v_fi').value, fade_out: +$('#v_fo').value, title_bg: $('#v_bg').value, title_fg: $('#v_fg').value, title_accent: $('#v_ac').value, font: $('#v_font').value }, audio: { normalize: $('#v_norm').checked, match_levels: $('#v_match').checked } });
+    if (P) await api('PATCH', `/api/projects/${P.name}`, { title: $('#v_title').value, output: { orientation: $('#v_or').value, fps: +$('#v_fps').value }, style: { transition: $('#v_tr').value, transition_duration: +$('#v_trd').value, fade_in: +$('#v_fi').value, fade_out: +$('#v_fo').value, title_bg: $('#v_bg').value, title_fg: $('#v_fg').value, title_accent: $('#v_ac').value, font: $('#v_font').value, credit_position: $('#v_cpos').value, credit_seconds: +$('#v_csec').value || 6 }, audio: { normalize: $('#v_norm').checked, match_levels: $('#v_match').checked } });
     closeSheet(); await loadProjects(P && P.name); toast('Saved');
   });
 }
@@ -1486,7 +1577,7 @@ async function newProjectSheet() {
 $('#helpBtn').onclick = showHelp;
 function showHelp() {
   const rows = [['space', 'play / pause'], ['I / O', 'mark in / out at the playhead'], ['X', 'mark the whole clip under the playhead'], ['⌫', 'cut out the marked part (no marks: delete the selected segment)'], ['K', 'keep only the marked part of the clip(s)'], ['S', 'split at the playhead (also C, ⌘K)'], ['Q / W', 'trim the clip\'s start / end to the playhead'], ['T', 'cut to a title card here'], ['← →', 'step one frame (⇧ for a second)'], ['↑ ↓', 'select previous / next segment'], ['[ ]', 'move the selected segment'], ['R', 'record (Space during a recording drops a marker)'], ['M', 'add / remove a marker at the playhead'], [', .', 'jump to the previous / next marker'], ['⌘V', 'paste a picture over the video at the playhead'], ['⌘Z / ⇧⌘Z', 'undo / redo'], ['⌘+ ⌘− ⌘0', 'zoom the timeline / fit'], ['esc', 'clear the marks / deselect / close'], ['F', 'fullscreen player'], ['⌘⏎', 'render preview'], ['⇧⌘⏎', 'export'], ['⌘N', 'new vlog']];
-  sheet(`<h2>Keyboard</h2><div class="kbd-grid">${rows.map(([k, d]) => `<kbd>${k}</kbd><span>${d}</span>`).join('')}</div><p class="muted" style="margin-top:14px">Drag the red playhead (or anywhere on the ruler) to scrub; shift-drag the ruler to mark a range and drag its edges to adjust it. Double-click a clip to re-trim it against the whole source. Pictures over the video sit on the pink lane above the clips: drag them to move, drag their ends to change how long they show, and drag them on the video to place them (corners resize). Drag the blue handles on a selected clip to trim, drag blocks to reorder. <b>Log / Linear</b> switches how wide clips are drawn; ⌘-scroll zooms.</p><div class="foot"><button class="pill" data-close>Close</button></div>`);
+  sheet(`<h2>Keyboard</h2><div class="kbd-grid">${rows.map(([k, d]) => `<kbd>${k}</kbd><span>${d}</span>`).join('')}</div><p class="muted" style="margin-top:14px">Drag the red playhead (or anywhere on the ruler) to scrub; shift-drag the ruler to mark a range and drag its edges to adjust it. Double-click a clip to re-trim it against the whole source. Pictures over the video sit on the pink lane above the clips: drag them to move, drag their ends to change how long they show, and drag them on the video to place them (corners resize). Drag the blue handles on a selected clip to trim, drag blocks to reorder. Music lives on the orange lane, anchored to the clips: splitting a clip keeps the song playing over both halves; select the music and use <b>✂ Split at playhead</b> to make pieces you can fade or delete on their own. <b>Log / Linear</b> switches how wide clips are drawn; ⌘-scroll zooms.</p><div class="foot"><button class="pill" data-close>Close</button></div>`);
 }
 
 // ================================================================== recorder (streams chunks to disk as it goes)

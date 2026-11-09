@@ -50,7 +50,18 @@ between masthead and date card (`intro_black_hold`), title-card colors for new v
    reorder. Double-click a clip to re-trim it against the whole source. Clips are drawn at
    log-scaled widths so short ones stay visible (**Log / Linear** in the bar switches it).
    Click a block for the inspector (captions, speed, fit, title colors and layout…). ⌘Z undoes
-   anything. ⌘-scroll zooms.
+   anything. ⌘-scroll zooms. **Speed** is a log slider from 0.1× to 1000× with a box to type any
+   number (60× makes a minute into a second; above 20× the sound is dropped, timelapse style).
+   **Music** (`♫ Music` in the bar, or *+ Add ▸ Music…*) goes on the orange lane, anchored to the
+   clips: over the marked range (`I`/`O` — the clips are split there so it starts and stops exactly
+   where you marked), over the selected clip, or over the whole vlog. Splitting a clip keeps the
+   song playing over both halves; select the music and **✂ Split at playhead** makes two pieces
+   that play on seamlessly, each with its own fades, volume, *Through* range or delete. The
+   inspector shows the whole song as a strip: drag the window to pick where in it the music
+   begins; *Repeat* loops it under long stretches; *Continue "song"* in the menu picks the song up
+   where its last piece stopped. A **credit** (license / attribution text) typed on a cue shows in
+   small text in a corner when the music comes in (corner and seconds per cue, defaults in
+   Settings ▸ This vlog).
    **Pictures over the video**: drop an image on the window, paste one (⌘V), or
    *+ Add ▸ Picture over the video*. It appears at the playhead for 3 seconds on the pink lane
    above the clips: drag it to move it, drag its ends to change how long it shows. In the
@@ -87,7 +98,11 @@ for that spot (they're placed one after another from the marker), or jump betwee
   **⇄ Swap** to make the other one big), or drag the inset around on the video and pull a
   corner to resize it. Split the clip (`S`) to change the layout partway through. Tick
   *include computer sound* to record what the Mac is playing along with your mic (if the
-  share offers it). Any clip can get an inset: *+ Put another clip in a box over this one…*.
+  share offers it). Any clip can get an inset: *+ Put a video in a frame over this clip…*, or
+  pick a clip from *+ Add ▸ In this project* and choose **In a frame over the clip at the
+  playhead** in the trimmer: the clip under the playhead is split so the frame comes in there and
+  goes away when the framed part ends. The inset has its own **speed** on top of the clip's (a 4×
+  timelapse in a corner while you talk) and a *Starts at* time in its own file.
 - **Voiceover**: the preview plays from the playhead while you talk. The narration becomes a
   layer on the *Narration* lane under the timeline, starting at that time; clip audio is
   ducked under your voice. Wear headphones. Narration layers are `voiceovers:` in the YAML.
@@ -115,7 +130,7 @@ Keyboard: `space` play · `I`/`O` mark in/out · `X` mark clip · `⌫` cut out 
 title: Thursday, October 22
 output: {orientation: auto}          # auto | portrait | landscape | square
 style: {transition: cut}             # cut | fade | dip ; also fade_in/out, fonts, colors
-music: {file: ~/Music/lofi.mp3, volume: 0.18, duck: true}
+music: {file: ~/Music/lofi.mp3, volume: 0.18, duck: true, credit: "Music: … (CC BY 3.0)"}   # old-style loop under everything
 timeline:
 - image: assets/masthead.png         # image card (the show's masthead); fit: cover to crop instead
   duration: 3
@@ -151,7 +166,9 @@ timeline:
   fit: cover                            # crop to fill instead of letterbox
 - clip: clips/REC_20261030-104452-screen.mp4   # a screen take: the screen, with the camera in a box over it
   pip: {clip: clips/REC_20261030-104452-cam.mp4, box: {x: 0.82, y: 0.84, w: 0.3}, shape: round}
-                                        # pip time = clip source time + offset; h omitted = the camera's own aspect
+                                        # pip time = offset + speed × clip source time; h omitted = the camera's own aspect
+- clip: clips/IMG_4840.MOV              # a 4x timelapse in a frame over this clip, from 0:05 of its file
+  pip: {clip: clips/IMG_4850.MOV, offset: 5, speed: 4, box: {x: 0.19, y: 0.19, w: 0.3}}
 - clip: clips/REC_20261030-104452-screen.mp4   # the same take, stacked: screen in the lower box, camera square on top
   box: {x: 0.5, y: 0.78, w: 1, h: 0.44}
   pip: {clip: clips/REC_20261030-104452-cam.mp4, box: {x: 0.5, y: 0.28, w: 1, h: 0.5625}, shape: rect}
@@ -160,8 +177,11 @@ voiceovers:
 images:                                 # pictures over the video; box = centre x/y + width as fractions of the frame
 - {image: assets/dog.jpg, at: 0:20, for: 3}                              # full screen
 - {image: assets/map.png, at: 0:31, for: 4, box: {x: 0.78, y: 0.24, w: 0.32}}   # small, top right
-stings:                                 # music cues anchored to segments (follow them when the edit changes)
+stings:                                 # music, anchored to segments (splits with them; follows them when the edit changes)
 - {file: audio/sting.mp3, from: s1, to: s3, start: 0:06.5, volume: 0.7, fade_in: 0.6, fade_out: 1.0}
+- {file: audio/city-lights.mp3, from: s5, to: s9, start: 0:12, loop: true, fade_out: 0,
+   credit: "Music: city lights by Snoozy Beats\nCC BY 3.0", credit_pos: tr, credit_for: 6}
+- {file: audio/city-lights.mp3, from: s10, to: s12, start: 1:02, fade_in: 0}   # …continued after a split
 ```
 
 ## CLI
@@ -176,13 +196,17 @@ vlog image PROJ pic.jpg --at 0:20 [--for 3] [--size full|large|half|small] [--po
 vlog cut PROJ 0:12 0:15                    cut out that stretch of the output timeline (closes the gap)
 vlog keep PROJ 0:12 0:15                   trim the clip(s) there so only that stretch remains
 vlog caption PROJ s3 "coffee first" [--at 2 --dur 3]
-vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true transition=fade
+vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true transition=fade   (speed: any number, e.g. 60)
 vlog set PROJ s3 channel=right             # one-channel mic: right (or left) to both ears; mix; stereo; auto
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
-vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos br] [--shape round|rect|circle] [--swap] [--rm]
+vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos br] [--shape round|rect|circle] [--speed 4] [--in 0:05] [--swap] [--rm]
                                            a clip in a box over s3 (picture in picture); --swap makes the inset the big one
+vlog frame PROJ clip.mp4 --at 0:32 [--in 0:05 --out 0:20] [--speed 4] [--pos tl]   video in a frame over the clip at 0:32, for its in→out part
 vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --at v1 to remove)
-vlog sting PROJ song.mp3 --from s1 --to s3 [--start 0:06.5] [--volume 0.7]   (`intro` = the configured song; rm --id m1)
+vlog sting PROJ song.mp3 --from s1 --to s3 [--start 0:06.5] [--volume 0.7] [--loop] [--credit "Music: …" --credit-pos tr]
+vlog sting PROJ song.mp3 --range 0:32 1:10 | --whole   music over that stretch (clips split at both ends) / the whole vlog
+vlog sting PROJ song.mp3 --continue --from s5   pick the song up where its last cue stopped  (`intro` = the configured song)
+vlog sting PROJ split --id m1 --at 0:45     split a cue at 0:45 into two that play on (the clip is split there too); rm --id m1 removes
 vlog preview PROJ [--open] · vlog render PROJ [--open] · vlog serve [--open]
 vlog undo PROJ · vlog redo PROJ
 ```

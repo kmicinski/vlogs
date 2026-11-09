@@ -319,6 +319,40 @@ def render_caption(cache_dir: Path, w: int, h: int, text: str, *, font: str, bg:
     return out
 
 
+def render_credit(cache_dir: Path, w: int, h: int, text: str, *, font: str, position: str = "tl",
+                  fg: str = "#ffffff") -> Path:
+    """Transparent full-frame PNG with small attribution text (a music credit) in a corner: tl | tr |
+    bl | br. Lines are kept as written; long ones wrap to under half the frame."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    out = cache_dir / f"credit_{_key('v1', w, h, text, font, position, fg)}.png"
+    if out.exists():
+        return out
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    short = min(w, h)
+    margin = int(short * 0.05)
+    f = load_font(font, max(12, int(short * 0.024)), "medium")
+    max_w = int(w * 0.48)
+    lines: list[str] = []
+    for raw in text.splitlines():
+        raw = raw.strip()
+        lines += _wrap(draw, raw, f, max_w) if raw else [""]
+    lh = int(f.size * 1.3)
+    block = len(lines) * lh
+    top = position in ("tl", "tr")
+    right = position in ("tr", "br")
+    y = margin if top else h - margin - block
+    for line in lines:
+        tw = draw.textlength(line, font=f)
+        x = (w - margin - tw) if right else margin
+        for dx, dy in ((1, 1), (0, 2)):
+            draw.text((x + dx, y + dy), line, font=f, fill=(0, 0, 0, 170))
+        draw.text((x, y), line, font=f, fill=_hex_to_rgba(fg))
+        y += lh
+    img.save(out)
+    return out
+
+
 def render_layer(cache_dir: Path, w: int, h: int, image: Path, box: tuple | None, fit: str = "contain") -> Path:
     """Full-frame PNG for a picture over the video. Full screen: opaque (whole picture over a blurred
     copy of itself, or cropped to fill). In a box: transparent frame with the picture placed at

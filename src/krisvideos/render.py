@@ -20,6 +20,7 @@ from .probe import MediaInfo, probe
 from .project import Overlay, Pip, Project, Segment
 
 AUDIO_FMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+MUTE_ABOVE = 20.0     # a clip faster than this plays silent (a timelapse): sped-up speech is just noise
 CANVAS = {"portrait": (1080, 1920), "landscape": (1920, 1080), "square": (1080, 1080)}
 
 
@@ -152,6 +153,25 @@ def sting_span(layout: Layout, m) -> tuple[float, float] | None:
     return a.start, b.end
 
 
+def credit_spans(p: Project, layout: Layout) -> list[tuple[str, float, float, str]]:
+    """(text, start, seconds, corner) for every music credit: each cue with a `credit` shows it when
+    it comes in; the looping background music shows its credit at the start of the vlog."""
+    out = []
+    st = p.style
+    pos_default = st.credit_position if st.credit_position in ("tl", "tr", "bl", "br") else "tl"
+    for m in p.stings:
+        if not m.credit.strip():
+            continue
+        span = sting_span(layout, m)
+        if span is None or not p.resolve(m.file).exists():
+            continue
+        out.append((m.credit.strip(), span[0], m.credit_for if m.credit_for else st.credit_seconds,
+                    m.credit_pos if m.credit_pos in ("tl", "tr", "bl", "br") else pos_default))
+    if p.music.file and p.music.credit.strip() and p.resolve(p.music.file).exists():
+        out.append((p.music.credit.strip(), 0.0, st.credit_seconds, pos_default))
+    return out
+
+
 def locate(layout: Layout, t: float) -> tuple[Placed | None, float]:
     """Map an output-timeline time to (placed segment, seconds into that segment)."""
     for pl in layout.placed:
@@ -276,7 +296,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             k = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in):.3f}", "-i", str(src)])
             vchain = ["setpts=PTS-STARTPTS"]
             if s.speed != 1.0:
-                vchain.append(f"setpts=PTS/{s.speed}")
+                vchain.append(f"setpts=PTS/{s.speed:.6g}")
             # the picture fills the frame, or the box it was given (screen + camera layouts)
             bx, by, bw, bh = region(s.box, W, H)
             fw, fh = _fit(info.width, info.height, bw, bh)
@@ -305,14 +325,15 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                         pinfo = None
             if pinfo is not None:
                 px, py, pw, ph = pip_rect(pip, pinfo, W, H)
-                pin = pl.src_in + pip.offset
+                rate = s.speed * (pip.speed or 1.0)        # the inset runs at its own speed on top of the clip's
+                pin = pip.time(pl.src_in)
                 seek = ["-ss", f"{pin:.3f}"] if pin > 0 else []
-                kp = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
+                kp = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
                 pchain = ["setpts=PTS-STARTPTS"]
                 if pin < 0:            # the inset's file starts after the clip's in point: hold its first frame until then
                     pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
-                if s.speed != 1.0:
-                    pchain.append(f"setpts=PTS/{s.speed}")
+                if rate != 1.0:
+                    pchain.append(f"setpts=PTS/{rate:.6g}")
                 if pinfo.hdr and hdr_mode != "none":
                     any_hdr = True
                     pchain.append(_hdr_chain(hdr_mode, *_fit(pinfo.width, pinfo.height, pw, ph)).rstrip(","))
@@ -358,7 +379,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 cur = f"vo{i}_{j}"
             filters.append(f"[{cur}]settb=AVTB[v{i}]")
             # audio
-            if info.has_audio and not s.mute and s.volume > 0:
+            if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
                 achain = ["asetpts=PTS-STARTPTS"]
                 ch = media.effective_channel(src, p.cache_dir, s.channel)
                 if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
@@ -426,6 +447,19 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         filters.append(f"[{V}][im{n}]overlay=0:0:eof_action=pass:enable='between(t,{a:.3f},{a + d:.3f})'[VI{n}]")
         V = f"VI{n}"
 
+    # music credits: small attribution text in a corner when a song first comes in
+    for n, (text, at, hold, pos) in enumerate(credit_spans(p, layout)):
+        d = min(hold, total - at)
+        if d < 0.3:
+            continue
+        png = titles.render_credit(p.cache_dir, W, H, text, font=st.font, position=pos)
+        k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", str(png)])
+        fd = min(0.4, d / 3)
+        filters.append(f"[{k}:v]format=rgba,fade=t=in:st=0:d={fd:.3f}:alpha=1,fade=t=out:st={d - fd:.3f}:d={fd:.3f}:alpha=1,"
+                       f"setpts=PTS-STARTPTS+{at:.3f}/TB[cr{n}]")
+        filters.append(f"[{V}][cr{n}]overlay=0:0:eof_action=pass:enable='between(t,{at:.3f},{at + d:.3f})'[VC{n}]")
+        V = f"VC{n}"
+
     # global video fades
     vf = []
     if st.fade_in > 0:
@@ -476,7 +510,8 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         for n, (m, (t0, t1)) in enumerate(stings):
             length = t1 - t0
             seek = ["-ss", f"{m.start:.3f}"] if m.start > 0 else []
-            km = add_input(seek + ["-t", f"{length:.3f}", "-i", str(p.resolve(m.file))])
+            loop = ["-stream_loop", "-1"] if m.loop else []
+            km = add_input(loop + seek + ["-t", f"{length:.3f}", "-i", str(p.resolve(m.file))])
             fi, fo = min(m.fade_in, length / 2), min(m.fade_out, length / 2)
             chain = [AUDIO_FMT, "asetpts=PTS-STARTPTS", f"atrim=duration={length:.3f}", f"apad=whole_dur={length:.3f}",
                      f"volume={m.volume}"]

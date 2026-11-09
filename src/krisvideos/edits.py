@@ -8,7 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from . import render
-from .project import Project, Segment
+from .project import Pip, Project, Segment, Sting
 
 MIN_PIECE = 0.1     # leftovers shorter than this (seconds) are dropped instead of kept as slivers
 MIN_TITLE = 0.3     # a title card shortened below this is removed
@@ -123,19 +123,51 @@ def follow_content(before: Project, p: Project) -> None:
 
 def swap_pip(seg: Segment) -> None:
     """Exchange a clip and its inset: the inset's file becomes the main picture and vice versa. The
-    in/out points and markers move by the sync offset so the same moments stay on screen; the boxes
+    in/out points and markers move through the sync mapping (inset time = offset + speed * clip time)
+    so the same moments stay on screen and the piece keeps its length on the timeline; the boxes
     stay where they are (the big region stays big, the small one small)."""
     pip = seg.pip
     if pip is None:
         return
-    off = pip.offset
+    off, r = pip.offset, pip.speed or 1.0
     seg.src, pip.src = pip.src, seg.src
-    seg.in_ = max(0.0, seg.in_ + off)
+    seg.in_ = max(0.0, off + r * seg.in_)
     if seg.out is not None:
-        seg.out = max(seg.in_, seg.out + off)
-    seg.markers = sorted(round(max(0.0, m + off), 3) for m in seg.markers)
-    pip.offset = round(-off, 3) + 0.0      # (+ 0.0: never -0.0)
+        seg.out = max(seg.in_, off + r * seg.out)
+    seg.markers = sorted(round(max(0.0, off + r * m), 3) for m in seg.markers)
+    pip.offset = round(-off / r, 3) + 0.0      # (+ 0.0: never -0.0)
+    pip.speed = round(1 / r, 4)
+    seg.speed = round((seg.speed or 1.0) * r, 4)
     seg.channel = "auto"                  # the audio now comes from the other file
+
+
+def insert_pip(p: Project, t: float, src: str, in_: float = 0.0, out: float | None = None, speed: float = 1.0,
+               layout: str = "corner", pos: str | None = None, pip_aspect: float = 9 / 16) -> Segment:
+    """Put a video in a frame over the clip at output time `t`: the clip is split there so the inset
+    comes in at `t`, and split again where the inset's part ends (out - in, at its `speed`) so the
+    frame goes away after it. `in_`/`out` are the inset file's own times. Returns the clip segment
+    that now carries the inset (the caller sets the layout size/corner from the canvas)."""
+    speed = max(0.01, float(speed or 1.0))
+    layout_ = render.compute_layout(p)
+    pl, off = render.locate(layout_, t)
+    if pl is None:
+        raise ValueError("nothing on the timeline there")
+    if pl.seg.kind != "clip" or pl.duration - off < 0.25:
+        # a title card, or the very end of a clip: the frame goes over whatever comes next
+        nxt = next((q for q in layout_.placed[pl.index + 1:] if q.seg.kind == "clip"), None)
+        if nxt is None:
+            raise ValueError("put the frame over a clip (there is no clip at or after that time)")
+        pl, off = nxt, 0.0
+    main = pl.seg if off < 0.25 else split_segment(p, pl, off)
+    layout_ = render.compute_layout(p)
+    mpl = next(q for q in layout_.placed if q.seg is main)
+    if out is not None and out > in_:
+        length = (out - in_) / speed                    # output seconds the inset has footage for
+        if mpl.duration - length >= 0.25 and length >= 0.25:
+            split_segment(p, mpl, length)               # the frame ends with the inset's footage
+    main.pip = Pip(src=src, offset=round(in_ - speed * main.in_, 3) + 0.0, speed=speed)
+    pip_layout(main, layout, (layout_.width, layout_.height), pip_aspect, pos)
+    return main
 
 
 PIP_LAYOUTS = ("corner", "corner-large", "stacked", "hidden")
@@ -201,9 +233,18 @@ def pip_anchor(box: tuple, pip_aspect: float, canvas: tuple[int, int]) -> str | 
     return None
 
 
+def _music_follows_split(p: Project, seg_id: str, tail_id: str) -> None:
+    """A clip was split (or cut in the middle): music cues that ended on it now end on the tail, so
+    the song keeps playing over both pieces."""
+    for m in p.stings:
+        if (m.to_id or m.from_id) == seg_id:
+            m.to_id = tail_id
+
+
 def split_segment(p: Project, pl: render.Placed, off: float) -> Segment:
     """Split the clip `pl` at `off` output-seconds into it. The first half keeps the id (and the
-    caption); returns the new second half, which follows with a plain cut."""
+    caption); returns the new second half, which follows with a plain cut. Music cues over the clip
+    keep playing over both halves."""
     seg = pl.seg
     cut = pl.src_in + off * (seg.speed or 1.0)
     tail = deepcopy(seg)
@@ -216,7 +257,82 @@ def split_segment(p: Project, pl: render.Placed, off: float) -> Segment:
     seg.overlays = _overlays_before(seg, off)
     p.timeline.insert(pl.index + 1, tail)
     _fresh_ids(p)
+    _music_follows_split(p, seg.id, tail.id)
     return tail
+
+
+def _boundary_at(p: Project, t: float) -> int:
+    """Timeline index of the first segment that starts at output time `t`, splitting the clip under
+    `t` when `t` is inside one (near an edge, or on a title card, the nearest edge is used)."""
+    return insert_index_at(p, t)
+
+
+def split_sting(p: Project, m: Sting, t: float, file_duration: float | None = None) -> Sting:
+    """Split a music cue at output time `t` into two cues that play on seamlessly (the second picks
+    up in the song where the first stops): the clip under `t` is split there if need be. Either
+    piece can then be faded, moved or deleted on its own. Returns the new second cue."""
+    layout = render.compute_layout(p)
+    span = render.sting_span(layout, m)
+    if span is None:
+        raise ValueError("the cue's segments are gone")
+    a, b = span
+    if not (a + 0.1 < t < b - 0.1):
+        raise ValueError("the playhead is not inside that music")
+    idx = _boundary_at(p, t)
+    layout = render.compute_layout(p)
+    if idx <= 0 or idx >= len(layout.placed):
+        raise ValueError("nothing to split there")
+    left_last, right_first = layout.placed[idx - 1], layout.placed[idx]
+    by_id = {pl.seg.id: pl for pl in layout.placed}
+    first, last = by_id.get(m.from_id), by_id.get(m.to_id or m.from_id)
+    first, last = first or last, last or first
+    if first.index > last.index:
+        first, last = last, first
+    played = right_first.start - first.start
+    start2 = m.start + played
+    if m.loop and file_duration and file_duration > 0:
+        start2 = start2 % file_duration
+    m2 = p.add_sting(m.file, right_first.seg.id, last.seg.id, start=round(start2, 3), volume=m.volume,
+                     fade_in=0.0, fade_out=m.fade_out, duck=m.duck, loop=m.loop, note=m.note)
+    m.from_id, m.to_id = first.seg.id, left_last.seg.id
+    m.fade_out = 0.0
+    # keep the cues in timeline order
+    order = {pl.seg.id: pl.index for pl in layout.placed}
+    p.stings.sort(key=lambda x: order.get(x.from_id, 10 ** 6))
+    return m2
+
+
+def continue_sting(p: Project, m: Sting, from_id: str, to_id: str | None = None, file_duration: float | None = None,
+                   fade_in: float | None = None, fade_out: float | None = None) -> Sting:
+    """A new cue with the same song over `from_id`..`to_id`, starting in the song where `m` left off."""
+    layout = render.compute_layout(p)
+    span = render.sting_span(layout, m)
+    played = (span[1] - span[0]) if span else 0.0
+    start = m.start + played
+    if m.loop and file_duration and file_duration > 0:
+        start = start % file_duration
+    return p.add_sting(m.file, from_id, to_id or from_id, start=round(start, 3), volume=m.volume,
+                       fade_in=m.fade_in if fade_in is None else fade_in, fade_out=m.fade_out if fade_out is None else fade_out,
+                       duck=m.duck, loop=m.loop)
+
+
+def last_cue_with(p: Project, file: str, before_id: str | None = None) -> Sting | None:
+    """The cue using `file` that ends last before segment `before_id` starts (or last overall)."""
+    layout = render.compute_layout(p)
+    limit = None
+    if before_id:
+        pl = next((q for q in layout.placed if q.seg.id == before_id), None)
+        limit = pl.start + 0.01 if pl else None
+    best, best_end = None, -1.0
+    for m in p.stings:
+        if m.file != file:
+            continue
+        span = render.sting_span(layout, m)
+        if span is None or (limit is not None and span[1] > limit):
+            continue
+        if span[1] > best_end:
+            best, best_end = m, span[1]
+    return best
 
 
 def insert_index_at(p: Project, t: float) -> int:
@@ -276,6 +392,8 @@ def cut_range(p: Project, a: float, b: float) -> float:
             s.out = pl.src_in + off_a * spd
             s.overlays = _overlays_before(s, off_a)
             new += [s, second]
+            second.id = p.next_id()
+            _music_follows_split(p, s.id, second.id)
         elif head:                                # cut the end off
             s.out = pl.src_in + off_a * spd
             s.overlays = _overlays_before(s, off_a)

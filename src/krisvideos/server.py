@@ -22,7 +22,7 @@ from .cli import new_project as make_project, masthead_rel, sting_rel
 from .edits import title_at
 from .config import Config
 from .probe import is_video, probe
-from .project import CHANNELS, Overlay, Pip, Project, Segment, Voiceover, box4
+from .project import CHANNELS, CREDIT_POSITIONS, Overlay, Pip, Project, Segment, Voiceover, box4
 from .timeutil import parse_time
 
 WEB = Path(__file__).parent / "web"
@@ -287,7 +287,7 @@ def create_app(cfg: Config) -> FastAPI:
         except Exception:
             info = None
         st = media.media_status(p, pip.src)
-        return {"src": pip.src, "offset": pip.offset, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
+        return {"src": pip.src, "offset": pip.offset, "speed": pip.speed, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
                 "hidden": pip.hidden, "media": info.to_dict() if info else None, "missing": info is None,
                 "proxy_url": media_url(p, f"cache/{Path(pip.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, pip.src) if media.browser_playable(info) else None),
                 "thumb_url": media_url(p, f"cache/{Path(pip.src).name}.thumb.jpg") if st["thumb"] else None,
@@ -358,7 +358,8 @@ def create_app(cfg: Config) -> FastAPI:
             f = p.resolve(m.file)
             span = render.sting_span(layout, m) if layout else None
             md = m.to_dict() | {"id": m.id, "from": m.from_id, "to": m.to_id, "start": m.start, "volume": m.volume,
-                                "fade_in": m.fade_in, "fade_out": m.fade_out, "duck": m.duck, "missing": not f.exists(),
+                                "fade_in": m.fade_in, "fade_out": m.fade_out, "duck": m.duck, "loop": m.loop,
+                                "credit": m.credit, "credit_pos": m.credit_pos, "credit_for": m.credit_for, "missing": not f.exists(),
                                 "url": media_url(p, m.file) if f.exists() and not Path(m.file).is_absolute() else None,
                                 "at": span[0] if span else None, "end": span[1] if span else None}
             try:
@@ -592,6 +593,35 @@ def create_app(cfg: Config) -> FastAPI:
             p.add_title(body.get("text") or ("" if image else "Title"), body.get("subtitle") or "",
                         float(body.get("duration") or 3), at=at, kicker=body.get("kicker") or "", image=image,
                         bg=body.get("bg") or None, fg=body.get("fg") or None)
+        elif body.get("kind") == "pip":
+            # a video in a frame over the clip at `at_time` (default: the selected segment's start), for the
+            # length of its in→out part at `speed`; the clip is split so the frame comes and goes with it
+            src = body["src"]
+            if Path(src).expanduser().is_absolute():
+                src = media.import_file(p, Path(src))
+                media.prepare_async(p, src)
+            elif not p.resolve(src).exists():
+                raise HTTPException(400, f"missing {src}")
+            t = body.get("at_time")
+            if t is None:
+                sid = body.get("over")
+                layout = render.compute_layout(p)
+                pl = next((q for q in layout.placed if q.seg.id == sid), None) if sid else None
+                t = pl.start if pl else 0.0
+            try:
+                pinfo = probe(p.resolve(src), p.cache_dir)
+                aspect = pinfo.height / pinfo.width if pinfo.width and pinfo.height else 9 / 16
+            except Exception:
+                aspect = 9 / 16
+            lay, _, pos = str(body.get("layout") or "corner:br").partition(":")
+            try:
+                seg = edits.insert_pip(p, float(t), src, parse_time(body.get("in") or 0),
+                                       None if body.get("out") in (None, "") else parse_time(body["out"]),
+                                       float(body.get("speed") or 1.0), lay, pos or None, aspect)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            commit(p)
+            return project_json(p) | {"new_id": seg.id}
         else:
             src = body["src"]
             if not p.resolve(src).exists():
@@ -656,6 +686,10 @@ def create_app(cfg: Config) -> FastAPI:
                     base["clip"] = src
                     base.pop("src", None)
                     s.pip = Pip.from_dict(base)
+            elif k == "pip_in":
+                # where in its own file the inset is at this clip's in point
+                if s.pip is not None:
+                    s.pip.offset = round(parse_time(v) - (s.pip.speed or 1.0) * s.in_, 3) + 0.0
             elif k == "pip_swap":
                 if v:
                     edits.swap_pip(s)
@@ -1041,34 +1075,109 @@ def create_app(cfg: Config) -> FastAPI:
         commit(p)
         return project_json(p)
 
-    @app.post("/api/projects/{name}/stings")
-    def add_sting(name: str, body: dict):
-        p = load(name)
-        if body.get("file") == "intro":
+    def music_rel(p: Project, file: str) -> str:
+        """A song as a project-relative path: 'intro' is the configured intro song, a path inside the
+        project is used as is, anything else is copied into audio/."""
+        if file == "intro":
             rel = sting_rel(p, cfg)
             if not rel:
                 raise HTTPException(400, "no intro sting configured (Settings → App)")
-        else:
-            src = Path(body["file"]).expanduser()
-            if not src.exists():
-                raise HTTPException(400, f"not found: {src}")
-            p.ensure_dirs()
-            dst = p.audio_dir / src.name
-            if not dst.exists():
-                shutil.copy2(src, dst)
-            rel = f"audio/{dst.name}"
-        frm = body.get("from") or (p.timeline[0].id if p.timeline else "")
-        if not frm:
+            return rel
+        if not Path(file).expanduser().is_absolute() and p.resolve(file).exists():
+            return file
+        src = Path(file).expanduser()
+        if not src.exists():
+            raise HTTPException(400, f"not found: {src}")
+        p.ensure_dirs()
+        dst = p.audio_dir / src.name
+        if not dst.exists():
+            shutil.copy2(src, dst)
+        return f"audio/{dst.name}"
+
+    def file_duration(p: Project, rel: str) -> float | None:
+        try:
+            return probe(p.resolve(rel), p.cache_dir).duration
+        except Exception:
+            return None
+
+    @app.post("/api/projects/{name}/stings")
+    def add_sting(name: str, body: dict):
+        """A music cue over segments. Where it goes: `from`/`to` segment ids; `range: [a, b]` timeline
+        times (the clips are split at both ends so the music comes and goes exactly there); or
+        `whole: true` for the whole vlog. `continue: true` starts in the song where the last cue with
+        the same song left off (the rest of the track comes in later)."""
+        p = load(name)
+        if not p.timeline:
             raise HTTPException(400, "timeline is empty")
+        rel = music_rel(p, body.get("file") or "intro")
+        if body.get("range"):
+            a, b = sorted(float(parse_time(x)) for x in body["range"][:2])
+            layout = render.compute_layout(p)
+            b = min(b, layout.total)
+            if b - a < 0.2:
+                raise HTTPException(400, "mark a longer range")
+            ia = edits.insert_index_at(p, a)
+            ib = edits.insert_index_at(p, b)
+            if ib <= ia:
+                ib = ia + 1
+            frm, to = p.timeline[ia].id, p.timeline[min(ib, len(p.timeline)) - 1].id
+        elif body.get("whole"):
+            frm, to = p.timeline[0].id, p.timeline[-1].id
+        else:
+            frm = body.get("from") or p.timeline[0].id
+            to = body.get("to") or frm
         kw = {}
-        for k in ("start", "volume", "fade_in", "fade_out"):
-            if body.get(k) is not None:
+        for k in ("start", "volume", "fade_in", "fade_out", "credit_for"):
+            if body.get(k) not in (None, ""):
                 kw[k] = parse_time(body[k]) if k == "start" else float(body[k])
-        if body.get("duck") is not None:
-            kw["duck"] = bool(body["duck"])
-        p.add_sting(rel, frm, body.get("to") or frm, **kw)
+        for k in ("duck", "loop"):
+            if body.get(k) is not None:
+                kw[k] = bool(body[k])
+        if body.get("credit") is not None:
+            kw["credit"] = str(body["credit"])
+        if body.get("credit_pos") in CREDIT_POSITIONS:
+            kw["credit_pos"] = body["credit_pos"]
+        if body.get("continue") and "start" not in kw:
+            prev = edits.last_cue_with(p, rel, frm)
+            if prev is not None:
+                m = edits.continue_sting(p, prev, frm, to, file_duration(p, rel), kw.pop("fade_in", None), kw.pop("fade_out", None))
+                for k, v in kw.items():
+                    setattr(m, k, v)
+                commit(p)
+                return project_json(p) | {"new_id": m.id}
+        m = p.add_sting(rel, frm, to, **kw)
         commit(p)
-        return project_json(p)
+        return project_json(p) | {"new_id": m.id}
+
+    @app.post("/api/projects/{name}/stings/{mid}/split")
+    def split_sting_api(name: str, mid: str, body: dict):
+        """Split a cue at timeline time `at` into two that play on seamlessly (splitting the clip there)."""
+        p = load(name)
+        m = p.sting(mid)
+        try:
+            m2 = edits.split_sting(p, m, float(parse_time(body.get("at", 0))), file_duration(p, m.file))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        commit(p)
+        return project_json(p) | {"new_id": m2.id}
+
+    @app.post("/api/projects/{name}/stings/{mid}/continue")
+    def continue_sting_api(name: str, mid: str, body: dict):
+        """A new cue with the same song over `from`..`to` (default: the segment after this cue), picking
+        up in the song where this cue stops."""
+        p = load(name)
+        m = p.sting(mid)
+        frm = body.get("from")
+        if not frm:
+            layout = render.compute_layout(p)
+            span = render.sting_span(layout, m)
+            nxt = next((pl for pl in layout.placed if span and pl.start >= span[1] - 1e-3), None)
+            if nxt is None:
+                raise HTTPException(400, "nothing after this music to continue over")
+            frm = nxt.seg.id
+        m2 = edits.continue_sting(p, m, frm, body.get("to") or frm, file_duration(p, m.file))
+        commit(p)
+        return project_json(p) | {"new_id": m2.id}
 
     @app.patch("/api/projects/{name}/stings/{mid}")
     def patch_sting(name: str, mid: str, body: dict):
@@ -1085,6 +1194,14 @@ def create_app(cfg: Config) -> FastAPI:
                 setattr(m, k, max(0.0, float(body[k])))
         if "duck" in body:
             m.duck = bool(body["duck"])
+        if "loop" in body:
+            m.loop = bool(body["loop"])
+        if "credit" in body:
+            m.credit = str(body["credit"] or "")
+        if "credit_pos" in body:
+            m.credit_pos = body["credit_pos"] if body["credit_pos"] in CREDIT_POSITIONS else ""
+        if "credit_for" in body:
+            m.credit_for = None if body["credit_for"] in (None, "") else max(0.5, float(body["credit_for"]))
         if "note" in body:
             m.note = str(body["note"])
         commit(p)
