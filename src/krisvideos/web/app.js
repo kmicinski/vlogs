@@ -936,7 +936,8 @@ $('#addBtn').onclick = e => popover(e.currentTarget, [
   { label: 'Title card', fn: addTitleSheet },
   { label: 'Picture over the video…', k: '⌘V pastes', fn: () => pickImages() },
   { label: 'Masthead card', fn: () => guard(async () => { const at = sel ? P.timeline.findIndex(s => s.id === sel) + 1 : null; const p = await api('POST', `/api/projects/${P.name}/segments`, { kind: 'masthead', at }); setProject(p); const ns = at == null ? p.timeline[p.timeline.length - 1] : p.timeline[at]; if (ns) { select(ns.id); seek(ns.placed.start, true); } }) },
-  { label: 'Music…', fn: () => musicMenu($('#addBtn')) },
+  '-',
+  ...musicItems(),
 ]);
 // Music goes over clips as cues anchored to them (the orange lane). The default is to continue the intro
 // song where it last stopped; "Other music here…" opens a sheet to pick a song and where in it to begin.
@@ -949,14 +950,15 @@ function musicTarget() {
   if (s && s.placed) return { body: { from: s.id, to: s.id }, label: `over ${s.kind === 'clip' ? s.clip.replace(/^clips\//, '') : (s.title || 'the card')}`, length: s.placed.duration };
   return null;
 }
-function musicMenu(anchor) {
+function musicItems() {
   const tgt = musicTarget(), songs = [...new Set((P.stings || []).map(m => m.file))];
   const items = [{ label: 'Continue the intro song here', k: tgt ? tgt.label : 'select a clip first', disabled: !tgt, fn: () => addMusic('intro', true) }];
   for (const f of songs.filter(f => songName(f) !== 'the intro song')) items.push({ label: `Continue “${songName(f)}” here`, k: tgt ? tgt.label : '', disabled: !tgt, fn: () => addMusic(f, true) });
   items.push({ label: 'Other music here…', fn: () => musicSheet() });
-  if (P.music && P.music.file) items.push('-', { label: 'Background loop…', fn: () => ctxActions.music() });
-  popover(anchor, items);
+  if (P.music && P.music.file) items.push({ label: 'Background loop…', fn: () => ctxActions.music() });
+  return items;
 }
+function musicMenu(anchor) { popover(anchor, musicItems()); }
 async function addMusic(file, cont = false, extra = {}) {
   const tgt = musicTarget(); if (!tgt && !extra.whole) return toast('Select a clip or mark a range first');
   await guard(async () => {
