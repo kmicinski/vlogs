@@ -628,22 +628,35 @@ function dragOn(el, { down, move, up }) {
 const scrubState = { was: false };
 const scrubStart = () => { scrubState.was = playing; stop(); };
 const scrubEnd = () => { if (scrubState.was) play(); };
+// The ruler: a *click* (press + release without moving) jumps the playhead to that point. Dragging
+// scrubs only while paused; while playing the playhead stays put until you let go, so a hand that
+// drifts never moves it. A faint red ghost line (#ghost) follows the mouse to show where a click lands.
 dragOn($('#ruler'), {
-  down: e => { if (!P || !P.timeline.length) return false; scrubStart(); const t = xToT(contentX(e)); if (e.shiftKey) { MK.in = MK.out = t; renderMarks(); return { from: t }; } seek(t, true); return {}; },
-  move: (ev, c) => { const t = xToT(contentX(ev)); if (c.from != null) { MK.in = Math.min(c.from, t); MK.out = Math.max(c.from, t); renderMarks(); } seek(t); },
-  up: (ev, c) => { if (c.from != null && !markRange()) clearMarks(); scrubEnd(); },
+  down: e => { if (!P || !P.timeline.length) return false; const t = xToT(contentX(e)); if (e.shiftKey) { MK.in = MK.out = t; renderMarks(); return { from: t }; } return { x0: e.clientX, scrub: false }; },
+  move: (ev, c) => {
+    const t = xToT(contentX(ev));
+    if (c.from != null) { MK.in = Math.min(c.from, t); MK.out = Math.max(c.from, t); renderMarks(); if (!playing) seek(t); return; }
+    if (!c.scrub && !playing && Math.abs(ev.clientX - c.x0) > 4) { c.scrub = true; scrubStart(); }
+    if (c.scrub) seek(t); else ghostAt(contentX(ev));
+  },
+  up: (ev, c) => { if (c.from != null) { if (!markRange()) clearMarks(); return; } if (c.scrub) { scrubEnd(); return; } seek(xToT(contentX(ev)), true); },
 });
 dragOn($('#playhead .head'), { down: () => { scrubStart(); return {}; }, move: ev => seek(xToT(contentX(ev))), up: scrubEnd });
 for (const side of ['l', 'r']) dragOn($(`#range .edge.${side}`), {
   down: () => { const r = markRange(); if (!r) return false; stop(); return { other: side === 'l' ? r[1] : r[0] }; },
-  move: (ev, c) => { const t = xToT(contentX(ev)); if (side === 'l') { MK.in = Math.min(t, c.other - 0.05); MK.out = c.other; } else { MK.in = c.other; MK.out = Math.max(t, c.other + 0.05); } renderMarks(); seek(t); },
+  move: (ev, c) => { const t = xToT(contentX(ev)); if (side === 'l') { MK.in = Math.min(t, c.other - 0.05); MK.out = c.other; } else { MK.in = c.other; MK.out = Math.max(t, c.other + 0.05); } renderMarks(); if (!playing) seek(t); },
 });
+function ghostAt(x) {   // the "where a click would take you" line + time label; null hides it
+  const hv = $('#hoverTime'), g = $('#ghost');
+  if (x == null || !P || !P.timeline.length) { if (hv) hv.classList.add('hidden'); g.classList.add('hidden'); return; }
+  x = clamp(x, 0, TL.W || x); g.classList.remove('hidden'); g.style.left = `${x}px`;
+  if (hv) { hv.classList.remove('hidden'); hv.style.left = `${x}px`; hv.textContent = fmt(xToT(x)); }
+}
 $('#tl').addEventListener('pointermove', e => {
-  const hv = $('#hoverTime'); if (!hv || !P || !P.timeline.length) return;
-  if (!(e.target.closest && e.target.closest('#ruler'))) { hv.classList.add('hidden'); return; }
-  const x = contentX(e); hv.classList.remove('hidden'); hv.style.left = `${x}px`; hv.textContent = fmt(xToT(x));
+  if (TL.dragging || !(e.target.closest && e.target.closest('#tlInner')) || e.target.closest('#playhead')) return ghostAt(null);
+  ghostAt(contentX(e));
 });
-$('#tl').addEventListener('pointerleave', () => { const hv = $('#hoverTime'); if (hv) hv.classList.add('hidden'); });
+$('#tl').addEventListener('pointerleave', () => ghostAt(null));
 $('#track').addEventListener('pointerdown', e => { if (e.target === $('#track') || e.target.id === 'tlEmpty') select(null); });
 
 // ---- zoom and scale
@@ -1271,7 +1284,10 @@ function jumpMarker(dir) {           // , and . : previous / next marker
   const m = dir > 0 ? ms.find(x => x.t > T + 0.02) : [...ms].reverse().find(x => x.t < T - 0.02);
   if (m) { stop(); seek(m.t, true); } else toast(dir > 0 ? 'No more markers after this' : 'No markers before this');
 }
-$('#imgLane').addEventListener('pointerdown', e => { if (e.target !== $('#imgLane') || !P || !P.timeline.length) return; select(null); seek(xToT(contentX(e)), true); });
+dragOn($('#imgLane'), {   // a click on the empty lane jumps there (a press that drifts does nothing)
+  down: e => (e.target !== $('#imgLane') || !P || !P.timeline.length) ? false : { x0: e.clientX },
+  up: (ev, c) => { if (Math.abs(ev.clientX - c.x0) < 4) { select(null); seek(xToT(contentX(ev)), true); } },
+});
 // dragging a picture on the video moves it; its corners resize it from the opposite corner
 function layerPointer(e, id) {
   if (e.button !== 0) return;
@@ -1657,7 +1673,7 @@ async function newProjectSheet() {
 $('#helpBtn').onclick = showHelp;
 function showHelp() {
   const rows = [['space', 'play / pause'], ['I / O', 'mark in / out at the playhead'], ['X', 'mark the whole clip under the playhead'], ['⌫', 'cut out the marked part (no marks: delete the selected segment)'], ['K', 'keep only the marked part of the clip(s)'], ['S', 'split at the playhead (also C, ⌘K)'], ['Q / W', 'trim the clip\'s start / end to the playhead'], ['T', 'cut to a title card here'], ['← →', 'step one frame (⇧ for a second)'], ['↑ ↓', 'select previous / next segment'], ['[ ]', 'move the selected segment'], ['R', 'record (Space during a recording drops a marker)'], ['M', 'add / remove a marker at the playhead'], [', .', 'jump to the previous / next marker'], ['⌘V', 'paste a picture over the video at the playhead'], ['⌘Z / ⇧⌘Z', 'undo / redo'], ['⌘+ ⌘− ⌘0', 'zoom the timeline / fit'], ['esc', 'clear the marks / deselect / close'], ['F', 'fullscreen player'], ['⌘⏎', 'render preview'], ['⇧⌘⏎', 'export'], ['⌘N', 'new vlog']];
-  sheet(`<h2>Keyboard</h2><div class="kbd-grid">${rows.map(([k, d]) => `<kbd>${k}</kbd><span>${d}</span>`).join('')}</div><p class="muted" style="margin-top:14px">Drag the red playhead (or anywhere on the ruler) to scrub; shift-drag the ruler to mark a range and drag its edges to adjust it. Double-click a clip to re-trim it against the whole source. Pictures over the video sit on the pink lane above the clips: drag them to move, drag their ends to change how long they show, and drag them on the video to place them (corners resize). Drag the blue handles on a selected clip to trim, drag blocks to reorder. Music lives on the orange lane, anchored to the clips: splitting a clip keeps the song playing over both halves; select the music and use <b>✂ Split at playhead</b> to make pieces you can fade or delete on their own. <b>Log / Linear</b> switches how wide clips are drawn; ⌘-scroll zooms.</p><div class="foot"><button class="pill" data-close>Close</button></div>`);
+  sheet(`<h2>Keyboard</h2><div class="kbd-grid">${rows.map(([k, d]) => `<kbd>${k}</kbd><span>${d}</span>`).join('')}</div><p class="muted" style="margin-top:14px">Click the ruler to jump there (the faint red line shows where a click lands); drag the red playhead, or drag on the ruler while paused, to scrub — while playing, the playhead only moves when you let go. Shift-drag the ruler to mark a range and drag its edges to adjust it. Double-click a clip to re-trim it against the whole source. Pictures over the video sit on the pink lane above the clips: drag them to move, drag their ends to change how long they show, and drag them on the video to place them (corners resize). Drag the blue handles on a selected clip to trim, drag blocks to reorder. Music lives on the orange lane, anchored to the clips: splitting a clip keeps the song playing over both halves; select the music and use <b>✂ Split at playhead</b> to make pieces you can fade or delete on their own. <b>Log / Linear</b> switches how wide clips are drawn; ⌘-scroll zooms.</p><div class="foot"><button class="pill" data-close>Close</button></div>`);
 }
 
 // ================================================================== recorder (streams chunks to disk as it goes)

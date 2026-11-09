@@ -158,6 +158,7 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 .lane .vo { background: var(--vo); } .lane .st { background: #b8632a; } .lane .mu { background: var(--music); left: 0; right: 0; }
 .lane .vo.selected, .lane .mu.selected, .lane .st.selected { outline: 2px solid var(--accent); }
 #playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); pointer-events: none; z-index: 5; }
+#ghost { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); opacity: .35; pointer-events: none; z-index: 4; }
 #playhead .head { position: absolute; top: 0; left: -6px; width: 14px; height: 18px; background: var(--danger); border-radius: 3px 3px 7px 7px; pointer-events: auto; cursor: grab; touch-action: none; }
 #playhead .head:active { cursor: grabbing; }
 /* marked range (in / out) */
