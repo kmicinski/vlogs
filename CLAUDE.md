@@ -35,7 +35,10 @@ split {at}` and `/continue`. When Kris says "put music over 0:32 to 1:10" → `v
 should keep going into the next clip" → `--continue` or change `to`. A credit (license text) on a cue
 is drawn by `titles.render_credit` in a corner (`style.credit_position`/`credit_seconds` defaults)
 when the cue starts; `render.credit_spans` lists them. `project.music` (the green loop under
-everything) still exists for old projects; the GUI offers "Turn into music over the clips".
+everything) still exists for old projects; the GUI offers "Turn into music over the clips". GUI menu
+(`musicMenu`): "Continue the intro song here" is the default (target = marked range > selected clip >
+clip under the playhead), "Other music here…" opens `musicSheet` (song picker, `GET/POST
+/api/projects/{name}/songs`, draggable start window with audition).
 The intro sting comes from config `intro_sting`.
 Projects live in `~/Vlogs/<name>/` (configurable: `vlog config`). Times in the YAML are
 *source-clip* seconds for `in`/`out`; `vlog title-at` takes *output-timeline* time.

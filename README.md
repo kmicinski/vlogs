@@ -53,13 +53,15 @@ between masthead and date card (`intro_black_hold`), title-card colors for new v
    anything. ⌘-scroll zooms. **Speed** is a log slider from 0.1× to 1000× with a box to type any
    number (60× makes a minute into a second; above 20× the sound is dropped, timelapse style).
    **Music** (`♫ Music` in the bar, or *+ Add ▸ Music…*) goes on the orange lane, anchored to the
-   clips: over the marked range (`I`/`O` — the clips are split there so it starts and stops exactly
-   where you marked), over the selected clip, or over the whole vlog. Splitting a clip keeps the
-   song playing over both halves; select the music and **✂ Split at playhead** makes two pieces
-   that play on seamlessly, each with its own fades, volume, *Through* range or delete. The
-   inspector shows the whole song as a strip: drag the window to pick where in it the music
-   begins; *Repeat* loops it under long stretches; *Continue "song"* in the menu picks the song up
-   where its last piece stopped. A **credit** (license / attribution text) typed on a cue shows in
+   clips. The default, **Continue the intro song here**, picks the intro song up where it last
+   stopped, over the marked range (`I`/`O` — the clips are split there so it starts and stops
+   exactly where you marked), else the selected clip, else the clip under the playhead. Songs
+   already in the vlog get their own *Continue "…" here*. **Other music here…** opens a sheet:
+   pick a song, drag the window on the song strip to choose where in it the music begins (▶
+   listens from there), choose what it plays over (range / clip / whole vlog), fades, *Repeat*,
+   and an optional credit. Splitting a clip keeps the song playing over both halves; select the
+   music and **✂ Split at playhead** makes two pieces that play on seamlessly, each with its own
+   fades, volume, *Through* range or delete. A **credit** (license / attribution text) shows in
    small text in a corner when the music comes in (corner and seconds per cue, defaults in
    Settings ▸ This vlog).
    **Pictures over the video**: drop an image on the window, paste one (⌘V), or

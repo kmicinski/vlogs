@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -1099,6 +1100,36 @@ def create_app(cfg: Config) -> FastAPI:
             return probe(p.resolve(rel), p.cache_dir).duration
         except Exception:
             return None
+
+    AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".aif", ".aiff", ".flac", ".ogg", ".opus"}
+
+    def song_json(p: Project, rel: str) -> dict:
+        f = p.resolve(rel)
+        try:
+            dur = probe(f, p.cache_dir).duration
+        except Exception:
+            dur = 0.0
+        intro = bool(re.match(r"sting\.[a-z0-9]+$", f.name, re.I))
+        name = "the intro song" if intro else re.sub(r"[_-]+", " ", f.stem).strip()
+        return {"file": rel, "name": name, "duration": dur, "intro": intro, "url": media_url(p, rel),
+                "used": any(m.file == rel for m in p.stings)}
+
+    @app.get("/api/projects/{name}/songs")
+    def list_songs(name: str):
+        """Songs in the project's audio/ folder (not voiceovers), the intro song first."""
+        p = load(name)
+        songs = []
+        for f in sorted(p.audio_dir.glob("*")) if p.audio_dir.exists() else []:
+            if f.suffix.lower() in AUDIO_EXT and not f.name.startswith("VO_"):
+                songs.append(song_json(p, f"audio/{f.name}"))
+        songs.sort(key=lambda d: (not d["intro"], d["name"].lower()))
+        return {"songs": songs, "intro_available": bool(cfg.intro_sting and Path(cfg.intro_sting).expanduser().exists())}
+
+    @app.post("/api/projects/{name}/songs")
+    def add_song(name: str, body: dict):
+        """Bring a song into the project (copy into audio/): 'intro', an absolute path, or a project-relative one."""
+        p = load(name)
+        return song_json(p, music_rel(p, str(body.get("path") or "intro")))
 
     @app.post("/api/projects/{name}/stings")
     def add_sting(name: str, body: dict):

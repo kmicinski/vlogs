@@ -938,32 +938,110 @@ $('#addBtn').onclick = e => popover(e.currentTarget, [
   { label: 'Masthead card', fn: () => guard(async () => { const at = sel ? P.timeline.findIndex(s => s.id === sel) + 1 : null; const p = await api('POST', `/api/projects/${P.name}/segments`, { kind: 'masthead', at }); setProject(p); const ns = at == null ? p.timeline[p.timeline.length - 1] : p.timeline[at]; if (ns) { select(ns.id); seek(ns.placed.start, true); } }) },
   { label: 'Music…', fn: () => musicMenu($('#addBtn')) },
 ]);
-// Music goes over clips as cues anchored to them (the orange lane): over the marked range (I/O), the
-// selected clip, or the whole vlog. "Continue" picks up a song where its last cue stopped.
-function whereMusic() { return markRange() ? 'over the marked range' : seg() ? 'over the selected clip' : 'over the whole vlog'; }
+// Music goes over clips as cues anchored to them (the orange lane). The default is to continue the intro
+// song where it last stopped; "Other music here…" opens a sheet to pick a song and where in it to begin.
+// The target is the marked range (I/O: the clips are split there), else the selected clip, else the clip
+// under the playhead.
+const songName = f => /(^|\/)sting\.[a-z0-9]+$/i.test(f || '') ? 'the intro song' : (f || '').split('/').pop().replace(/\.[a-z0-9]+$/i, '').replace(/[_-]+/g, ' ').trim();
+function musicTarget() {
+  const r = markRange(); if (r) return { body: { range: r }, label: `over ${fmt(r[0])} → ${fmt(r[1])}`, length: r[1] - r[0] };
+  const s = seg() || (locate(T) || {}).seg;
+  if (s && s.placed) return { body: { from: s.id, to: s.id }, label: `over ${s.kind === 'clip' ? s.clip.replace(/^clips\//, '') : (s.title || 'the card')}`, length: s.placed.duration };
+  return null;
+}
 function musicMenu(anchor) {
-  const songs = [...new Set((P.stings || []).map(m => m.file))];
-  const items = [{ label: `Music ${whereMusic()}…`, fn: () => addMusic(null) }];
-  for (const f of songs) items.push({ label: `Continue “${f.split('/').pop()}” ${whereMusic()}`, fn: () => addMusic(f, true) });
-  if (!songs.some(f => /(^|\/)sting\.[a-z0-9]+$/i.test(f))) items.push({ label: `Continue the intro song ${whereMusic()}`, fn: () => addMusic('intro', true) });
-  items.push('-', { label: P.music && P.music.file ? 'Background loop settings…' : 'Background loop under everything (old style)…', fn: () => ctxActions.music() });
+  const tgt = musicTarget(), songs = [...new Set((P.stings || []).map(m => m.file))];
+  const items = [{ label: 'Continue the intro song here', k: tgt ? tgt.label : 'select a clip first', disabled: !tgt, fn: () => addMusic('intro', true) }];
+  for (const f of songs.filter(f => songName(f) !== 'the intro song')) items.push({ label: `Continue “${songName(f)}” here`, k: tgt ? tgt.label : '', disabled: !tgt, fn: () => addMusic(f, true) });
+  items.push({ label: 'Other music here…', fn: () => musicSheet() });
+  if (P.music && P.music.file) items.push('-', { label: 'Background loop…', fn: () => ctxActions.music() });
   popover(anchor, items);
 }
-async function addMusic(file, cont = false) {
+async function addMusic(file, cont = false, extra = {}) {
+  const tgt = musicTarget(); if (!tgt && !extra.whole) return toast('Select a clip or mark a range first');
   await guard(async () => {
-    const body = { continue: !!cont };
-    if (file) body.file = file;
-    else { const r = await api('POST', '/api/pick', { kind: 'music' }); if (!r.paths[0]) return; body.file = r.paths[0]; }
-    const s = seg(), range = markRange();
-    if (range) body.range = range;
-    else if (s) { body.from = s.id; body.to = s.id; }
-    else { body.whole = true; body.loop = true; body.volume = 0.35; body.fade_in = 1; body.fade_out = 3; }
+    const body = { file, continue: !!cont, ...(extra.whole ? { whole: true } : tgt.body), ...extra };
     if (cont) { body.fade_in = body.fade_in ?? 1.5; body.fade_out = body.fade_out ?? 2; }
     const p = await api('POST', `/api/projects/${P.name}/stings`, body);
     setProject(p); selSting = p.new_id; sel = null; clearMarks(); renderTimeline(); renderInspector();
     const m = (p.stings || []).find(x => x.id === p.new_id); if (m && m.at != null) seek(m.at, true);
-    toast(range ? 'Music added over the marked range' : body.whole ? 'Music added over the whole vlog — split it at the playhead to shape it' : 'Music added — set "Through" in the inspector to stretch it over more clips');
+    toast(`${songName(m ? m.file : file) === 'the intro song' ? 'The intro song' : 'Music'} ${cont ? 'continues ' : 'added '}${extra.whole ? 'over the whole vlog' : tgt.label}`);
   });
+}
+// pick a song and where in it to begin: a strip of the whole song with the part that will play as a window
+// (drag it), ▶ to listen from there, and where on the timeline it goes
+const MS = { songs: [], song: null, start: 0, audio: null };
+async function musicSheet() {
+  const info = await guard(() => api('GET', `/api/projects/${P.name}/songs`)); if (!info) return;
+  MS.songs = info.songs; MS.start = 0; MS.song = null;
+  const tgt = musicTarget(), tot = total();
+  const wheres = [];
+  if (markRange()) wheres.push(['range', `the marked range (${fmt(MK.in)} → ${fmt(MK.out)})`]);
+  if (tgt && !markRange()) wheres.push(['seg', `${seg() ? 'the selected clip' : 'the clip at the playhead'} (${esc(tgt.label.replace(/^over /, ''))})`]);
+  wheres.push(['whole', 'the whole vlog']);
+  sheet(`<h2>Music here</h2>
+    ${field('Song', `<div class="inline"><select id="ms_song" style="flex:1">${info.songs.map(sg => `<option value="${esc(sg.file)}">${esc(sg.name)}${sg.used ? ' · in use' : ''}</option>`).join('')}${!info.songs.some(sg => sg.intro) && info.intro_available ? '<option value="intro">the intro song</option>' : ''}<option value="__pick">Choose a file…</option></select><button class="link" id="ms_pick">Choose…</button></div>`)}
+    <div class="field"><label>Where in the song it begins — drag the window, ▶ to listen from there</label>
+      <div class="songstrip big" id="ms_strip"><img alt="" draggable="false"><div class="win"></div><span class="t t0">0:00</span><span class="t t1"></span></div>
+      <div class="inline" style="margin-top:6px"><button class="playbtn" id="ms_play" title="Listen from the start point"><svg viewBox="0 0 16 16" width="14" height="14"><path id="ms_playIcon" d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg></button><span class="muted">starts at</span><input type="text" id="ms_start" value="0:00.00" style="flex:0 0 84px"><span class="muted" id="ms_len"></span></div>
+      <div class="check" id="ms_contRow" style="margin-top:8px"><input type="checkbox" id="ms_cont"><label for="ms_cont">Pick up where this song last stopped</label></div>
+    </div>
+    ${field('Over', `<select id="ms_where">${wheres.map(([v, l], i) => `<option value="${v}" ${i === 0 ? 'selected' : ''}>${l}</option>`).join('')}</select>`)}
+    <div class="inline">${field('Fade in (s)', '<input type="number" id="ms_fi" step="0.1" min="0" value="1">')}${field('Fade out (s)', '<input type="number" id="ms_fo" step="0.1" min="0" value="2">')}${field('Volume', '<input type="number" id="ms_vol" step="0.05" min="0" max="1.5" value="0.7">')}</div>
+    <div class="check"><input type="checkbox" id="ms_loop"><label for="ms_loop">Repeat the song if the clips run longer than it</label></div>
+    ${field('Credit shown in a corner when it starts (license / attribution, optional)', '<textarea id="ms_credit" rows="2" placeholder="Music: Song by Artist&#10;CC BY 3.0 — link"></textarea>')}
+    <div class="foot"><button class="pill" data-close>Cancel</button><button class="pill primary" id="s_ok">Add music</button></div>`);
+  const strip = $('#ms_strip'), win = $('.win', strip), img = $('img', strip);
+  const spanLen = () => { const w = $('#ms_where').value; return w === 'range' ? MK.out - MK.in : w === 'whole' ? tot : (tgt ? tgt.length : 0); };
+  const stopAudio = () => { if (MS.audio) { MS.audio.pause(); MS.audio.remove(); MS.audio = null; } const i = $('#ms_playIcon'); if (i) i.setAttribute('d', 'M4 2.5v11l9-5.5z'); };
+  const paint = () => {
+    const sg = MS.song, d = sg ? sg.duration : 0, L = spanLen();
+    if (!sg) { img.removeAttribute('src'); win.style.width = '0'; $('#ms_len').textContent = ''; return; }
+    if (img.dataset.file !== sg.file) { img.dataset.file = sg.file; img.src = `/api/projects/${P.name}/wave?src=${encodeURIComponent(sg.file)}&start=0&end=${d}&w=800&h=48&color=b8632a`; }
+    const w = d ? clamp(L / d, 0, 1 - clamp(MS.start / d, 0, 1)) : 0;
+    win.style.left = `${d ? MS.start / d * 100 : 0}%`; win.style.width = `${Math.max(0.5, w * 100)}%`;
+    $('.t1', strip).textContent = fmt(d); $('#ms_start').value = fmt(MS.start, 2);
+    $('#ms_len').textContent = `plays ${fmt(L)}${d && MS.start + L > d + 0.05 ? ($('#ms_loop').checked ? ' (repeats)' : ' · the song runs out first') : ''}`;
+    const prev = (P.stings || []).filter(m => m.file === sg.file && m.at != null).length;
+    $('#ms_contRow').style.display = prev ? '' : 'none'; if (!prev) $('#ms_cont').checked = false;
+    strip.classList.toggle('dim', $('#ms_cont').checked); $('#ms_start').disabled = $('#ms_cont').checked;
+  };
+  const choose = sg => { stopAudio(); MS.song = sg; MS.start = 0; $('#ms_cont').checked = (P.stings || []).some(m => m.file === sg.file && m.at != null); paint(); };
+  const pickFile = path => guard(async () => {
+    const r = path ? { paths: [path] } : await api('POST', '/api/pick', { kind: 'music' }); if (!r.paths[0]) return;
+    const sg = await api('POST', `/api/projects/${P.name}/songs`, { path: r.paths[0] });
+    if (!MS.songs.some(x => x.file === sg.file)) { MS.songs.push(sg); const o = document.createElement('option'); o.value = sg.file; o.textContent = sg.name; $('#ms_song').insertBefore(o, $('#ms_song option[value=__pick]')); }
+    $('#ms_song').value = sg.file; choose(sg);
+  });
+  $('#ms_song').onchange = e => { const v = e.target.value; if (v === '__pick') pickFile(); else if (v === 'intro') pickFile('intro'); else choose(MS.songs.find(x => x.file === v)); };
+  $('#ms_pick').onclick = () => pickFile();
+  $('#ms_where').onchange = () => { $('#ms_loop').checked = $('#ms_where').value === 'whole'; paint(); };
+  $('#ms_loop').onchange = paint; $('#ms_cont').onchange = paint;
+  $('#ms_start').onchange = e => { MS.start = clamp(parseTime(e.target.value), 0, MS.song ? MS.song.duration : 0); paint(); };
+  dragOn(strip, {
+    down: e => { if (!MS.song || $('#ms_cont').checked) return false; const r = strip.getBoundingClientRect(), d = MS.song.duration, x = clamp((e.clientX - r.left) / r.width, 0, 1); const a = MS.start / d, w = clamp(spanLen() / d, 0, 1); return { r, d, x0: x, s0: x >= a && x <= a + w ? MS.start : clamp(x * d - spanLen() / 2, 0, Math.max(0, d - Math.min(spanLen(), d))) }; },
+    move: (ev, c) => { const x = clamp((ev.clientX - c.r.left) / c.r.width, 0, 1); MS.start = clamp(c.s0 + (x - c.x0) * c.d, 0, Math.max(0, c.d - Math.min(spanLen(), c.d))); paint(); },
+    up: () => { if (MS.audio) { try { MS.audio.currentTime = MS.start; } catch { } } },
+  });
+  $('#ms_play').onclick = () => {
+    if (!MS.song) return;
+    if (MS.audio && !MS.audio.paused) return stopAudio();
+    stopAudio(); const el = document.createElement('audio'); el.src = MS.song.url; el.volume = 0.8; document.body.appendChild(el); MS.audio = el;
+    el.addEventListener('loadedmetadata', () => { try { el.currentTime = MS.start; } catch { } }, { once: true });
+    el.play().catch(() => { }); $('#ms_playIcon').setAttribute('d', 'M3 2.5h3.5v11H3zM9.5 2.5H13v11H9.5z');
+    el.ontimeupdate = () => { if (MS.song && el.currentTime >= MS.start + spanLen()) stopAudio(); };
+  };
+  $('#s_ok').onclick = async () => {
+    if (!MS.song) return toast('Pick a song first', true);
+    const where = $('#ms_where').value, body = { fade_in: +$('#ms_fi').value, fade_out: +$('#ms_fo').value, volume: +$('#ms_vol').value, loop: $('#ms_loop').checked, credit: $('#ms_credit').value };
+    if (!$('#ms_cont').checked) body.start = MS.start;
+    const cont = $('#ms_cont').checked, file = MS.song.file;
+    stopAudio(); closeSheet();
+    await addMusic(file, cont, where === 'whole' ? { ...body, whole: true } : body);
+  };
+  const first = info.songs.find(sg => !sg.intro) || info.songs[0];
+  if (first) { $('#ms_song').value = first.file; choose(first); } else if (info.intro_available) { $('#ms_song').value = 'intro'; pickFile('intro'); } else { $('#ms_song').value = '__pick'; }
+  const obs = new MutationObserver(() => { if (!$('#ms_strip')) { stopAudio(); obs.disconnect(); } }); obs.observe($('#sheetBody'), { childList: true });
 }
 let immichVids = [], picked = new Set();
 const trimOnImport = () => lsGet('kv.trimImport', '1') === '1';

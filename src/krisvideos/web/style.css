@@ -372,6 +372,8 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 .songstrip .win.wrap { border-left: none; border-right: 2px dashed #ffb061; opacity: .7; }
 .songstrip .t { position: absolute; bottom: 2px; font-size: 10px; color: rgba(255,255,255,.75); pointer-events: none; } .songstrip .t0 { left: 6px; } .songstrip .t1 { right: 6px; }
 .songstrip:active { cursor: grabbing; }
+.songstrip.big { height: 56px; } .songstrip.big img { height: 48px; }
+.songstrip.dim { opacity: .45; cursor: default; }
 /* ---------- speed: log slider + typed number */
 .speedctl { display: flex; align-items: center; gap: 6px; }
 .speedctl .sp-slider { flex: 1; min-width: 0; }
