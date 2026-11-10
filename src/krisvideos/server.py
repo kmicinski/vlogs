@@ -23,7 +23,7 @@ from .cli import new_project as make_project, masthead_rel, sting_rel
 from .edits import title_at
 from .config import Config
 from .probe import is_video, probe
-from .project import CHANNELS, CREDIT_POSITIONS, Overlay, Pip, Project, Segment, Voiceover, box4
+from .project import CHANNELS, CREDIT_POSITIONS, Overlay, Pip, Project, Segment, Voiceover, box4, polish_value
 from .timeutil import parse_time
 
 WEB = Path(__file__).parent / "web"
@@ -281,6 +281,16 @@ def create_app(cfg: Config) -> FastAPI:
     def media_url(p: Project, rel: str) -> str:
         return f"/media/{p.name}/{rel}"
 
+    def measure_voice_async(p: Project, rel: str, channel: str) -> None:
+        """Measure a file's loudness after the voice polish in the background (seconds per minute of
+        audio), so the live player's level is right before the first render."""
+        def work():
+            try:
+                media.voice_filters(p.resolve(rel), p.cache_dir, channel, p.audio.denoise)
+            except Exception as e:  # pragma: no cover
+                print(f"[media] voice loudness failed for {rel}: {e}")
+        media._pool.submit(work)
+
     def pip_json(p: Project, pip: Pip) -> dict:
         f = p.resolve(pip.src)
         try:
@@ -340,6 +350,14 @@ def create_app(cfg: Config) -> FastAPI:
                 d["one_sided"] = media.one_sided(f, p.cache_dir) if info else None
                 d["channel_effective"] = media.effective_channel(f, p.cache_dir, s.channel, compute=False) if info else "stereo"
                 d["lufs"] = media.cached_loudness(f, p.cache_dir, s.channel) if info else None
+                d["polish"] = s.polish
+                d["polished"] = bool(info and info.has_audio and render.polish_on(p, s.polish))
+                d["pregain"] = 0.0
+                if d["polished"]:      # the live player approximates the polish: pre-gain + EQ, level from the polished loudness
+                    vs = media.voice_state(f, p.cache_dir, s.channel, p.audio.denoise)
+                    d["pregain"] = vs["pregain"]
+                    if vs["lufs"] is not None:
+                        d["lufs"] = vs["lufs"]
                 d["box"] = list(s.box) if s.box else None
                 d["pip"] = pip_json(p, s.pip) if s.pip else None
             segs.append(d)
@@ -347,6 +365,7 @@ def create_app(cfg: Config) -> FastAPI:
         for v in p.voiceovers:
             f = p.resolve(v.file)
             vd = v.to_dict() | {"id": v.id, "at": v.at, "volume": v.volume, "duck_clips": v.duck_clips,
+                                "polish": v.polish, "polished": render.polish_on(p, v.polish),
                                 "missing": not f.exists(), "url": media_url(p, v.file) if f.exists() else None}
             try:
                 vd["duration"] = probe(f, p.cache_dir).duration if f.exists() else 0
@@ -562,6 +581,7 @@ def create_app(cfg: Config) -> FastAPI:
         p = load(name)
         if "title" in body:
             p.title = str(body["title"])
+        before = (p.audio.polish, p.audio.denoise)
         for section in ("output", "style", "music", "audio"):
             for k, v in (body.get(section) or {}).items():
                 obj = getattr(p, section)
@@ -574,6 +594,13 @@ def create_app(cfg: Config) -> FastAPI:
                     elif isinstance(cur, int):
                         v = int(v) if v not in (None, "") else None
                     setattr(obj, k, v)
+        if p.audio.polish and (p.audio.polish, p.audio.denoise) != before:
+            for seg in p.timeline:
+                if seg.kind == "clip" and render.polish_on(p, seg.polish) and p.resolve(seg.src).exists():
+                    measure_voice_async(p, seg.src, seg.channel)
+            for v in p.voiceovers:
+                if render.polish_on(p, v.polish) and p.resolve(v.file).exists():
+                    measure_voice_async(p, v.file, "stereo")
         commit(p)
         return project_json(p)
 
@@ -664,6 +691,12 @@ def create_app(cfg: Config) -> FastAPI:
                 s.channel = v if v in CHANNELS else "auto"
                 if p.resolve(s.src).exists():      # measure the loudness of what will be heard (fast, audio only)
                     media.measure_loudness(p.resolve(s.src), p.cache_dir, s.channel)
+                    if render.polish_on(p, s.polish):
+                        measure_voice_async(p, s.src, s.channel)
+            elif k == "polish":
+                s.polish = polish_value(v)
+                if render.polish_on(p, s.polish) and p.resolve(s.src).exists():
+                    measure_voice_async(p, s.src, s.channel)
             elif k == "fit":
                 s.fit = "cover" if v == "cover" else "contain"
             elif k == "box":
@@ -1060,6 +1093,10 @@ def create_app(cfg: Config) -> FastAPI:
             v.volume = float(body["volume"])
         if "duck_clips" in body:
             v.duck_clips = bool(body["duck_clips"])
+        if "polish" in body:
+            v.polish = polish_value(body["polish"])
+            if render.polish_on(p, v.polish) and p.resolve(v.file).exists():
+                measure_voice_async(p, v.file, "stereo")
         if "note" in body:
             v.note = str(body["note"])
         p.voiceovers.sort(key=lambda x: x.at)

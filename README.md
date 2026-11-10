@@ -116,6 +116,17 @@ reached one channel (a DJI Mic plugged into the right input) is detected on impo
 is copied to both ears, in the live player and the render; the inspector's *Channels* select overrides
 it (stereo as recorded, left or right to both ears, mix to mono) — `channel:` in the YAML.
 
+Voice polish (on by default, *Settings → This vlog → Polish voices*): every clip and narration goes
+through a gentle produced-voice chain in the render — the take is brought to a fixed level, rumble
+below 90 Hz is cut, room noise and hiss are reduced (~10 dB; *Noise reduction* sets how much, 0 turns
+it off), sibilance is tamed, a little mud is taken out at 250 Hz with a touch of presence at 3 kHz
+and air above 9 kHz, and a slow 2.5:1 compressor evens out quiet asides and emphatic bits; the usual
+level matching is measured *after* the polish and a limiter catches the peaks. It is meant to still
+sound like you, not like a radio voice. The inspector's *Voice* select turns it off (or forces it on)
+per clip or narration (`polish: on|off` in the YAML; `audio.polish` / `audio.denoise` for the vlog).
+The live player only approximates it (level + EQ), so judge it in a preview. For better noise
+reduction drop an RNNoise model at `~/.config/krisvideos/rnnoise.rnnn`.
+
 The record sheet warns, loudly, when the selected microphone isn't a good one (a webcam or
 computer mic instead of the DJI Mic Mini, a Yeti or an audio interface), and switches to a good
 mic automatically when one is plugged in. If the mic is unplugged mid-take, recording stops and

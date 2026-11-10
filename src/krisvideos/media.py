@@ -1,6 +1,7 @@
 """Ingest: copy media into a project, make browser-friendly proxies and thumbnails."""
 from __future__ import annotations
 
+import math
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -123,6 +124,8 @@ def prepare(p: Project, src_rel: str) -> None:
     make_thumbnail(p, src_rel)
     make_proxy(p, src_rel)
     measure_loudness(p.resolve(src_rel), p.cache_dir, "auto")    # + one-sided detection
+    if p.audio.polish:
+        voice_filters(p.resolve(src_rel), p.cache_dir, "auto", p.audio.denoise)   # loudness after the voice polish
 
 
 def media_status(p: Project, src_rel: str) -> dict:
@@ -145,11 +148,77 @@ CHANNEL_PAN = {
 }
 ONE_SIDED_DB = 20.0     # a channel this far below the other (and the other above -45 dB RMS) is "dead"
 
+# "Voice polish": the chain that makes a small-mic recording of Kris sound like a produced voice while
+# still sounding like him. Every stage is gentle; together they do what a mix engineer does by hand:
+#   pre-gain    the take is brought to -23 LUFS first so the compressor always sees the same level
+#   highpass    rumble, desk thumps, breath pops below the voice (12 dB/oct from 90 Hz)
+#   denoise     room/fan noise and hiss: non-local means (anlmdn, `denoise` dB off the floor — 10 by default —
+#               with speech untouched within 0.3 dB) — or RNNoise if a model file is installed
+#   deesser     tames the sibilant "s" sounds a close lavalier/USB mic exaggerates
+#   EQ          -2.5 dB of mud at 250 Hz, +2 dB presence at 3 kHz, +1.5 dB of air above 9 kHz
+#   compressor  2.5:1 above -22 dB, 10 ms attack / 150 ms release, so quiet asides and emphatic bits both read
+# No make-up gain here: the usual LUFS matching (measured on the polished signal) sets the level, and
+# VOICE_LIMITER after it catches the peaks. Tuned on an Anker USB mic take (noise floor -44 dB RMS).
+RNNOISE_MODEL = "rnnoise.rnnn"      # drop a model (e.g. rnnoise-models' bd.rnnn) under the config dir to use it
+VOICE_PRE_LUFS = -23.0
 
-def _loud_cache(path: Path, cache_dir: Path | None, channel: str = "stereo") -> Path | None:
+
+def rnnoise_model() -> Path | None:
+    from .config import CONFIG_DIR
+    f = CONFIG_DIR / RNNOISE_MODEL
+    return f if f.exists() else None
+
+
+def voice_chain(denoise: float = 10.0, model: Path | None = None, pregain_db: float = 0.0) -> str:
+    """The voice-polish filter chain (see above). `denoise` is roughly the dB taken off the noise floor
+    (0 = none); `pregain_db` brings the take to VOICE_PRE_LUFS before the chain (level_gain_db)."""
+    parts = []
+    if abs(pregain_db) > 0.05:
+        parts.append(f"volume={pregain_db:.2f}dB")
+    parts.append("highpass=f=90:p=2")
+    if denoise > 0:
+        if model:
+            parts.append(f"arnndn=m={_fpath(model)}:mix={min(1.0, denoise / 15):.2f}")
+        else:
+            # anlmdn's strength is relative to the signal's amplitude, hence the pre-gain first; at -23 LUFS
+            # the floor drops by about 4.3·ln(s) - 1.5 dB (measured), so s = e^((dB + 1.5) / 4.3): 10 dB → 14.5
+            parts.append(f"anlmdn=s={max(1.0, min(200.0, math.exp((denoise + 1.5) / 4.3))):.3g}:p=0.002:r=0.006:m=11")
+    parts += ["deesser=i=0.3:m=0.5:f=0.5",
+              "equalizer=f=250:t=q:w=1.2:g=-2.5", "equalizer=f=3000:t=q:w=1.4:g=2", "highshelf=f=9000:g=1.5",
+              "acompressor=threshold=-22dB:ratio=2.5:attack=10:release=150:knee=4:makeup=1"]
+    return ",".join(parts)
+
+
+VOICE_LIMITER = "alimiter=limit=0.891:attack=3:release=80:level=0"     # -1 dBFS ceiling after the gain stage
+
+
+def voice_state(path: Path, cache_dir: Path | None, channel: str, denoise: float) -> dict:
+    """For the GUI, from the cache only: {"pregain": dB before the polish chain, "lufs": loudness after it
+    (None if not measured yet)}."""
+    raw = cached_loudness(path, cache_dir, channel)
+    pre = level_gain_db(raw, VOICE_PRE_LUFS)
+    ch = effective_channel(path, cache_dir, channel, compute=False)
+    return {"pregain": round(pre, 2), "lufs": cached_loudness(path, cache_dir, ch, voice_chain(denoise, rnnoise_model(), pre))}
+
+
+def voice_filters(path: Path, cache_dir: Path | None, channel: str, denoise: float) -> tuple[str, float | None]:
+    """(polish chain for this file, loudness after it) — the chain includes the pre-gain from the file's
+    own loudness; both cached."""
+    pre = level_gain_db(measure_loudness(path, cache_dir, channel), VOICE_PRE_LUFS)
+    chain = voice_chain(denoise, rnnoise_model(), pre)
+    return chain, measure_loudness(path, cache_dir, channel, chain)
+
+
+def _fpath(f: Path) -> str:
+    """A path quoted for use inside a filter option."""
+    return str(f).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _loud_cache(path: Path, cache_dir: Path | None, channel: str = "stereo", voice: str = "") -> Path | None:
     if not cache_dir:
         return None
-    return cache_dir / (path.name + (".loud.json" if channel == "stereo" else f".loud.{channel}.json"))
+    tag = ("" if channel == "stereo" else f".{channel}") + (".voice" if voice else "")
+    return cache_dir / (path.name + f".loud{tag}.json")
 
 
 def _read_cache(f: Path | None, path: Path) -> dict | None:
@@ -225,31 +294,33 @@ def effective_channel(path: Path, cache_dir: Path | None, channel: str = "auto",
     return d.get("one_sided") or "stereo"
 
 
-def measure_loudness(path: Path, cache_dir: Path | None = None, channel: str = "stereo") -> float | None:
+def measure_loudness(path: Path, cache_dir: Path | None = None, channel: str = "stereo", voice: str = "") -> float | None:
     """Integrated loudness (LUFS) of a file's audio *as it will be heard* for `channel` (see
-    effective_channel); cached. None if no/silent audio."""
+    effective_channel) and, when `voice` is a filter chain (voice_chain), after that polish; cached.
+    None if no/silent audio."""
     import json
     path = Path(path)
     ch = effective_channel(path, cache_dir, channel)
-    if ch == "stereo":
+    if ch == "stereo" and not voice:
         return audio_analysis(path, cache_dir).get("lufs")
-    cache = _loud_cache(path, cache_dir, ch)
+    cache = _loud_cache(path, cache_dir, ch, voice)
     d = _read_cache(cache, path)
-    if d:
+    if d and d.get("af", "") == voice:
         return d.get("lufs")
-    lufs, _ = _audio_stats(path, CHANNEL_PAN[ch] + ",")
+    af = (CHANNEL_PAN[ch] + "," if ch != "stereo" else "") + (voice + "," if voice else "")
+    lufs, _ = _audio_stats(path, af)
     if cache:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache.write_text(json.dumps({"size": path.stat().st_size, "lufs": lufs}))
+        cache.write_text(json.dumps({"size": path.stat().st_size, "lufs": lufs, "af": voice}))
     return lufs
 
 
-def cached_loudness(path: Path, cache_dir: Path | None, channel: str = "auto") -> float | None:
+def cached_loudness(path: Path, cache_dir: Path | None, channel: str = "auto", voice: str = "") -> float | None:
     """measure_loudness from the cache only (None when not measured yet)."""
     path = Path(path)
     ch = effective_channel(path, cache_dir, channel, compute=False)
-    d = _read_cache(_loud_cache(path, cache_dir, ch), path)
-    return d.get("lufs") if d else None
+    d = _read_cache(_loud_cache(path, cache_dir, ch, voice), path)
+    return d.get("lufs") if d and d.get("af", "") == voice else None
 
 
 def one_sided(path: Path, cache_dir: Path | None) -> str | None:

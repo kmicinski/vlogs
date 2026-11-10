@@ -117,6 +117,17 @@ gain are measured on that result, `cache/<name>.loud.<ch>.json`); the live playe
 Web Audio (`VP.route`) and the inspector has a *Channels* select. When Kris says "my mic only recorded on
 the right / the audio is only in one ear" → `vlog set PROJ sN channel=right` (auto usually already did it;
 `vlog show` prints `audio=auto→right to both ears`).
+Voice polish: `media.voice_chain(denoise, model, pregain)` (pre-gain to -23 LUFS, highpass 90 Hz, anlmdn
+denoise or arnndn if `<config>/rnnoise.rnnn` exists, deesser, EQ 250/3k/9k, acompressor 2.5:1) goes on every
+clip and voiceover when `audio.polish` (default on; `segment.polish`/`voiceover.polish` auto|on|off override,
+`render.polish_on`); level matching uses the loudness measured after the chain (`media.voice_filters`, cache
+`*.loud[.ch].voice.json` keyed by the chain string) and `media.VOICE_LIMITER` follows the gain. GUI: inspector
+*Voice* select, settings *Polish voices* + *Noise reduction*; the live player approximates with pre-gain + EQ
+(`VP.route(el, mode, fx)`). CLI: `vlog set PROJ s4 polish=off`, `vlog set PROJ audio polish=off denoise=6`.
+When Kris says "my audio sounds muffled/noisy/harsh" → check polish is on, raise/lower `denoise`; "leave this
+clip as recorded" → `polish=off` on that segment.
+The final master (`render.MASTER_LUFS` -16) is a static gain + true-peak limiter when `match_levels` is on
+(single-pass `loudnorm` is an AGC that pumped room noise up between phrases); `loudnorm` only when it is off.
 
 ## Development
 - `uv sync`; run with `.venv/bin/vlog ...`; GUI: `.venv/bin/vlog serve --port 8799`.

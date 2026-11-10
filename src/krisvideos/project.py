@@ -37,6 +37,8 @@ def _slug(s: str) -> str:
 
 # segment.channel values: auto (mirror a one-sided take, else stereo), stereo (as recorded), left / right
 # (that channel to both ears), mix (both channels summed to mono)
+# segment / voiceover `polish` values: auto (the project's audio.polish), on, off
+POLISH = ("auto", "on", "off")
 CHANNELS = ("auto", "stereo", "left", "right", "mix")
 
 @dataclass
@@ -78,13 +80,15 @@ class Voiceover:
     at: float = 0.0                 # output-timeline seconds
     volume: float = 1.0
     duck_clips: bool = True         # lower clip audio while this plays
+    polish: str = "auto"            # voice polish (media.voice_chain): auto = audio.polish | on | off
     id: str = ""
     note: str = ""
 
     @classmethod
     def from_dict(cls, d: dict, idx: int) -> "Voiceover":
         return cls(file=str(d["file"]), at=parse_time(d.get("at", 0)), volume=float(d.get("volume", 1.0)),
-                   duck_clips=bool(d.get("duck_clips", True)), id=str(d.get("id") or f"v{idx+1}"), note=str(d.get("note") or ""))
+                   duck_clips=bool(d.get("duck_clips", True)), polish=polish_value(d.get("polish")),
+                   id=str(d.get("id") or f"v{idx+1}"), note=str(d.get("note") or ""))
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"file": self.file, "at": round(self.at, 3)}
@@ -92,6 +96,8 @@ class Voiceover:
             d["volume"] = self.volume
         if not self.duck_clips:
             d["duck_clips"] = False
+        if self.polish != "auto":
+            d["polish"] = self.polish
         if self.note:
             d["note"] = self.note
         d["id"] = self.id
@@ -275,6 +281,7 @@ class Segment:
     volume: float = 1.0
     channel: str = "auto"           # auto | stereo | left | right | mix: which channel(s) to hear (left/right: that
                                     # channel copied to both ears, for a mic plugged into one side; auto = detect)
+    polish: str = "auto"            # voice polish (media.voice_chain): auto = the project's audio.polish | on | off
     caption: str | None = None      # convenience: a lower-third shown for the whole clip
     fit: str = "contain"            # contain (letterbox) | cover (crop to fill the canvas)
     overlays: list[Overlay] = field(default_factory=list)
@@ -308,6 +315,7 @@ class Segment:
             seg.channel = str(d.get("channel") or "auto")
             if seg.channel not in CHANNELS:
                 seg.channel = "auto"
+            seg.polish = polish_value(d.get("polish"))
             seg.caption = d.get("caption")
             seg.fit = str(d.get("fit") or "contain")
             seg.overlays = [Overlay.from_dict(o) for o in d.get("overlays", []) or []]
@@ -349,6 +357,8 @@ class Segment:
                 d["volume"] = self.volume
             if self.channel != "auto":
                 d["channel"] = self.channel
+            if self.polish != "auto":
+                d["polish"] = self.polish
             if self.caption:
                 d["caption"] = self.caption
             if self.fit != "contain":
@@ -433,6 +443,8 @@ class Audio:
     normalize: bool = True          # loudness-normalize the final mix
     match_levels: bool = True       # auto-gain each clip/voiceover toward the same loudness
     target_lufs: float = -18.0
+    polish: bool = True             # voice polish on clips and voiceovers (media.voice_chain; per-item `polish` overrides)
+    denoise: float = 10.0           # roughly the dB taken off the room noise by the polish (0 = no denoising)
     master_volume: float = 1.0
 
 
@@ -640,6 +652,14 @@ class Project:
     def move(self, seg_id: str, new_index: int) -> None:
         seg = self.remove(seg_id)
         self.timeline.insert(max(0, min(new_index, len(self.timeline))), seg)
+
+
+def polish_value(v) -> str:
+    """Normalize a `polish` value: bools and on/off/auto strings → "auto" | "on" | "off"."""
+    if isinstance(v, bool):
+        return "on" if v else "off"
+    v = str(v or "auto").lower()
+    return v if v in POLISH else "auto"
 
 
 def _fill(cls, data):

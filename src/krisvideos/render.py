@@ -20,6 +20,7 @@ from .probe import MediaInfo, probe
 from .project import Overlay, Pip, Project, Segment
 
 AUDIO_FMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
+MASTER_LUFS = -16.0      # loudness of the final mix (clips are matched to audio.target_lufs, then gained to this)
 MUTE_ABOVE = 20.0     # a clip faster than this plays silent (a timelapse): sped-up speech is just noise
 CANVAS = {"portrait": (1080, 1920), "landscape": (1920, 1080), "square": (1080, 1080)}
 
@@ -222,6 +223,11 @@ def pip_rect(pip: Pip, info: MediaInfo, W: int, H: int) -> tuple[int, int, int, 
     return left, top, pw, ph
 
 
+def polish_on(p: Project, setting: str) -> bool:
+    """Whether a clip/voiceover with this `polish` setting gets the voice polish."""
+    return setting == "on" or (setting != "off" and p.audio.polish)
+
+
 def _atempo(speed: float) -> str:
     """Chain atempo filters so every factor stays in [0.5, 100]."""
     parts = []
@@ -384,14 +390,20 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 ch = media.effective_channel(src, p.cache_dir, s.channel)
                 if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
                     achain.append(media.CHANNEL_PAN[ch])
+                polished = polish_on(p, s.polish)
+                if polished:                     # voice polish: denoise / de-ess / EQ / compress, before any speed change
+                    chain, lufs = media.voice_filters(src, p.cache_dir, ch, p.audio.denoise)
+                    achain.append(chain)
+                else:
+                    lufs = media.measure_loudness(src, p.cache_dir, ch) if p.audio.match_levels else None
                 if s.speed != 1.0:
                     achain.append(_atempo(s.speed))
                 achain.append(AUDIO_FMT)
-                gain = 0.0
-                if p.audio.match_levels:
-                    gain = media.level_gain_db(media.measure_loudness(src, p.cache_dir, ch), p.audio.target_lufs)
+                gain = media.level_gain_db(lufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
                 if s.volume != 1.0 or abs(gain) > 0.1:
                     achain.append(f"volume={s.volume}*{10 ** (gain / 20):.4f}")
+                if polished:
+                    achain.append(media.VOICE_LIMITER)
                 achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
                 filters.append(f"[{k}:a]{','.join(achain)}[a{i}]")
             else:
@@ -479,8 +491,15 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         labels = []
         for n, v in enumerate(vos):
             kv = add_input(["-i", str(p.resolve(v.file))])
-            gain = media.level_gain_db(media.measure_loudness(p.resolve(v.file), p.cache_dir), p.audio.target_lufs) if p.audio.match_levels else 0.0
-            filters.append(f"[{kv}:a]{AUDIO_FMT},volume={v.volume}*{10 ** (gain / 20):.4f},"
+            vf = p.resolve(v.file)
+            if polish_on(p, v.polish):
+                chain, lufs = media.voice_filters(vf, p.cache_dir, "stereo", p.audio.denoise)
+                chain += ","
+            else:
+                chain, lufs = "", media.measure_loudness(vf, p.cache_dir)
+            gain = media.level_gain_db(lufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
+            filters.append(f"[{kv}:a]{chain}{AUDIO_FMT},volume={v.volume}*{10 ** (gain / 20):.4f},"
+                           + (media.VOICE_LIMITER + "," if chain else "") +
                            f"adelay={int(v.at * 1000)}:all=1,atrim=duration={total:.3f},apad=whole_dur={total:.3f}[vo{n}]")
             labels.append(f"vo{n}")
         if len(labels) == 1:
@@ -562,7 +581,13 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         fo = min(st.fade_out, total / 2)
         af.append(f"afade=t=out:st={total - fo:.3f}:d={fo:.3f}")
     if p.audio.normalize and mode == "final":
-        af.append("loudnorm=I=-16:TP=-1.5:LRA=11,aresample=48000")
+        if p.audio.match_levels:
+            # every clip and voiceover is already gained to target_lufs, so the master is a plain gain to
+            # MASTER_LUFS and a true-peak limiter: single-pass loudnorm is an AGC that pumps the room noise
+            # back up between phrases (6 dB measured), undoing the voice polish
+            af.append(f"volume={MASTER_LUFS - p.audio.target_lufs:.2f}dB,alimiter=limit=0.841:attack=5:release=100:level=0,aresample=48000")
+        else:
+            af.append(f"loudnorm=I={MASTER_LUFS:g}:TP=-1.5:LRA=11,aresample=48000")
     if p.audio.master_volume != 1.0:
         af.append(f"volume={p.audio.master_volume}")
     filters.append(f"[{A}]{','.join(af) if af else 'anull'}[aout]")

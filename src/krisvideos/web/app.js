@@ -69,6 +69,9 @@ function bindSpeed(id, onCommit) {
   num.onkeydown = e => { if (e.key === 'Enter') num.blur(); };
 }
 const CORNERS = { tl: 'top left', tr: 'top right', bl: 'bottom left', br: 'bottom right' };
+// the Voice select of a clip / narration: auto follows the vlog's audio.polish setting
+const polishOptions = cur => [['auto', `${P && P.audio && P.audio.polish === false ? 'As recorded' : 'Polished'} (vlog setting)`], ['on', 'Polished'], ['off', 'As recorded']]
+  .map(([v, l]) => `<option value="${v}" ${(cur || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('');
 // the Channels select of a clip: what `auto` does to this file is spelled out
 const channelOptions = s => {
   const auto = s.one_sided ? `Auto: only the ${s.one_sided} channel has sound → copied to both ears` : s.lufs == null && !s.media ? 'Auto' : 'Auto: stereo as recorded';
@@ -183,25 +186,37 @@ const VP = (() => {
   // Audio and the chosen channel is copied to both ears, like render.py's pan filter. An element is hooked
   // the first time a clip needs it and keeps playing through the context from then on.
   const MIX = { stereo: [[1, 0], [0, 1]], left: [[1, 0], [1, 0]], right: [[0, 1], [0, 1]], mix: [[.5, .5], [.5, .5]] };   // [ear][source channel]
+  // Voice polish, approximated live: the pre-gain and the EQ of media.voice_chain (highpass 90 Hz, -2.5 dB
+  // at 250 Hz, +2 dB at 3 kHz, +1.5 dB above 9 kHz); the denoiser, de-esser and compressor only exist in
+  // the render, and the level comes from the loudness measured after the real chain (s.lufs).
+  const EQ = [['highpass', 90, 0.7, 0], ['peaking', 250, 1.2, -2.5], ['peaking', 3000, 1.4, 2], ['highshelf', 9000, 0.7, 1.5]];
   let actx = null; const routes = new Map();
-  function route(el, mode) {
+  function route(el, mode, fx) {
     mode = MIX[mode] ? mode : 'stereo';
+    const pre = fx ? Math.pow(10, (fx.pregain || 0) / 20) : 1;
     let r = routes.get(el);
     if (!r) {
-      if (mode === 'stereo') return;
+      if (mode === 'stereo' && !fx) return;
       try {
         actx = actx || new AudioContext();
         const src = actx.createMediaElementSource(el), sp = actx.createChannelSplitter(2), mg = actx.createChannelMerger(2);
-        src.connect(sp); mg.connect(actx.destination);
+        src.connect(sp);
         const gains = [[null, null], [null, null]];
         for (let o = 0; o < 2; o++) for (let i = 0; i < 2; i++) { const g = actx.createGain(); sp.connect(g, i); g.connect(mg, 0, o); gains[o][i] = g; }
-        r = { gains, mode: '' }; routes.set(el, r);
-      } catch (e) { console.warn('channel routing unavailable', e); routes.set(el, { gains: null, mode }); return; }
+        const preG = actx.createGain(); let last = mg.connect(preG);
+        const eq = EQ.map(([type, f, q]) => { const b = actx.createBiquadFilter(); b.type = type; b.frequency.value = f; b.Q.value = q; b.gain.value = 0; last = last.connect(b); return b; });
+        last.connect(actx.destination);
+        r = { gains, preG, eq, mode: '', fx: null }; routes.set(el, r);
+      } catch (e) { console.warn('audio routing unavailable', e); routes.set(el, { gains: null, mode }); return; }
     }
     if (actx && actx.state === 'suspended') actx.resume().catch(() => { });
-    if (!r.gains || r.mode === mode) return;
-    r.mode = mode;
-    for (let o = 0; o < 2; o++) for (let i = 0; i < 2; i++) r.gains[o][i].gain.value = MIX[mode][o][i];
+    if (!r.gains) return;
+    if (r.mode !== mode) { r.mode = mode; for (let o = 0; o < 2; o++) for (let i = 0; i < 2; i++) r.gains[o][i].gain.value = MIX[mode][o][i]; }
+    const on = !!fx;
+    if (r.fx !== on || r.preG.gain.value !== pre) {
+      r.fx = on; r.preG.gain.value = pre;
+      r.eq.forEach((b, i) => { b.gain.value = on ? EQ[i][3] : 0; if (EQ[i][0] === 'highpass') b.frequency.value = on ? EQ[i][1] : 1; });
+    }
   }
   function reset() { for (const v of videos) { v.pause(); v.removeAttribute('src'); v.dataset.url = ''; v.load(); v.classList.add('hidden'); } cards.forEach(c => c.classList.add('hidden')); owner.clear(); paintLayers(-1); paintCredits(-1); syncPip(null); }
   // keep a <video> on `want` at `rate`: the browser plays up to 16×, anything faster is stepped frame by frame
@@ -335,7 +350,7 @@ const VP = (() => {
     mainBoxStyle(el, s.box);
     el.muted = !!s.mute || !playing || (s.speed || 1) > MUTE_ABOVE;
     el.volume = clamp((s.volume ?? 1) * gainFactor(s) * weight * duck, 0, 1);
-    route(el, s.channel_effective);
+    route(el, s.channel_effective, s.polished ? { pregain: s.pregain } : null);
     drive(el, s.speed || 1, want, s.id);
     return el;
   }
@@ -345,7 +360,7 @@ const VP = (() => {
     if (rendered) {
       cards.forEach(c => c.classList.add('hidden')); captions(null); videos[1].classList.add('hidden');
       syncPip(null);
-      const v = videos[0]; setSrc(v, P.preview.url); v.classList.remove('hidden'); v.style.opacity = 1; v.style.objectFit = 'contain'; mainBoxStyle(v, null); v.muted = false; v.volume = 1; v.playbackRate = 1; route(v, 'stereo');
+      const v = videos[0]; setSrc(v, P.preview.url); v.classList.remove('hidden'); v.style.opacity = 1; v.style.objectFit = 'contain'; mainBoxStyle(v, null); v.muted = false; v.volume = 1; v.playbackRate = 1; route(v, 'stereo', null);
       if (hard || Math.abs(v.currentTime - t) > 0.25) { try { v.currentTime = t; } catch { } }
       return;
     }
@@ -790,7 +805,8 @@ function renderInspector() {
       pipInspectorHtml(s) +
       `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
       field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`) +
-      (m.has_audio ? field('Channels', `<select data-k="channel">${channelOptions(s)}</select>`) : '');
+      (m.has_audio ? field('Channels', `<select data-k="channel">${channelOptions(s)}</select>`) : '') +
+      (m.has_audio ? field('Voice', `<select data-k="polish">${polishOptions(s.polish)}</select>` + (s.polished ? `<span class="muted" style="font-size:11px">Polished: room noise down, sibilance tamed, a little presence and evenness. The live player only approximates it — judge it in a preview.</span>` : '')) : '');
   }
   html += field('Transition in', `<div class="inline"><select data-k="transition">${trOpts}</select><input type="number" data-k="transition_duration" step="0.1" min="0.1" max="3" value="${s.transition_duration ?? ''}" placeholder="${P.style.transition_duration}s" style="flex:0 0 64px"></div>`);
   html += `<div class="sep"></div><div class="actions"><button class="link" id="segUp" title="[">← Move</button><button class="link" id="segDown" title="]">Move →</button><button class="link" id="segDup">Duplicate</button><span class="spacer"></span><button class="link danger" id="segDelete">Delete</button></div>`;
@@ -865,6 +881,7 @@ function renderVoInspector(el, v, close) {
     field('Starts at', `<div class="inline"><input type="text" id="voAt" value="${fmt(v.at, 2)}"><button class="link" id="voAtPh" title="move to playhead">← playhead</button></div>`) +
     field('Volume', `<input type="range" id="voVol" min="0" max="2" step="0.1" value="${v.volume}">`) +
     `<div class="check"><input type="checkbox" id="voDuck" ${v.duck_clips ? 'checked' : ''}><label for="voDuck">Lower clip audio while this plays</label></div>` +
+    field('Voice', `<select id="voPolish">${polishOptions(v.polish)}</select>`) +
     `<div class="sep"></div><div class="actions"><span class="spacer"></span><button class="link danger" id="voDel">Delete</button></div>`;
   $('#inspClose').onclick = () => { selVo = null; renderTimeline(); renderInspector(); };
   const patch = body => guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/voiceovers/${v.id}`, body)); });
@@ -872,6 +889,7 @@ function renderVoInspector(el, v, close) {
   $('#voAtPh').onclick = () => patch({ at: T });
   $('#voVol').onchange = e => patch({ volume: +e.target.value });
   $('#voDuck').onchange = e => patch({ duck_clips: e.target.checked });
+  $('#voPolish').onchange = e => patch({ polish: e.target.value });
   $('#voDel').onclick = () => guard(async () => { setProject(await api('DELETE', `/api/projects/${P.name}/voiceovers/${v.id}`)); selVo = null; renderInspector(); });
 }
 function renderStingInspector(el, m, close) {
@@ -1623,6 +1641,8 @@ async function openSettings(tab) {
       <div class="inline">${field('Music credits appear', `<select id="v_cpos">${[['tl', 'top left'], ['tr', 'top right'], ['bl', 'bottom left'], ['br', 'bottom right']].map(([v, l]) => `<option value="${v}" ${(st.credit_position || 'tl') === v ? 'selected' : ''}>${l}</option>`).join('')}</select>`)}${field('for (s)', `<input type="number" id="v_csec" step="0.5" min="1" value="${st.credit_seconds ?? 6}">`)}</div>
       <div class="check"><input type="checkbox" id="v_norm" ${a.normalize ? 'checked' : ''}><label for="v_norm">Normalize final loudness</label></div>
       <div class="check"><input type="checkbox" id="v_match" ${a.match_levels ? 'checked' : ''}><label for="v_match">Match clip & voice levels</label></div>
+      <div class="check"><input type="checkbox" id="v_polish" ${a.polish !== false ? 'checked' : ''}><label for="v_polish">Polish voices (denoise, de-ess, EQ, compress every clip and narration; the inspector's <i>Voice</i> overrides it per clip)</label></div>
+      ${field('Noise reduction (dB)', `<input type="number" id="v_denoise" step="1" min="0" max="30" value="${a.denoise ?? 10}" style="width:80px">`)}
       <div class="actions"><button class="link" id="openFolder">Open project folder</button><span class="spacer"></span><button class="link danger" id="delProj">Delete this vlog…</button></div>
     </div>
     <div id="setApp" class="${tab === 'app' ? '' : 'hidden'}">
@@ -1645,7 +1665,7 @@ async function openSettings(tab) {
   if (P) { $('#openFolder').onclick = () => api('POST', '/api/open', { path: P.folder }); $('#delProj').onclick = () => { if (!confirm(`Move “${P.name}” to the Trash?`)) return; guard(async () => { await api('DELETE', `/api/projects/${P.name}`); closeSheet(); localStorage.removeItem('kv.project'); P = null; await loadProjects(); }); }; }
   $('#s_ok').onclick = () => guard(async () => {
     await api('PUT', '/api/settings', { immich_url: $('#s_url').value, immich_api_key: $('#s_key').value, vlogs_dir: $('#s_dir').value, default_title_subtitle: $('#s_sub').value, default_title_kicker: $('#s_kick').value, masthead_image: $('#s_mast').value, intro_black_hold: +$('#s_hold').value || 0, intro_masthead_seconds: +$('#s_ms').value || 2.5, intro_title_seconds: +$('#s_ts').value || 2, intro_sting: $('#s_sting').value, intro_sting_start: parseTime($('#s_stingStart').value), intro_sting_volume: +$('#s_stingVol').value || 0, default_music: $('#s_music').value, default_orientation: $('#s_or').value, default_transition: $('#s_tr').value });
-    if (P) await api('PATCH', `/api/projects/${P.name}`, { title: $('#v_title').value, output: { orientation: $('#v_or').value, fps: +$('#v_fps').value }, style: { transition: $('#v_tr').value, transition_duration: +$('#v_trd').value, fade_in: +$('#v_fi').value, fade_out: +$('#v_fo').value, title_bg: $('#v_bg').value, title_fg: $('#v_fg').value, title_accent: $('#v_ac').value, font: $('#v_font').value, credit_position: $('#v_cpos').value, credit_seconds: +$('#v_csec').value || 6 }, audio: { normalize: $('#v_norm').checked, match_levels: $('#v_match').checked } });
+    if (P) await api('PATCH', `/api/projects/${P.name}`, { title: $('#v_title').value, output: { orientation: $('#v_or').value, fps: +$('#v_fps').value }, style: { transition: $('#v_tr').value, transition_duration: +$('#v_trd').value, fade_in: +$('#v_fi').value, fade_out: +$('#v_fo').value, title_bg: $('#v_bg').value, title_fg: $('#v_fg').value, title_accent: $('#v_ac').value, font: $('#v_font').value, credit_position: $('#v_cpos').value, credit_seconds: +$('#v_csec').value || 6 }, audio: { normalize: $('#v_norm').checked, match_levels: $('#v_match').checked, polish: $('#v_polish').checked, denoise: Math.max(0, +$('#v_denoise').value || 0) } });
     closeSheet(); await loadProjects(P && P.name); toast('Saved');
   });
 }

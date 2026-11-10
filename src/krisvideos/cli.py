@@ -266,12 +266,26 @@ def cmd_trim(cfg, a):
 
 def cmd_set(cfg, a):
     p = _project(cfg, a.project)
+    if a.seg == "audio":        # project-wide audio settings: polish=on|off denoise=10 match_levels=... target_lufs=...
+        for kv in a.pairs:
+            k, _, v = kv.partition("=")
+            if not hasattr(p.audio, k):
+                sys.exit(f"unknown audio setting {k}")
+            cur = getattr(p.audio, k)
+            setattr(p.audio, k, v.lower() in ("1", "true", "yes", "on") if isinstance(cur, bool) else type(cur)(v))
+        p.save()
+        print("ok")
+        return
     s = _seg(p, a.seg)
     for kv in a.pairs:
         k, _, v = kv.partition("=")
         k = {"in": "in_", "title": "text"}.get(k, k)
         if not hasattr(s, k):
             sys.exit(f"unknown field {k}")
+        if k == "polish":
+            from .project import polish_value
+            setattr(s, k, polish_value(v))
+            continue
         cur = getattr(s, k)
         if isinstance(cur, bool):
             v = v.lower() in ("1", "true", "yes", "on")
@@ -537,7 +551,8 @@ def cmd_undo(cfg, a, redo=False):
 def cmd_show(cfg, a):
     p = _project(cfg, a.project)
     layout = render.compute_layout(p)
-    print(f"{p.title}  [{layout.width}x{layout.height} @ {layout.fps}fps]  total {fmt_time(layout.total)}")
+    print(f"{p.title}  [{layout.width}x{layout.height} @ {layout.fps}fps]  total {fmt_time(layout.total)}"
+          f"  voices {'polished (denoise ' + format(p.audio.denoise, 'g') + ')' if p.audio.polish else 'as recorded'}")
     for pl in layout.placed:
         s = pl.seg
         tr = "" if pl.transition == "cut" else f" ({pl.transition} {pl.transition_duration}s)"
@@ -558,6 +573,8 @@ def cmd_show(cfg, a):
             ch = media.effective_channel(p.resolve(s.src), p.cache_dir, s.channel, compute=False)
             if s.channel != "auto" or ch != "stereo":
                 desc += f"  audio={s.channel}" + (f"→{ch} to both ears" if ch in ("left", "right") else "→mono" if ch == "mix" else "")
+            if s.polish != "auto":
+                desc += f"  voice={'polished' if s.polish == 'on' else 'as recorded'}"
             if s.caption:
                 desc += f"  caption={s.caption!r}"
             for ov in s.overlays:
@@ -576,7 +593,7 @@ def cmd_show(cfg, a):
                     desc += f" x{s.pip.speed:g}"
         print(f"  {s.id:>4}  {fmt_time(pl.start):>7} - {fmt_time(pl.end):<7} {desc}{tr}")
     for v in p.voiceovers:
-        print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}")
+        print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}{'' if v.polish == 'auto' else '  voice=' + ('polished' if v.polish == 'on' else 'as recorded')}")
     for m in p.images:
         where = "full screen" if not m.box else f"box x={m.box[0]:.2f} y={m.box[1]:.2f} w={m.box[2]:.2f}"
         print(f"  {m.id:>4}  {fmt_time(m.at):>7} - {fmt_time(m.at + m.duration):<7} IMAGE  {m.file}  {where}")
