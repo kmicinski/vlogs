@@ -24,6 +24,11 @@ uv run python scripts/make_app.py   # builds dist/KrisVideos.app
 Drag `dist/KrisVideos.app` to Applications (or run it from `dist/`). It starts the local
 server and opens the GUI in a chromeless Chrome window. Or run `vlog serve --open`.
 
+Renaming: the vlog switcher (the title at the top left) has *Rename this vlog…* (title, day, folder) and
+*Move this vlog to today* for the day you forgot to make it: the date is updated, the opening date card
+shows the new day, a title that was just the date follows, and a folder named after the day is renamed.
+`vlog rename PROJ --today` / `--title` / `--date` / `--name` do the same.
+
 Settings (gear icon, or `vlog config key=value`) live in `~/.config/krisvideos/config.yaml`:
 Immich URL + API key (Immich → Account settings → API keys), the vlogs folder
 (default `~/Vlogs`), the masthead image and opening-card kicker/subtitle, the seconds of black
@@ -201,6 +206,8 @@ stings:                                 # music, anchored to segments (splits wi
 
 ```
 vlog new [2026-10-22] [--title "..."]      vlog pull 2026-10-22 [--date ...]   (from Immich)
+vlog rename 2026-10-22 --today             forgot to make it that day? move it to today (date card, title, folder)
+vlog rename 2026-10-22 --title "Lake day"  retitle (a title card showing the old title follows)
 vlog add PROJ file.mov ...                 vlog show PROJ
 vlog title PROJ "Lunch" [--sub ..] [--kicker ..] [--image f.png] [--dur 2] [--at INDEX]
 vlog masthead PROJ [--at INDEX]            insert the configured masthead image card

@@ -19,7 +19,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from . import edits, media, render, titles
-from .cli import new_project as make_project, masthead_rel, sting_rel
+from .cli import new_project as make_project, masthead_rel, move_project, sting_rel
 from .edits import title_at
 from .config import Config
 from .probe import is_video, probe
@@ -89,6 +89,13 @@ class SettingsIn(BaseModel):
     title_bg: str | None = None
     title_fg: str | None = None
     title_accent: str | None = None
+
+
+class RenameIn(BaseModel):
+    title: str | None = None
+    date: str | None = None     # YYYY-MM-DD
+    name: str | None = None     # new folder name
+    today: bool = False         # move it to today (name follows when the vlog is named after its day)
 
 
 class NewProject(BaseModel):
@@ -556,6 +563,38 @@ def create_app(cfg: Config) -> FastAPI:
     @app.get("/api/projects/{name}")
     def get_project(name: str):
         return project_json(load(name))
+
+    @app.post("/api/projects/{name}/rename")
+    def rename_project(name: str, body: RenameIn):
+        """Retitle, move to another day and/or rename the folder; the opening date card follows the date and
+        cards showing the title follow the title. Returns {"project", "name"} (the name may have changed)."""
+        p = load(name)
+        date, new = body.date, (body.name or "").strip() or None
+        if body.today:
+            date = dt.date.today().isoformat()
+        if date:
+            try:
+                dt.date.fromisoformat(date)
+            except ValueError:
+                raise HTTPException(400, f"date must be YYYY-MM-DD, not {date!r}")
+            if new is None and body.today:
+                try:
+                    dt.date.fromisoformat(p.name)
+                    new = date            # a vlog named after its day keeps that convention
+                except ValueError:
+                    pass
+            edits.redate(p, date, new)
+        if body.title is not None and body.title.strip():
+            edits.retitle(p, body.title.strip())
+        commit(p)
+        if new and new != p.name:
+            try:
+                p = move_project(p, root, new)
+            except FileExistsError as e:
+                raise HTTPException(409, str(e))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+        return {"project": project_json(p), "name": p.name}
 
     @app.delete("/api/projects/{name}")
     def delete_project(name: str):

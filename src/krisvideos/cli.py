@@ -1,6 +1,8 @@
 """`vlog` command line. Every command edits project.yaml and/or runs ffmpeg.
 
     vlog new [NAME] [--title T]              create ~/Vlogs/NAME (default: today)
+    vlog rename PROJECT --today              forgot to make it that day: move it to today (date card, title, folder)
+    vlog rename PROJECT --title "Lake day" [--date 2026-11-12] [--name NAME]
     vlog add PROJECT FILE...                 import clips (local files)
     vlog pull PROJECT [--date YYYY-MM-DD]    pull a day's videos from Immich
     vlog title PROJECT "Text" [--sub S] [--kicker K] [--image FILE] [--dur 3] [--at INDEX]
@@ -70,7 +72,7 @@ def _import(p: Project, path: Path) -> str:
 
 def new_project(cfg: Config, folder: Path, title: str | None, opening: bool = True) -> Project:
     """Create a project with the configured defaults and (optionally) the standard intro."""
-    p = Project.new(folder, title=title or folder.name)
+    p = Project.new(folder, title=title or folder.name, date=folder.name if _is_date(folder.name) else "")   # a vlog named after its day is dated that day
     p.output.orientation = cfg.default_orientation
     p.style.font = cfg.font
     p.style.transition = cfg.default_transition
@@ -100,6 +102,23 @@ def masthead_rel(p: Project, cfg: Config) -> str | None:
 
 INTRO_FADE_OUT = 1.0   # masthead -> black
 INTRO_FADE_IN = 0.8    # black -> opening card
+
+
+def move_project(p: Project, root: Path, new_name: str) -> Project:
+    """Rename a project's folder (the vlog's name): everything inside (clips, cache, history) moves with
+    it. Raises FileExistsError / ValueError."""
+    new_name = new_name.strip()
+    if not new_name or new_name in (".", "..") or "/" in new_name or "\\" in new_name or new_name.startswith("."):
+        raise ValueError(f"not a valid vlog name: {new_name!r}")
+    target = root / new_name
+    if target.resolve() == p.folder.resolve():
+        return p
+    if target.exists():
+        raise FileExistsError(f"a vlog named {new_name} already exists")
+    p.save()
+    import shutil
+    shutil.move(str(p.folder), str(target))
+    return Project.load(target)
 
 
 def add_opening(p: Project, cfg: Config, title: str, at: int | None = None) -> None:
@@ -152,10 +171,39 @@ def cmd_new(cfg, a):
 
 
 def _pretty_date(name: str) -> str:
+    return edits.pretty_date(name)
+
+
+def _is_date(name: str) -> bool:
     try:
-        return dt.date.fromisoformat(name).strftime("%A, %B %-d")
+        dt.date.fromisoformat(name)
+        return True
     except ValueError:
-        return name
+        return False
+
+
+def cmd_rename(cfg, a):
+    """Retitle a vlog and/or move it to another day (--today when it was made on the wrong date)."""
+    p = _project(cfg, a.project)
+    date = dt.date.today().isoformat() if a.today else a.date
+    name = a.name
+    if date:
+        try:
+            dt.date.fromisoformat(date)
+        except ValueError:
+            sys.exit(f"date must be YYYY-MM-DD, not {date!r}")
+        if name is None and _is_date(p.name):     # a vlog named after its day keeps that convention
+            name = date
+        edits.redate(p, date, name)
+    if a.title is not None:
+        edits.retitle(p, a.title)
+    p.save()
+    if name and name != p.name:
+        try:
+            p = move_project(p, cfg.vlogs_path, name)
+        except (FileExistsError, ValueError) as e:
+            sys.exit(str(e))
+    print(f"{p.name}: {p.title!r} dated {p.date}")
 
 
 def cmd_add(cfg, a):
@@ -648,6 +696,7 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("new"); s.add_argument("name", nargs="?"); s.add_argument("--title"); s.add_argument("--no-opening", dest="opening", action="store_false"); s.set_defaults(fn=cmd_new)
+    s = sub.add_parser("rename", help="retitle a vlog, move it to another day (--today), or rename its folder"); s.add_argument("project"); s.add_argument("--title"); s.add_argument("--date", help="YYYY-MM-DD"); s.add_argument("--today", action="store_true", help="move it to today (made on the wrong day)"); s.add_argument("--name", help="new folder name (default: follows the date when the vlog is named after its day)"); s.set_defaults(fn=cmd_rename)
     s = sub.add_parser("add"); s.add_argument("project"); s.add_argument("files", nargs="+"); s.set_defaults(fn=cmd_add)
     s = sub.add_parser("pull"); s.add_argument("project"); s.add_argument("--date"); s.add_argument("--no-add", dest="add", action="store_false"); s.set_defaults(fn=cmd_pull)
     s = sub.add_parser("title"); s.add_argument("project"); s.add_argument("text"); s.add_argument("--sub"); s.add_argument("--kicker"); s.add_argument("--image"); s.add_argument("--dur", type=float, default=3.0); s.add_argument("--at", type=int); s.set_defaults(fn=cmd_title)

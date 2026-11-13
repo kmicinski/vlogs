@@ -352,6 +352,45 @@ def insert_index_at(p: Project, t: float) -> int:
     return pl.index + 1
 
 
+def pretty_date(iso: str) -> str:
+    """'2026-11-10' → 'Monday, November 10' (anything else is returned as is)."""
+    import datetime as dt
+    try:
+        return dt.date.fromisoformat(iso).strftime("%A, %B %-d")
+    except (ValueError, TypeError):
+        return iso
+
+
+def retitle(p: Project, title: str) -> list[Segment]:
+    """Give the vlog a new title; title cards that showed the old title (the opening card made with
+    `--title`) show the new one. Returns the cards changed."""
+    old = p.title
+    p.title = title
+    changed = []
+    for s in p.timeline:
+        if s.kind == "title" and old and s.text == old:
+            s.text = title
+            changed.append(s)
+    return changed
+
+
+def redate(p: Project, date: str, new_name: str | None = None) -> list[Segment]:
+    """Move the vlog to another day (e.g. today, when it was made on the wrong date): sets `date`, moves the
+    opening date card ("Monday, November 10") to the new day, and when the title was just the date / the
+    folder name it follows too (to `new_name` if given). Returns the cards changed."""
+    old_date = p.date or p.name
+    olds = {old_date, pretty_date(old_date), p.name, pretty_date(p.name)}
+    changed = []
+    for s in p.timeline:
+        if s.kind == "title" and s.text in olds:
+            s.text = pretty_date(date)
+            changed.append(s)
+    if p.title in olds or not p.title:
+        p.title = pretty_date(date) if p.title == pretty_date(old_date) or p.title == pretty_date(p.name) else (new_name or date)
+    p.date = date
+    return changed
+
+
 def title_at(p: Project, t: float, text: str, subtitle: str = "", duration: float = 3.0) -> Segment:
     """Split the timeline at output time `t` (if that is inside a clip) and insert a title card."""
     return p.add_title(text, subtitle, duration, at=insert_index_at(p, t))

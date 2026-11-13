@@ -40,6 +40,11 @@ everything) still exists for old projects; the GUI offers "Turn into music over 
 clip under the playhead), "Other music here…" opens `musicSheet` (song picker, `GET/POST
 /api/projects/{name}/songs`, draggable start window with audition).
 The intro sting comes from config `intro_sting`.
+Renaming: `edits.retitle(p, title)` (cards showing the old title follow), `edits.redate(p, date, new_name)`
+(the opening date card and a title that was just the date follow), `cli.move_project` renames the folder;
+`POST /api/projects/{name}/rename {title?, date?, name?, today?}` returns `{project, name}`; GUI: switcher
+"Rename this vlog…" / "Move this vlog to today". When Kris says "I forgot to make yesterday's vlog, make this
+one today's" → `vlog rename PROJ --today`; "call it Lake day" → `vlog rename PROJ --title "Lake day"`.
 Projects live in `~/Vlogs/<name>/` (configurable: `vlog config`). Times in the YAML are
 *source-clip* seconds for `in`/`out`; `vlog title-at` takes *output-timeline* time.
 `in`/`out` accept `12.5` or `0:12.5`. Segment ids (`s3`) are stable; the GUI shows them in `vlog show`.

@@ -1634,7 +1634,7 @@ async function openSettings(tab) {
   const o = P ? P.output : {}, st = P ? P.style : {}, a = P ? P.audio : {};
   sheet(`<div class="tabs"><button class="tab ${tab === 'vlog' ? 'active' : ''}" data-t="vlog" ${P ? '' : 'disabled'}>This vlog</button><button class="tab ${tab === 'app' ? 'active' : ''}" data-t="app">App & Immich</button></div>
     <div id="setVlog" class="${tab === 'vlog' ? '' : 'hidden'}">
-      ${field('Title', `<input type="text" id="v_title" value="${esc(P ? P.title : '')}">`)}
+      ${field('Title', `<div class="inline"><input type="text" id="v_title" value="${esc(P ? P.title : '')}"><button class="link" id="v_rename" title="title, day and folder">Day / folder…</button></div>`)}
       <div class="inline">${field('Orientation', `<select id="v_or">${opt(['auto', 'portrait', 'landscape', 'square'], o.orientation)}</select>`)}${field('Transitions', `<select id="v_tr">${opt(['cut', 'fade', 'dip'], st.transition)}</select>`)}${field('Length (s)', `<input type="number" id="v_trd" step="0.1" min="0.1" value="${st.transition_duration}">`)}</div>
       <div class="inline">${field('Fade in (s)', `<input type="number" id="v_fi" step="0.1" min="0" value="${st.fade_in}">`)}${field('Fade out (s)', `<input type="number" id="v_fo" step="0.1" min="0" value="${st.fade_out}">`)}${field('FPS', `<select id="v_fps">${opt([24, 30, 60], o.fps)}</select>`)}</div>
       ${field('Title cards', `<div class="inline"><input type="color" id="v_bg" value="${st.title_bg}" title="background"><input type="color" id="v_fg" value="${st.title_fg}" title="text"><input type="color" id="v_ac" value="${st.title_accent}" title="subtitle / accent"><input type="text" id="v_font" value="${esc(st.font)}" placeholder="font family"></div>`)}
@@ -1662,18 +1662,55 @@ async function openSettings(tab) {
   $$('.tabs .tab').forEach(b => b.onclick = () => { $$('.tabs .tab').forEach(x => x.classList.toggle('active', x === b)); $('#setVlog').classList.toggle('hidden', b.dataset.t !== 'vlog'); $('#setApp').classList.toggle('hidden', b.dataset.t !== 'app'); });
   $('#s_mastPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'image' }); if (r.paths[0]) $('#s_mast').value = r.paths[0]; });
   $('#s_stingPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'music' }); if (r.paths[0]) $('#s_sting').value = r.paths[0]; });
-  if (P) { $('#openFolder').onclick = () => api('POST', '/api/open', { path: P.folder }); $('#delProj').onclick = () => { if (!confirm(`Move “${P.name}” to the Trash?`)) return; guard(async () => { await api('DELETE', `/api/projects/${P.name}`); closeSheet(); localStorage.removeItem('kv.project'); P = null; await loadProjects(); }); }; }
+  if (P) { $('#v_rename').onclick = () => { closeSheet(); renameSheet(); }; $('#openFolder').onclick = () => api('POST', '/api/open', { path: P.folder }); $('#delProj').onclick = () => { if (!confirm(`Move “${P.name}” to the Trash?`)) return; guard(async () => { await api('DELETE', `/api/projects/${P.name}`); closeSheet(); localStorage.removeItem('kv.project'); P = null; await loadProjects(); }); }; }
   $('#s_ok').onclick = () => guard(async () => {
     await api('PUT', '/api/settings', { immich_url: $('#s_url').value, immich_api_key: $('#s_key').value, vlogs_dir: $('#s_dir').value, default_title_subtitle: $('#s_sub').value, default_title_kicker: $('#s_kick').value, masthead_image: $('#s_mast').value, intro_black_hold: +$('#s_hold').value || 0, intro_masthead_seconds: +$('#s_ms').value || 2.5, intro_title_seconds: +$('#s_ts').value || 2, intro_sting: $('#s_sting').value, intro_sting_start: parseTime($('#s_stingStart').value), intro_sting_volume: +$('#s_stingVol').value || 0, default_music: $('#s_music').value, default_orientation: $('#s_or').value, default_transition: $('#s_tr').value });
-    if (P) await api('PATCH', `/api/projects/${P.name}`, { title: $('#v_title').value, output: { orientation: $('#v_or').value, fps: +$('#v_fps').value }, style: { transition: $('#v_tr').value, transition_duration: +$('#v_trd').value, fade_in: +$('#v_fi').value, fade_out: +$('#v_fo').value, title_bg: $('#v_bg').value, title_fg: $('#v_fg').value, title_accent: $('#v_ac').value, font: $('#v_font').value, credit_position: $('#v_cpos').value, credit_seconds: +$('#v_csec').value || 6 }, audio: { normalize: $('#v_norm').checked, match_levels: $('#v_match').checked, polish: $('#v_polish').checked, denoise: Math.max(0, +$('#v_denoise').value || 0) } });
+    if (P && $('#v_title').value.trim() && $('#v_title').value.trim() !== P.title) setProject((await api('POST', `/api/projects/${P.name}/rename`, { title: $('#v_title').value.trim() })).project);
+    if (P) await api('PATCH', `/api/projects/${P.name}`, { output: { orientation: $('#v_or').value, fps: +$('#v_fps').value }, style: { transition: $('#v_tr').value, transition_duration: +$('#v_trd').value, fade_in: +$('#v_fi').value, fade_out: +$('#v_fo').value, title_bg: $('#v_bg').value, title_fg: $('#v_fg').value, title_accent: $('#v_ac').value, font: $('#v_font').value, credit_position: $('#v_cpos').value, credit_seconds: +$('#v_csec').value || 6 }, audio: { normalize: $('#v_norm').checked, match_levels: $('#v_match').checked, polish: $('#v_polish').checked, denoise: Math.max(0, +$('#v_denoise').value || 0) } });
     closeSheet(); await loadProjects(P && P.name); toast('Saved');
   });
 }
 $('#projBtn').onclick = async e => {
   const anchor = e.currentTarget;   // currentTarget is null once the await has yielded
   const list = await api('GET', '/api/projects');
-  popover(anchor, [...list.slice(0, 12).map(p => ({ label: `${p.name}${p.title && p.title !== p.name ? ' · ' + p.title : ''}`, k: p.rendered ? 'exported' : `${p.segments} seg`, sel: P && p.name === P.name, fn: () => openProject(p.name) })), '-', { label: 'New vlog…', k: '⌘N', fn: newProjectSheet }]);
+  const today = todayIso();
+  popover(anchor, [...list.slice(0, 12).map(p => ({ label: `${p.name}${p.title && p.title !== p.name ? ' · ' + p.title : ''}`, k: p.rendered ? 'exported' : `${p.segments} seg`, sel: P && p.name === P.name, fn: () => openProject(p.name) })), '-',
+    ...(P ? [{ label: 'Rename this vlog…', k: 'title · date', fn: renameSheet }, { label: 'Move this vlog to today', k: today, disabled: P.date === today && (P.name === today || !isIsoDate(P.name)), fn: moveToToday }, '-'] : []),
+    { label: 'New vlog…', k: '⌘N', fn: newProjectSheet }]);
 };
+const todayIso = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`; };
+const isIsoDate = s => /^\d{4}-\d{2}-\d{2}$/.test(s || '');
+const prettyDate = iso => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); return m ? new Date(+m[1], +m[2] - 1, +m[3]).toLocaleDateString(undefined, { weekday: 'long', month: 'long', day: 'numeric' }) : iso; };
+// rename: title, day and folder name; the server moves the opening date card and the title card along
+async function renameProject(body) {
+  const r = await api('POST', `/api/projects/${P.name}/rename`, body);
+  closeSheet();
+  if (r.name !== P.name) localStorage.setItem('kv.project', r.name);
+  await loadProjects(r.name);
+  return r;
+}
+function moveToToday() { guard(async () => { const r = await renameProject({ today: true }); toast(`Moved to ${r.project.date}${r.name !== r.project.date ? '' : ' (folder renamed too)'}`); }); }
+function renameSheet() {
+  if (!P) return;
+  const follows = isIsoDate(P.name) && (P.name === P.date || !P.date);
+  sheet(`<h2>Rename vlog</h2>
+    ${field('Title', `<input id="r_title" type="text" value="${esc(P.title || '')}" placeholder="${esc(prettyDate(P.date || P.name))}">`)}
+    ${field('Day', `<div class="inline"><input id="r_date" type="date" value="${esc(P.date || (isIsoDate(P.name) ? P.name : ''))}" style="flex:0 0 160px"><button class="link" id="r_today">Today</button><span class="muted" style="font-size:11px">The opening date card follows the day.</span></div>`)}
+    ${field('Folder', `<div class="inline"><input id="r_name" type="text" value="${esc(P.name)}" ${follows ? 'disabled' : ''}><label class="check" style="margin:0"><input type="checkbox" id="r_follow" ${follows ? 'checked' : ''}> follows the day</label></div>`)}
+    <div class="foot"><button class="pill" data-close>Cancel</button><button class="pill primary" id="s_ok">Rename</button></div>`);
+  const sync = () => { if ($('#r_follow').checked) { $('#r_name').value = $('#r_date').value || P.name; $('#r_name').disabled = true; } else $('#r_name').disabled = false; };
+  $('#r_follow').onchange = sync; $('#r_date').onchange = sync;
+  $('#r_today').onclick = () => { $('#r_date').value = todayIso(); sync(); };
+  $('#s_ok').onclick = () => guard(async () => {
+    const body = {};
+    const title = $('#r_title').value.trim(); if (title && title !== P.title) body.title = title;
+    const date = $('#r_date').value; if (date && date !== P.date) body.date = date;
+    const name = $('#r_name').value.trim(); if (name && name !== P.name) body.name = name;
+    if (!Object.keys(body).length) return closeSheet();
+    const r = await renameProject(body);
+    toast(`Now “${r.project.title}”${r.name !== P.name ? ` in ${r.name}` : ''}`);
+  });
+}
 $('#welcomeNew').onclick = newProjectSheet;
 async function newProjectSheet() {
   const today = new Date().toISOString().slice(0, 10);
