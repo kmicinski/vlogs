@@ -67,11 +67,18 @@ fractions, `fit`, `shape` round|rect|circle, `hidden`) and `box:` (where the mai
 whole frame). pip time = `offset` + `speed` × main source time (`Pip.time`), so trims/splits never
 touch it and the inset can run at its own speed (a 4x timelapse in a frame); `edits.swap_pip` exchanges
 the two (mapping in/out/markers through offset/speed and keeping the piece's length),
-`edits.insert_pip(p, t, src, in, out, speed, layout, pos)` puts a video in a frame over the clip at
-timeline time `t` (splits the clip so the frame comes in at `t` and goes away when the in→out part
-ends); server `POST segments {kind: "pip", src, at_time, in, out, speed, layout: "corner:br"}`;
-CLI `vlog frame PROJ file --at 0:32 --in 0:05 --out 0:20 --speed 4`; the trimmer's target
-"In a frame over the clip at the playhead" uses it. Clip `speed` takes any positive number
+`edits.insert_pip(p, t, src, in, out, speed, layout, pos)` puts a video over the clip at
+timeline time `t` (splits the clip so it comes in at `t` and goes away when the in→out part ends; with no
+`out` the file's whole length is used, so it never runs past its footage); layout `full` = B-roll (the inset
+covers the picture: `box (0.5,0.5,1,1)`, rendered as a plain overlay with no mask/shadow) while the clip's
+sound carries on; `Pip.volume` (0 = silent, default) mixes the inset's own sound in, level-matched like a
+clip (`amix` after the clip's chain). Server `POST segments {kind: "pip", src, at_time, in, out, speed,
+layout: "full" | "corner:br", volume?}`; `PATCH segments/{id} {pip: {volume}}`; CLI `vlog frame PROJ file
+--at 0:32 --layout full [--in 0:05 --out 0:20 --speed 4 --sound 0.3]`, `vlog pip PROJ s3 --layout full
+--sound 0.5`; the trimmer's targets "Over the video at the playhead" (default label) and "In a small frame…"
+use it. When Kris says "put this clip over the video while I keep talking" → `--layout full` (sound off);
+"let me hear it a bit" → `--sound 0.3`. The live player holds the inset's last frame past its footage
+(`syncPip` clamps to `media.duration`) and never lets the full inset be dragged. Clip `speed` takes any positive number
 (GUI: log slider 0.1–1000× + typed number); above `render.MUTE_ABOVE` (20×) the clip's audio is
 dropped; the live player steps frames for clips faster than 16× (`VP.drive`). `edits.pip_layout(seg, corner|corner-large|stacked|hidden,
 (W, H), aspect, pos)` sets the standard layouts (the JS `pipLayoutBoxes` mirrors it). `render.py` places

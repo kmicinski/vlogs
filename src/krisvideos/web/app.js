@@ -242,11 +242,15 @@ const VP = (() => {
     if (!url) { box.classList.add('hidden'); box.dataset.seg = ''; if (!v.paused) v.pause(); return; }
     setSrc(v, url);
     // inset time = offset + inset speed × clip source time; it runs at its own speed on top of the clip's
-    const want = Math.max(0, (pip.offset || 0) + (pip.speed || 1) * ((s.in || 0) + (t - s.placed.start) * (s.speed || 1)));
-    v.muted = true;
-    drive(v, (s.speed || 1) * (pip.speed || 1), want, s.id);
+    let want = Math.max(0, (pip.offset || 0) + (pip.speed || 1) * ((s.in || 0) + (t - s.placed.start) * (s.speed || 1)));
+    const pd = pip.media && pip.media.duration;
+    if (pd) want = Math.min(want, Math.max(0, pd - 0.05));     // past its footage: hold the last frame (like the render), never seek past the end
+    const rate = (s.speed || 1) * (pip.speed || 1), full = pipIsFull(pip);
+    v.muted = !(pip.volume > 0) || !playing || rate > MUTE_ABOVE;
+    v.volume = clamp((pip.volume || 0) * opacity, 0, 1);
+    drive(v, rate, want, s.id);
     const [W, H] = canvasWH(), cr = $('#canvas').getBoundingClientRect();
-    box.className = `pipbox ${pip.shape || 'round'}${sel === s.id ? ' sel' : ''}`;
+    box.className = `pipbox ${pip.shape || 'round'}${sel === s.id ? ' sel' : ''}${full ? ' full' : ''}`;
     box.style.borderRadius = pip.shape === 'circle' ? '50%' : pip.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width, cr.height) * 0.02)}px`;
     boxStyle(box, pip.box, W, H, pipAspect(pip.media), pip.shape);
     v.style.objectFit = pip.fit === 'contain' ? 'contain' : 'cover';
@@ -842,20 +846,22 @@ function renderInspector() {
 // picture in picture: the inset's layout (small / large corner, stacked, hidden), corner, shape, swap
 function pipInspectorHtml(s) {
   const pp = s.pip;
-  if (!pp) return `<div class="field"><label>Picture in picture</label><div class="inline"><button class="link" id="pipAdd">+ Put a video in a frame over this clip…</button><button class="link muted" id="pipLib" title="Pick a clip already in this project; in the trimmer choose “In a frame over the clip at the playhead”">from this project…</button></div></div>`;
+  if (!pp) return `<div class="field"><label>Video over this clip</label><div class="inline"><button class="link" id="pipAdd" title="B-roll: its picture replaces this clip's for as long as it runs; this clip's sound carries on">+ Put a video over this clip…</button><button class="link muted" id="pipLib" title="Pick a clip already in this project; in the trimmer choose “Over the video at the playhead”">from this project…</button></div></div>`;
   const [W, H] = canvasWH(), lay = pipLayoutOf(s), anchor = pipAnchorOf(s);
-  return `<div class="field"><label>Picture in picture</label>
+  return `<div class="field"><label>Video over this clip</label>
     <div class="insp-img">${pp.thumb_url ? `<img src="${pp.thumb_url}">` : ''}<span class="sub" title="${esc(pp.src)}">${esc(pp.src.replace(/^clips\//, ''))}${pp.missing ? ' <b style="color:var(--danger)">missing</b>' : ''}</span><span class="spacer"></span><button class="link" id="pipSwap" title="Show the inset big and this clip in the box instead">⇄ Swap</button><button class="link muted" id="pipRm">Remove</button></div>
     <div class="seg" id="pipLayout">${pipLayoutNames(W, H).map(([k, l]) => `<button data-k="${k}" class="${k === lay ? 'on' : ''}">${l}</button>`).join('')}</div>
-    ${!pp.hidden && !(s.box && pp.box[3] != null) ? `<div class="inline" style="margin-top:8px"><div class="grid9" id="pipPos">${POS9.map(p => `<button data-p="${p}" class="${p === anchor ? 'on' : ''}"></button>`).join('')}</div><span class="muted" style="font-size:11.5px;line-height:1.4">or drag it on the video;<br>drag a corner to resize</span></div>` : ''}
-    ${!pp.hidden ? `<div class="seg" id="pipShape" style="margin-top:8px"><button data-v="round" class="${pp.shape === 'round' ? 'on' : ''}">Rounded</button><button data-v="rect" class="${pp.shape === 'rect' ? 'on' : ''}">Square corners</button><button data-v="circle" class="${pp.shape === 'circle' ? 'on' : ''}">Circle</button></div>` : ''}
-    <div class="inline" style="margin-top:10px;align-items:flex-end"><div class="field" style="margin:0;flex:1"><label>Inset speed (on top of the clip's)</label>${speedControl('pipSpeed', pp.speed || 1)}</div><div class="field" style="margin:0;flex:0 0 86px"><label>Starts at (its own time)</label><input type="text" id="pipIn" value="${fmt((pp.offset || 0) + (pp.speed || 1) * (s.in || 0), 2)}" title="Where in its file the inset is when this clip starts"></div></div>
+    ${!pp.hidden && lay !== 'full' && !(s.box && pp.box[3] != null) ? `<div class="inline" style="margin-top:8px"><div class="grid9" id="pipPos">${POS9.map(p => `<button data-p="${p}" class="${p === anchor ? 'on' : ''}"></button>`).join('')}</div><span class="muted" style="font-size:11.5px;line-height:1.4">or drag it on the video;<br>drag a corner to resize</span></div>` : ''}
+    ${!pp.hidden && lay !== 'full' ? `<div class="seg" id="pipShape" style="margin-top:8px"><button data-v="round" class="${pp.shape === 'round' ? 'on' : ''}">Rounded</button><button data-v="rect" class="${pp.shape === 'rect' ? 'on' : ''}">Square corners</button><button data-v="circle" class="${pp.shape === 'circle' ? 'on' : ''}">Circle</button></div>` : ''}
+    <div class="inline" style="margin-top:10px;align-items:flex-end"><div class="field" style="margin:0;flex:1"><label>Its speed (on top of the clip's)</label>${speedControl('pipSpeed', pp.speed || 1)}</div><div class="field" style="margin:0;flex:0 0 86px"><label>Starts at (its own time)</label><input type="text" id="pipIn" value="${fmt((pp.offset || 0) + (pp.speed || 1) * (s.in || 0), 2)}" title="Where in its file the inset is when this clip starts"></div></div>
+    <div class="field" style="margin:10px 0 0"><label>Its sound</label><div class="inline"><input type="range" id="pipVol" min="0" max="1" step="0.05" value="${pp.volume || 0}" style="flex:1"><span class="muted" style="font-size:11px;flex:0 0 150px">${(pp.volume || 0) > 0 ? `mixed in at ${Math.round((pp.volume || 0) * 100)}%` : 'off: this clip\'s sound carries on'}</span></div></div>
   </div>`;
 }
 function bindPipInspector(s) {
   const lay = pipLayoutOf(s), anchor = pipAnchorOf(s);
-  if ($('#pipAdd')) $('#pipAdd').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'files' }); if (r.paths[0]) { await patchSeg(s.id, { pip: { clip: r.paths[0] }, pip_layout: 'corner:br' }); toast('Inset added: drag it on the video, or pick a layout'); } });
-  if ($('#pipLib')) $('#pipLib').onclick = () => { seek(s.placed.start, true); lsSet('kv.trWhere', 'frame'); openLibrary('clips'); };
+  if ($('#pipAdd')) $('#pipAdd').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'files' }); if (r.paths[0]) { await patchSeg(s.id, { pip: { clip: r.paths[0] }, pip_layout: 'full' }); toast('Video added over the clip — pick “Small inset” to put it in a frame instead'); } });
+  if ($('#pipLib')) $('#pipLib').onclick = () => { seek(s.placed.start, true); lsSet('kv.trWhere', 'over'); openLibrary('clips'); };
+  if ($('#pipVol')) $('#pipVol').onchange = e => patchSeg(s.id, { pip: { volume: +e.target.value } });
   bindSpeed('pipSpeed', v => patchSeg(s.id, { pip: { speed: v } }));
   if ($('#pipIn')) { $('#pipIn').onchange = e => patchSeg(s.id, { pip_in: e.target.value }); $('#pipIn').onkeydown = e => { if (e.key === 'Enter') e.target.blur(); }; }
   if ($('#pipSwap')) $('#pipSwap').onclick = () => patchSeg(s.id, { pip_swap: true });
@@ -1162,8 +1168,10 @@ function pipAnchorBox(w, pos, W, H, aspect, m = 0.04) {
   const hf = w * W / H * aspect, i = Math.max(0, POS9.indexOf(pos)), col = i % 3, row = Math.floor(i / 3);
   return [[m + w / 2, 0.5, 1 - m - w / 2][col], [m + hf / 2, 0.5, 1 - m - hf / 2][row], w, null].map(v => v == null ? null : +v.toFixed(4));
 }
+const pipIsFull = pp => !!(pp && !pp.hidden && pp.box && pp.box[3] != null && pp.box[2] >= 0.999 && pp.box[3] >= 0.999);   // B-roll: covers the picture
 function pipLayoutBoxes(name, pos, W, H, aspect) {   // -> { box: main clip's box or null, pip: inset box, shape }
   const portrait = H > W;
+  if (name === 'full') return { box: null, pip: [0.5, 0.5, 1, 1], shape: 'rect' };
   if (name === 'stacked') {
     if (!portrait) return { box: [0.69, 0.5, 0.62, 1], pip: [0.19, 0.5, 0.38, 1], shape: 'rect' };
     const hc = +(W / H).toFixed(4);
@@ -1172,10 +1180,11 @@ function pipLayoutBoxes(name, pos, W, H, aspect) {   // -> { box: main clip's bo
   const w = name === 'corner-large' ? (portrait ? 0.6 : 0.45) : (portrait ? 0.42 : 0.3);
   return { box: null, pip: pipAnchorBox(w, pos || 'br', W, H, aspect), shape: 'round' };
 }
-const pipLayoutNames = (W, H) => [['corner', 'Small inset'], ['corner-large', 'Large inset'], ['stacked', H > W ? 'Stacked' : 'Side by side'], ['hidden', 'Hide inset']];
+const pipLayoutNames = (W, H) => [['full', 'Over the picture'], ['corner', 'Small inset'], ['corner-large', 'Large inset'], ['stacked', H > W ? 'Stacked' : 'Side by side'], ['hidden', 'Hide']];
 function pipLayoutOf(s) {      // which standard layout a clip + inset currently is in ('' = custom)
   const pp = s.pip; if (!pp) return '';
   if (pp.hidden) return 'hidden';
+  if (pipIsFull(pp) && !s.box) return 'full';
   const [W, H] = canvasWH(), portrait = H > W;
   if (s.box && pp.box[3] != null) return 'stacked';
   if (pp.box[3] != null) return '';
@@ -1345,6 +1354,7 @@ function layerPointer(e, id) {
 $('#pipBox').addEventListener('pointerdown', e => {
   if (e.button !== 0 || !P) return;
   const box = $('#pipBox'), id = box.dataset.seg, s = P.timeline.find(x => x.id === id); if (!s || !s.pip) return;
+  if (pipIsFull(s.pip)) { if (sel !== id) select(id); return; }     // B-roll over the whole picture: nothing to drag
   e.preventDefault(); e.stopPropagation(); stop();
   if (sel !== id) select(id);
   const cr = $('#canvas').getBoundingClientRect(), cw = cr.width, ch = cr.height, [W, H] = canvasWH();
@@ -1437,7 +1447,7 @@ function openTrimmer(srcs, { segId = null } = {}) {
       <span id="trSel"></span>
       ${edit ? '' : `<span class="trspeed" title="Play the part at this speed and put it on the timeline at this speed (8× turns a minute into 7½ s)">${speedControl('trSpeed', 1)}<span id="trLen" class="muted"></span></span>`}
       <span class="spacer"></span>
-      ${edit ? '' : `<select id="trWhere" title="Where the part goes on the timeline"><option value="end" ${where === 'end' ? 'selected' : ''}>Add at the end</option><option value="playhead" ${where === 'playhead' ? 'selected' : ''}>Insert at the playhead</option><option value="frame" ${where === 'frame' ? 'selected' : ''}>In a frame over the clip at the playhead</option></select>`}
+      ${edit ? '' : `<select id="trWhere" title="Where the part goes on the timeline"><option value="end" ${where === 'end' ? 'selected' : ''}>Add at the end</option><option value="playhead" ${where === 'playhead' ? 'selected' : ''}>Insert at the playhead</option><option value="over" ${where === 'over' ? 'selected' : ''}>Over the video at the playhead (its sound stays off)</option><option value="frame" ${where === 'frame' ? 'selected' : ''}>In a small frame over the clip at the playhead</option></select>`}
     </div>
     <div class="foot">
       ${edit ? `<span class="muted trhint">Drag the yellow handles, or play and press I / O.</span><span class="spacer"></span><button class="pill" id="trCancel">Cancel</button><button class="pill primary" id="trApply">Update clip <kbd>⏎</kbd></button>`
@@ -1591,7 +1601,8 @@ async function trAdd(more = false) {
   const where = $('#trWhere') ? $('#trWhere').value : 'end', it = trItem();
   const body = { kind: 'clip', ...trBody({ src: TR.src, in: TR.in, out: TR.out, speed: TR.speed, dur: TR.dur }) };
   if (where === 'playhead') body.at_time = T;
-  if (where === 'frame') { body.kind = 'pip'; body.at_time = T; body.in = +TR.in.toFixed(3); body.out = +TR.out.toFixed(3); body.layout = 'corner:' + lsGet('kv.recPos', 'br'); }
+  const over = where === 'over' || where === 'frame';
+  if (over) { body.kind = 'pip'; body.at_time = T; body.in = +TR.in.toFixed(3); body.out = +TR.out.toFixed(3); body.speed = TR.speed || 1; body.layout = where === 'over' ? 'full' : 'corner:' + lsGet('kv.recPos', 'br'); }
   trPause();
   await guard(async () => {
     const p = await api('POST', `/api/projects/${P.name}/segments`, body);
@@ -1599,7 +1610,7 @@ async function trAdd(more = false) {
     if (it) { it.seen = true; it.take = false; }       // it is on the timeline already, not waiting in the queue
     const ns = p.new_id && p.timeline.find(x => x.id === p.new_id);
     if (where === 'playhead' && ns && ns.placed) { T = ns.placed.end; updatePlayhead(); }   // the next part lands after this one
-    if (where === 'frame' && ns) { select(ns.id); T = ns.placed.end; updatePlayhead(); toast('In a frame over the clip — set its speed and corner in the inspector, or drag it on the video'); trAdvance(); return; }
+    if (over && ns) { select(ns.id); T = ns.placed.end; updatePlayhead(); toast(where === 'over' ? `Over the video for ${fmt(ns.placed.duration)} — the clip's sound carries on; its own sound and speed are in the inspector` : 'In a frame over the clip — set its speed and corner in the inspector, or drag it on the video'); trAdvance(); return; }
     toast(`Added ${fmt((TR.out - TR.in) / (TR.speed || 1))} to the timeline${(TR.speed || 1) !== 1 ? ` at ${fmtSpeed(TR.speed)}` : ''}`);
     if (more) { const from = TR.out >= TR.dur - 0.1 ? 0 : TR.out; TR.in = from; TR.out = TR.dur; trSave(); trSeek(from); trLoadUsed(); trQueueRender(); }
     else trAdvance();
@@ -1626,8 +1637,8 @@ async function trAddAll() {
   trPause();
   await guard(async () => {
     let p;
-    if (where === 'frame') {       // frames are placed one by one (each splits the clip under the playhead)
-      for (const it of items) { p = await api('POST', `/api/projects/${P.name}/segments`, { kind: 'pip', at_time: T, in: it.in, out: it.out == null ? it.dur : it.out, speed: it.speed || 1, src: it.src, layout: 'corner:' + lsGet('kv.recPos', 'br') }); const ns = p.timeline.find(x => x.id === p.new_id); if (ns) T = ns.placed.end; }
+    if (where === 'frame' || where === 'over') {       // placed one by one, each after the last (each splits the clip under the playhead)
+      for (const it of items) { p = await api('POST', `/api/projects/${P.name}/segments`, { kind: 'pip', at_time: T, in: it.in, out: it.out == null ? it.dur : it.out, speed: it.speed || 1, src: it.src, layout: where === 'over' ? 'full' : 'corner:' + lsGet('kv.recPos', 'br') }); const ns = p.timeline.find(x => x.id === p.new_id); if (ns) T = ns.placed.end; }
     } else {
       const body = { items: items.map(trBody) }; if (where === 'playhead') body.at_time = T;
       p = await api('POST', `/api/projects/${P.name}/segments/batch`, body);

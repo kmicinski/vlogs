@@ -176,13 +176,14 @@ class Pip:
     shape: str = "round"                    # round | rect | circle
     hidden: bool = False                    # keep it but don't show it (the clip fills the frame)
     speed: float = 1.0                      # the inset's own speed, on top of the clip's (a 4x timelapse in a frame)
+    volume: float = 0.0                     # the inset's own sound mixed in: 0 = silent (the clip's sound carries on), 1 = full
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pip":
         return cls(src=str(d.get("clip") or d.get("src")), offset=float(parse_time(d.get("offset", 0) or 0)),
                    box=box4(d.get("box")) or (0.82, 0.84, 0.3, None), fit=str(d.get("fit") or "cover"),
                    shape=str(d.get("shape") or "round"), hidden=bool(d.get("hidden", False)),
-                   speed=max(0.01, float(d.get("speed", 1.0) or 1.0)))
+                   speed=max(0.01, float(d.get("speed", 1.0) or 1.0)), volume=max(0.0, float(d.get("volume", 0.0) or 0.0)))
 
     def time(self, src_t: float) -> float:
         """The inset file's time at main-clip source time `src_t`."""
@@ -201,6 +202,8 @@ class Pip:
             d["shape"] = self.shape
         if self.hidden:
             d["hidden"] = True
+        if self.volume:
+            d["volume"] = self.volume
         return d
 
 

@@ -363,6 +363,9 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 .pipbox.circle { border-radius: 50% !important; }
 #pipBox { z-index: 1; cursor: move; pointer-events: auto; }
 #pipBox.sel { outline: 2px solid var(--accent); outline-offset: 2px; }
+#pipBox.full { cursor: default; box-shadow: none; }
+#pipBox.full.sel { outline-offset: -3px; }
+#pipBox.full .rz { display: none !important; }
 #pipBox .rz { position: absolute; width: 14px; height: 14px; background: #fff; border: 2px solid var(--accent); border-radius: 4px; display: none; z-index: 1; }
 #pipBox.sel .rz { display: block; }
 #pipBox .rz.tl { left: 0; top: 0; cursor: nwse-resize; } #pipBox .rz.br { right: 0; bottom: 0; cursor: nwse-resize; }

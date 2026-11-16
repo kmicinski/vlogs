@@ -107,12 +107,12 @@ for that spot (they're placed one after another from the marker), or jump betwee
   *Stacked* (portrait: you in a square on top, the screen below; landscape: side by side) or
   *Screen only*. The screen and the camera are recorded as **two synced clips**, so the layout
   is only a starting point: select the clip afterwards and change it in the inspector
-  (*Picture in picture*: small / large inset, corner, stacked, hide, rounded / square / circle,
+  (*Video over this clip*: over the picture, small / large inset, corner, stacked, hide, rounded / square / circle,
   **⇄ Swap** to make the other one big), or drag the inset around on the video and pull a
   corner to resize it. Split the clip (`S`) to change the layout partway through. Tick
   *include computer sound* to record what the Mac is playing along with your mic (if the
-  share offers it). Any clip can get an inset: *+ Put a video in a frame over this clip…*, or
-  pick a clip from *+ Add ▸ In this project* and choose **In a frame over the clip at the
+  share offers it). Any clip can get a video over it: *+ Put a video over this clip…*, or
+  pick a clip from *+ Add ▸ In this project* and choose **Over the video at the playhead** (B-roll: its picture replaces the clip's for as long as it runs while the clip's sound carries on; *Its sound* in the inspector mixes its own in) or **In a small frame over the clip at the
   playhead** in the trimmer: the clip under the playhead is split so the frame comes in there and
   goes away when the framed part ends. The inset has its own **speed** on top of the clip's (a 4×
   timelapse in a corner while you talk) and a *Starts at* time in its own file.
@@ -234,7 +234,8 @@ vlog set PROJ s3 channel=right             # one-channel mic: right (or left) to
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
 vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos br] [--shape round|rect|circle] [--speed 4] [--in 0:05] [--swap] [--rm]
                                            a clip in a box over s3 (picture in picture); --swap makes the inset the big one
-vlog frame PROJ clip.mp4 --at 0:32 [--in 0:05 --out 0:20] [--speed 4] [--pos tl]   video in a frame over the clip at 0:32, for its in→out part
+vlog frame PROJ clip.mp4 --at 0:32 --layout full [--in 0:05 --out 0:20] [--speed 4] [--sound 0.3]   B-roll: the video over the clip at 0:32 for its in→out part; the clip's sound carries on (--sound mixes its own in)
+vlog frame PROJ clip.mp4 --at 0:32 [--pos tl]      the same in a small frame (picture in picture)
 vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --at v1 to remove)
 vlog sting PROJ song.mp3 --from s1 --to s3 [--start 0:06.5] [--volume 0.7] [--loop] [--credit "Music: …" --credit-pos tr]
 vlog sting PROJ song.mp3 --range 0:32 1:10 | --whole   music over that stretch (clips split at both ends) / the whole vlog

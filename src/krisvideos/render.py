@@ -320,7 +320,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             filters.append(f"[{k}:v]{','.join(vchain)}[vb{i}]")
             cur = f"vb{i}"
             # picture in picture: a second clip in a box over this one, in sync (pip time = source time + offset)
-            pip, pinfo = s.pip, None
+            pip, pinfo, pip_audio = s.pip, None, None
             if pip and not pip.hidden:
                 ppath = p.resolve(pip.src)
                 if not ppath.exists():
@@ -335,6 +335,9 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 pin = pip.time(pl.src_in)
                 seek = ["-ss", f"{pin:.3f}"] if pin > 0 else []
                 kp = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
+                if pip.volume > 0 and pinfo.has_audio and rate <= MUTE_ABOVE:
+                    pip_audio = (kp, pin, rate, pip.volume)       # mixed into the clip's sound below
+                full = px <= 0 and py <= 0 and px + pw >= W and py + ph >= H     # B-roll: covers the picture
                 pchain = ["setpts=PTS-STARTPTS"]
                 if pin < 0:            # the inset's file starts after the clip's in point: hold its first frame until then
                     pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
@@ -350,7 +353,11 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     pchain.append(f"scale={pw}:{ph}:force_original_aspect_ratio=increase:flags=bicubic,crop={pw}:{ph}")
                 pchain.append(f"setsar=1,format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
                 radius = max(2, int(min(W, H) * 0.02))
-                if pip.shape in ("round", "circle"):
+                if full:                       # no mask, no shadow: the inset simply replaces the picture
+                    filters.append(f"[{kp}:v]{','.join(pchain)}[pa{i}]")
+                    filters.append(f"[{cur}][pa{i}]overlay=0:0:eof_action=repeat[pp{i}]")
+                    cur = f"pp{i}"
+                elif pip.shape in ("round", "circle"):
                     km = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
                                     "-i", str(titles.render_pip_mask(p.cache_dir, pw, ph, pip.shape, radius))])
                     filters.append(f"[{kp}:v]{','.join(pchain)}[pv{i}]")
@@ -358,12 +365,13 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     filters.append(f"[pv{i}][pm{i}]alphamerge[pa{i}]")
                 else:
                     filters.append(f"[{kp}:v]{','.join(pchain)}[pa{i}]")
-                ks = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
-                                "-i", str(titles.render_pip_shadow(p.cache_dir, W, H, px, py, pw, ph, pip.shape, radius))])
-                filters.append(f"[{cur}][{ks}:v]overlay=0:0:eof_action=pass[ps{i}]")
-                # eof_action=repeat: if the inset's file ends early its last frame stays up
-                filters.append(f"[ps{i}][pa{i}]overlay={px}:{py}:eof_action=repeat[pp{i}]")
-                cur = f"pp{i}"
+                if not full:
+                    ks = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
+                                    "-i", str(titles.render_pip_shadow(p.cache_dir, W, H, px, py, pw, ph, pip.shape, radius))])
+                    filters.append(f"[{cur}][{ks}:v]overlay=0:0:eof_action=pass[ps{i}]")
+                    # eof_action=repeat: if the inset's file ends early its last frame stays up
+                    filters.append(f"[ps{i}][pa{i}]overlay={px}:{py}:eof_action=repeat[pp{i}]")
+                    cur = f"pp{i}"
             # captions/overlays
             ovs = list(s.overlays)
             if s.caption:
@@ -384,7 +392,8 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     f"[{cur}][ov{i}_{j}]overlay=0:0:eof_action=pass:enable='between(t,{a:.3f},{b:.3f})'[vo{i}_{j}]")
                 cur = f"vo{i}_{j}"
             filters.append(f"[{cur}]settb=AVTB[v{i}]")
-            # audio
+            # audio (the clip's own; an inset's sound, if it has any turned on, is mixed in after)
+            a_main = f"a{i}m" if pip_audio else f"a{i}"
             if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
                 achain = ["asetpts=PTS-STARTPTS"]
                 ch = media.effective_channel(src, p.cache_dir, s.channel)
@@ -405,9 +414,25 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 if polished:
                     achain.append(media.VOICE_LIMITER)
                 achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
-                filters.append(f"[{k}:a]{','.join(achain)}[a{i}]")
+                filters.append(f"[{k}:a]{','.join(achain)}[{a_main}]")
             else:
-                filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
+                filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[{a_main}]")
+            if pip_audio:
+                kp, pin, rate, vol = pip_audio
+                pch = ["asetpts=PTS-STARTPTS"]
+                if pin < 0:
+                    pch.append(f"adelay={int(-pin * 1000)}:all=1")
+                pch_ = media.effective_channel(ppath, p.cache_dir, "auto")
+                if pch_ in media.CHANNEL_PAN:
+                    pch.append(media.CHANNEL_PAN[pch_])
+                if rate != 1.0:
+                    pch.append(_atempo(rate))
+                # level-matched like a clip (ambient sound under the picture sits at `vol` of the target level)
+                plufs = media.measure_loudness(ppath, p.cache_dir, pch_) if p.audio.match_levels else None
+                pgain = media.level_gain_db(plufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
+                pch += [AUDIO_FMT, f"volume={vol:.3f}*{10 ** (pgain / 20):.4f}", f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}"]
+                filters.append(f"[{kp}:a]{','.join(pch)}[ap{i}]")
+                filters.append(f"[{a_main}][ap{i}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a{i}]")
         v_labels.append(f"v{i}")
         a_labels.append(f"a{i}")
 

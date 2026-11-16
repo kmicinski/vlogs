@@ -305,7 +305,7 @@ def create_app(cfg: Config) -> FastAPI:
         except Exception:
             info = None
         st = media.media_status(p, pip.src)
-        return {"src": pip.src, "offset": pip.offset, "speed": pip.speed, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
+        return {"src": pip.src, "offset": pip.offset, "speed": pip.speed, "volume": pip.volume, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
                 "hidden": pip.hidden, "media": info.to_dict() if info else None, "missing": info is None,
                 "proxy_url": media_url(p, f"cache/{Path(pip.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, pip.src) if media.browser_playable(info) else None),
                 "thumb_url": media_url(p, f"cache/{Path(pip.src).name}.thumb.jpg") if st["thumb"] else None,
@@ -686,6 +686,8 @@ def create_app(cfg: Config) -> FastAPI:
                 seg = edits.insert_pip(p, float(t), src, parse_time(body.get("in") or 0),
                                        None if body.get("out") in (None, "") else parse_time(body["out"]),
                                        float(body.get("speed") or 1.0), lay, pos or None, aspect)
+                if body.get("volume") not in (None, "") and seg.pip:
+                    seg.pip.volume = max(0.0, float(body["volume"]))
             except ValueError as e:
                 raise HTTPException(400, str(e))
             commit(p)

@@ -143,7 +143,8 @@ def swap_pip(seg: Segment) -> None:
 
 def insert_pip(p: Project, t: float, src: str, in_: float = 0.0, out: float | None = None, speed: float = 1.0,
                layout: str = "corner", pos: str | None = None, pip_aspect: float = 9 / 16) -> Segment:
-    """Put a video in a frame over the clip at output time `t`: the clip is split there so the inset
+    """Put a video over the clip at output time `t` (layout "full": B-roll covering the picture while the
+    clip's sound carries on; "corner"…: in a frame): the clip is split there so the inset
     comes in at `t`, and split again where the inset's part ends (out - in, at its `speed`) so the
     frame goes away after it. `in_`/`out` are the inset file's own times. Returns the clip segment
     that now carries the inset (the caller sets the layout size/corner from the canvas)."""
@@ -161,6 +162,12 @@ def insert_pip(p: Project, t: float, src: str, in_: float = 0.0, out: float | No
     main = pl.seg if off < 0.25 else split_segment(p, pl, off)
     layout_ = render.compute_layout(p)
     mpl = next(q for q in layout_.placed if q.seg is main)
+    if out is None:                                     # the whole file: the frame still ends when its footage does
+        try:
+            from .probe import probe
+            out = probe(p.resolve(src), p.cache_dir).duration or None
+        except Exception:
+            out = None
     if out is not None and out > in_:
         length = (out - in_) / speed                    # output seconds the inset has footage for
         if mpl.duration - length >= 0.25 and length >= 0.25:
@@ -170,7 +177,7 @@ def insert_pip(p: Project, t: float, src: str, in_: float = 0.0, out: float | No
     return main
 
 
-PIP_LAYOUTS = ("corner", "corner-large", "stacked", "hidden")
+PIP_LAYOUTS = ("corner", "corner-large", "stacked", "full", "hidden")
 PIP_POSITIONS = ("tl", "t", "tr", "l", "c", "r", "bl", "b", "br")
 
 
@@ -179,6 +186,8 @@ def pip_layout(seg: Segment, name: str, canvas: tuple[int, int], pip_aspect: flo
     corner / corner-large: the clip fills the frame, the inset sits in a corner (`pos`: tl … br).
     stacked: on a portrait canvas the inset is a square across the top and the clip sits below it;
     on a landscape canvas the inset is a tall column on the left and the clip fills the right.
+    full: the inset covers the whole frame (B-roll over the clip: its picture replaces the clip's while
+    the clip's sound carries on).
     hidden: the clip fills the frame and the inset is kept but not shown."""
     pip = seg.pip
     if pip is None:
@@ -190,6 +199,10 @@ def pip_layout(seg: Segment, name: str, canvas: tuple[int, int], pip_aspect: flo
         seg.box = None
         return
     pip.hidden = False
+    if name == "full":
+        seg.box = None
+        pip.box, pip.fit, pip.shape = (0.5, 0.5, 1.0, 1.0), "cover", "rect"
+        return
     if name == "stacked":
         if portrait:
             hc = round(W / H, 4)                       # a square: as tall (in frame fractions) as it is wide
