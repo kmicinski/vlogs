@@ -85,7 +85,7 @@ async function loadProjects(selectName) {
   const list = await api('GET', '/api/projects');
   if (!list.length) { $('#welcome').classList.remove('hidden'); $('#app').classList.add('hidden'); $('#projTitle').textContent = 'KrisVideos'; return; }
   $('#welcome').classList.add('hidden'); $('#app').classList.remove('hidden');
-  const name = selectName || localStorage.getItem('kv.project') || list[0].name;
+  const name = selectName || new URLSearchParams(location.search).get('project') || localStorage.getItem('kv.project') || list[0].name;
   await openProject(list.some(p => p.name === name) ? name : list[0].name);
 }
 async function openProject(name) {
@@ -517,34 +517,49 @@ function renderRuler() {
 }
 function renderTimeline() {
   if (TL.dragging) { TL.pending = true; return; }    // rebuilt when the drag ends
-  const track = $('#track');
-  $$('.block', track).forEach(b => b.remove());
+  // Stacked tracks, like an NLE: V2 pictures · V1 the clips (filmstrips) · A1 the clips' own sound
+  // (waveforms, one block per clip, selected together) · voice · music. Thin, no file names: the
+  // picture is the label; details live in the inspector and the hover title.
+  const track = $('#track'), atrack = $('#atrack');
+  $$('.block, .tlbl', track).forEach(b => b.remove()); atrack.innerHTML = '';
   $('#tlEmpty').classList.toggle('hidden', !!P.timeline.length);
   layoutTimeline();
   $('#tlInner').style.width = `${TL.W}px`;
   renderRuler();
+  track.insertAdjacentHTML('afterbegin', trackLabel('V1', 'Video: the clips in order'));
+  atrack.innerHTML = trackLabel('A1', "Audio: each clip's own sound");
   for (const blk of TL.blocks) {
     const s = blk.s, b = document.createElement('div');
     const w = Math.max(6, blk.x1 - blk.x0 - TL_GAP);
     b.className = `block ${s.kind}${s.missing ? ' missing' : ''}${s.id === sel ? ' selected' : ''}${s.kind === 'clip' && !s.missing && !s.proxy_url ? ' pending' : ''}`;
     b.style.left = `${blk.x0}px`; b.style.width = `${w}px`; b.dataset.id = s.id; b.draggable = true;
     const xf = s.placed.transition !== 'cut' ? '<div class="xf"></div>' : '';
-    const meta = `<div class="meta">${fmt(s.placed.duration)}${s.speed && s.speed !== 1 ? ` ${fmtSpeed(s.speed)}` : ''}${s.mute ? ' 🔇' : ''}${s.fit === 'cover' ? ' ⤢' : ''}${s.pip && !s.pip.hidden ? ' ⧉' : ''}</div>`;
+    const flags = `${s.speed && s.speed !== 1 ? ` ${fmtSpeed(s.speed)}` : ''}${s.fit === 'cover' ? ' ⤢' : ''}${s.pip && !s.pip.hidden ? ' ⧉' : ''}`;
+    const meta = w > 44 ? `<div class="meta">${fmt(s.placed.duration)}${flags}</div>` : '';
     if (s.kind === 'title') {
       const black = !s.title && !s.image && (s.bg || '').toLowerCase() === '#000000';
       b.classList.toggle('img', !!s.image_url); b.classList.toggle('black', black);
       b.style.background = s.bg && !s.image_url ? s.bg : ''; b.style.color = s.fg ? s.fg : '';
-      const lbl = s.title || (s.image ? s.image.replace(/^assets\//, '') : black ? 'black' : 'card');
+      const lbl = s.title || (s.image ? s.image.replace(/^assets\//, '') : black ? '' : 'card');
       b.innerHTML = `${s.image_url ? `<img class="strip" src="${s.image_url}" draggable="false">` : ''}${xf}${w > 64 ? meta : ''}<div class="lbl">${esc(lbl)}</div>`;
+      b.title = `${lbl || 'black'} · ${fmt(s.placed.duration)}`;
     } else {
       const m = s.media || {}; const ar = m.width && m.height ? m.width / m.height : 16 / 9;
-      const n = clamp(Math.ceil(w / (64 * ar)), 1, 60);
+      const n = clamp(Math.ceil(w / (V1_H * ar)), 1, 80);
       const q = `src=${encodeURIComponent(s.clip)}&start=${s.placed.src_in}&end=${s.placed.src_out}`;
-      const strip = s.proxy_url ? `<img class="strip" src="/api/projects/${P.name}/strip?v=2&${q}&n=${n}&h=64" draggable="false">` : (s.thumb_url ? `<img class="strip" src="${s.thumb_url}" draggable="false">` : '');
-      const wave = (s.proxy_url && m.has_audio && !s.mute && w > 24) ? `<img class="wave" src="/api/projects/${P.name}/wave?${q}&w=${Math.ceil(w / 50) * 50}&h=20&color=ffffff" draggable="false">` : '';
+      const strip = s.proxy_url ? `<img class="strip" src="/api/projects/${P.name}/strip?v=2&${q}&n=${n}&h=${V1_H}" draggable="false">` : (s.thumb_url ? `<img class="strip" src="${s.thumb_url}" draggable="false">` : '');
       const mks = segMarkers(s).map(mk => `<i class="mk" style="left:${tToX(mk.t) - blk.x0}px"></i>`).join('');
-      b.innerHTML = `${strip}${wave}${xf}${mks}${meta}${s.caption ? `<div class="cap">${esc(s.caption)}</div>` : ''}<div class="lbl">${esc(s.clip.replace(/^clips\//, ''))}</div><div class="handle l"></div><div class="handle r"></div>`;
-      b.title = 'Double-click to re-trim against the whole clip';
+      b.innerHTML = `${strip}${xf}${mks}${meta}${s.caption ? `<div class="cap">${esc(s.caption)}</div>` : ''}<div class="handle l"></div><div class="handle r"></div>`;
+      b.title = `${s.clip.replace(/^clips\//, '')} · ${fmt(s.placed.duration)}${flags} · double-click to re-trim against the whole clip`;
+      // its sound, on the audio track: silent when muted, too fast to keep speech, or without a track
+      const a = document.createElement('div'), silent = !!s.mute || !m.has_audio || (s.speed || 1) > MUTE_ABOVE;
+      a.className = `ablk${silent ? ' silent' : ''}${s.id === sel ? ' selected' : ''}`; a.dataset.id = s.id;
+      a.style.left = `${blk.x0}px`; a.style.width = `${w}px`;
+      a.innerHTML = (!silent && s.proxy_url && w > 10) ? `<img src="/api/projects/${P.name}/wave?${q}&w=${Math.ceil(w / 50) * 50}&h=${A1_H}&color=ffffff" draggable="false">` : '';
+      a.title = silent ? (s.mute ? 'Muted' : !m.has_audio ? 'No sound in this clip' : 'Silent: faster than ' + MUTE_ABOVE + '×') : `${s.clip.replace(/^clips\//, '')} · sound${s.polished ? ' · voice polished' : ''}`;
+      a.onclick = e => { select(s.id); seek(xToT(contentX(e)), true); };
+      a.ondblclick = e => { if (!s.missing) { e.preventDefault(); openTrimmer([s.clip], { segId: s.id }); } };
+      atrack.appendChild(a);
     }
     b.onclick = e => { if (e.target.classList.contains('handle')) return; select(s.id); seek(xToT(contentX(e)), true); };
     b.ondblclick = e => { if (s.kind === 'clip' && !s.missing) { e.preventDefault(); openTrimmer([s.clip], { segId: s.id }); } };
@@ -558,13 +573,15 @@ function renderTimeline() {
   track.ondragover = e => e.preventDefault(); track.ondrop = e => { if (e.target === track) onDrop(e, null); };
   renderImageLane(); renderLanes(); renderMarks(); updatePlayhead();
 }
+const V1_H = 40, A1_H = 20;    // px: the video and audio track heights (style.css #track / #atrack)
+const trackLabel = (name, tip) => `<i class="tlbl" title="${esc(tip)}">${name}</i>`;
 function renderLanes() {
   const lanes = $('#lanes'); lanes.innerHTML = '';
   const W = TL.W, tot = Math.max(total(), 1);
   const place = (el, a, b) => { const x0 = tToX(a), w = Math.max(14, tToX(b) - x0); el.style.left = `${x0}px`; el.style.width = `${w}px`; return w; };
   const vos = P.voiceovers || [];
   if (vos.length) {
-    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = '<span class="lanelbl">voice</span>';
+    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = trackLabel('VO', 'Narration recorded over the clips');
     for (const v of vos) {
       const d = document.createElement('div'); d.className = 'vo' + (v.id === selVo ? ' selected' : ''); const w = place(d, v.at, v.at + (v.duration || 1));
       d.innerHTML = `${v.url ? `<img src="/api/projects/${P.name}/wave?src=${encodeURIComponent(v.file)}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>${fmt(v.duration || 0)}</span>`;
@@ -574,7 +591,7 @@ function renderLanes() {
   }
   const stings = (P.stings || []).filter(m => m.at != null);
   if (stings.length) {
-    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = '<span class="lanelbl">music</span>';
+    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = trackLabel('M', 'Music');
     for (const m of stings) {
       const d = document.createElement('div'); d.className = 'st' + (m.id === selSting ? ' selected' : ''); const w = place(d, m.at, m.end);
       d.title = `${m.file.split('/').pop()} · from ${fmt(m.start || 0)} in the song${m.loop ? ' · repeats' : ''}${m.credit ? ' · shows a credit' : ''}`;
@@ -584,7 +601,7 @@ function renderLanes() {
     lanes.appendChild(l);
   }
   if (P.music && P.music.file) {
-    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`;
+    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = trackLabel('M', 'Music under everything');
     const d = document.createElement('div'); d.className = 'mu' + (selMusic ? ' selected' : '');
     // the waveform image is linear in time, so it only lines up with a linear timeline
     d.innerHTML = `${TL.log ? '' : `<img src="/api/projects/${P.name}/wave?src=music&start=${P.music.start || 0}&end=${(P.music.start || 0) + tot}&w=${Math.ceil(W / 100) * 100}&h=16&color=ffffff">`}<span>♫ ${esc(P.music.file.split('/').pop())} · ${Math.round(P.music.volume * 100)}%${P.music.duck ? ' · ducks under speech' : ''}</span>`;
@@ -1269,18 +1286,19 @@ document.addEventListener('paste', e => {
   e.preventDefault(); uploadImages(files, T);
 });
 function renderImageLane() {
-  const lane = $('#imgLane'), imgs = P.images || [], ROW = 28;
+  const lane = $('#imgLane'), imgs = P.images || [], ROW = 18;
   const rows = [], rowOf = new Map();       // overlapping pictures get their own rows
   for (const L of [...imgs].sort((a, b) => a.at - b.at)) { let r = rows.findIndex(end => end <= L.at + 1e-3); if (r < 0) { r = rows.length; rows.push(0); } rows[r] = L.at + L.duration; rowOf.set(L.id, r); }
   const marks = allMarkers();
-  lane.style.width = `${TL.W}px`; lane.style.height = imgs.length ? `${rows.length * ROW + 4}px` : '24px';
-  lane.innerHTML = imgs.length ? '' : marks.length ? '' : '<div class="lanehint">Pictures over the video go here: drop or paste one (⌘V), or + Add ▸ Picture</div>';
+  lane.style.width = `${TL.W}px`; lane.style.height = imgs.length ? `${rows.length * ROW + 2}px` : '14px';
+  lane.innerHTML = trackLabel('V2', 'Pictures over the video: drop or paste one (⌘V), or + Add ▸ Picture');
+  lane.title = imgs.length ? '' : 'Pictures over the video go here: drop or paste one (⌘V), or + Add ▸ Picture';
   for (const L of imgs) {
     const d = document.createElement('div');
     d.className = 'imgblk' + (L.id === selImg ? ' selected' : '') + (L.missing ? ' missing' : ''); d.dataset.id = L.id;
     const place = (a, b) => { const x0 = tToX(a); d.style.left = `${x0}px`; d.style.width = `${Math.max(22, tToX(b) - x0)}px`; };
-    place(L.at, L.at + L.duration); d.style.top = `${2 + rowOf.get(L.id) * ROW}px`;
-    d.innerHTML = `${L.url ? `<img src="${L.url}" draggable="false">` : ''}<span>${fmt(L.duration)} · ${sizeName(L)}</span><div class="eh l"></div><div class="eh r"></div>`;
+    place(L.at, L.at + L.duration); d.style.top = `${1 + rowOf.get(L.id) * ROW}px`;
+    d.innerHTML = `${L.url ? `<img src="${L.url}" draggable="false">` : ''}<span>${fmt(L.duration)}</span><div class="eh l"></div><div class="eh r"></div>`;
     d.title = `${L.file.split('/').pop()}: drag to move, drag an end to change how long it shows`;
     dragOn(d, {
       down: e => { stop(); const eh = e.target.closest('.eh'); selectImage(L.id, { seekInto: false }); return { edge: eh ? (eh.classList.contains('l') ? 'l' : 'r') : null, x: e.clientX, a: L.at, b: L.at + L.duration, ph: T, moved: false }; },

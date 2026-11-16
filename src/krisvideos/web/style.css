@@ -113,21 +113,27 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 #rangeLbl { color: #8a5a00; font-weight: 600; margin-right: 2px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 #tl { position: relative; overflow-x: auto; overflow-y: hidden; padding: 0 8px 4px; }
 #tlInner { position: relative; min-width: 100%; }
-#ruler { position: relative; height: 22px; cursor: ew-resize; color: var(--muted); font-size: 10px; font-variant-numeric: tabular-nums; user-select: none; touch-action: none; border-bottom: 1px solid var(--line); }
-#ruler .tick { position: absolute; bottom: 0; height: 7px; border-left: 1px solid #c9c9ce; pointer-events: none; }
-#ruler .tick.minor { height: 4px; border-left-color: #dfdfe4; }
+#ruler { position: relative; height: 16px; cursor: ew-resize; color: var(--muted); font-size: 9.5px; font-variant-numeric: tabular-nums; user-select: none; touch-action: none; border-bottom: 1px solid var(--line); }
+#ruler .tick { position: absolute; bottom: 0; height: 5px; border-left: 1px solid #c9c9ce; pointer-events: none; }
+#ruler .tick.minor { height: 3px; border-left-color: #dfdfe4; }
 #ruler .tick.edge { height: 100%; border-left-color: #b4b4bb; }
-#ruler .lab { position: absolute; top: 2px; padding-left: 4px; line-height: 12px; white-space: nowrap; pointer-events: none; }
+#ruler .lab { position: absolute; top: 1px; padding-left: 3px; line-height: 11px; white-space: nowrap; pointer-events: none; }
+/* track labels (V2 · V1 · A1 · VO · M) stay at the left edge while the timeline scrolls */
+.tlbl { position: sticky; left: 0; display: inline-block; vertical-align: top; z-index: 3; font-size: 8.5px; font-weight: 700; letter-spacing: .06em; color: #8a8a92; line-height: 12px; padding: 0 4px 0 3px; margin-top: 1px; background: rgba(255,255,255,.82); border-radius: 0 3px 3px 0; pointer-events: auto; cursor: default; }
 #hoverTime { position: absolute; top: 2px; transform: translateX(-50%); background: #1d1d1f; color: #fff; border-radius: 4px; padding: 0 5px; line-height: 15px; pointer-events: none; z-index: 6; white-space: nowrap; }
-#track { position: relative; height: 64px; margin-top: 4px; }
+#track { position: relative; height: 40px; margin-top: 2px; }
+#atrack { position: relative; height: 20px; margin-top: 1px; background: var(--surface2); border-radius: 3px; }
+.ablk { position: absolute; top: 0; height: 20px; border-radius: 3px; overflow: hidden; background: #2e7d61; cursor: pointer; user-select: none; outline: 0 solid var(--accent); transition: outline-width .08s; }
+.ablk img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .9; pointer-events: none; }
+.ablk.silent { background: repeating-linear-gradient(45deg, #dcdee3, #dcdee3 4px, #ebedf1 4px, #ebedf1 8px); }
+.ablk.selected { outline-width: 2px; z-index: 2; }
 #tlEmpty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); }
-.block { position: absolute; top: 0; height: 64px; border-radius: 8px; overflow: hidden; background: var(--clip-block); cursor: pointer; user-select: none; outline: 0 solid var(--accent); transition: outline-width .08s; }
+.block { position: absolute; top: 0; height: 40px; border-radius: 3px; overflow: hidden; background: var(--clip-block); cursor: pointer; user-select: none; outline: 0 solid var(--accent); transition: outline-width .08s; }
 .block.title { background: linear-gradient(135deg, #7a66d4, #5a47b3); color: #fff; }
 .block.missing { background: repeating-linear-gradient(45deg, #f3d0cc, #f3d0cc 8px, #f9e3e0 8px, #f9e3e0 16px); }
 .block.selected { outline-width: 2px; z-index: 2; }
 .block.dragover { outline: 2px dashed var(--accent); }
 .block .strip { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: left; pointer-events: none; }
-.block .wave { position: absolute; left: 0; right: 0; bottom: 0; height: 20px; width: 100%; opacity: .85; pointer-events: none; }
 .block.pending { background: linear-gradient(90deg, #e6e8ee 25%, #f2f3f6 50%, #e6e8ee 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
 @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
 .lane .vo img, .lane .mu img, .lane .st img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .7; pointer-events: none; }
@@ -137,33 +143,31 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 #dropHint { position: fixed; inset: 10px; border: 2px dashed var(--accent); border-radius: 16px; background: rgba(229,240,255,.85); display: flex; align-items: center; justify-content: center; font-size: 18px; font-weight: 600; color: var(--accent); z-index: 50; pointer-events: none; }
 .kbd-grid { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; align-items: center; font-size: 13px; }
 .kbd-grid kbd { font-size: 12px; padding: 2px 6px; justify-self: start; }
-.block .lbl { position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 7px; font-size: 11px; font-weight: 500; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.55)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-.block.title .lbl { background: none; font-size: 12px; bottom: auto; top: 50%; transform: translateY(-50%); text-align: center; color: inherit; }
+.block .lbl { position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%); padding: 0 5px; font-size: 10px; font-weight: 500; text-align: center; color: inherit; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
 .block.title.img { background: #222; }
-.block.title.img .lbl { bottom: 0; top: auto; transform: none; text-align: left; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.55)); }
+.block.title.img .lbl { bottom: 0; top: auto; transform: none; text-align: left; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.55)); padding-bottom: 1px; }
 .block.title.black { background: #111; color: #999; }
 .insp-img { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .insp-img img { width: 64px; height: 40px; object-fit: cover; border-radius: 6px; background: #ddd; }
-.block .meta { position: absolute; left: 6px; top: 4px; font-size: 10px; color: #fff; text-shadow: 0 1px 2px rgba(0,0,0,.6); pointer-events: none; }
-.block .cap { position: absolute; right: 6px; top: 4px; font-size: 10px; color: #fff; background: rgba(0,0,0,.45); padding: 1px 6px; border-radius: 6px; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-.block .xf { position: absolute; left: 0; top: 0; bottom: 0; width: 10px; background: linear-gradient(90deg, rgba(0,0,0,.35), transparent); pointer-events: none; }
-.handle { position: absolute; top: 0; bottom: 0; width: 10px; background: var(--accent); cursor: col-resize; opacity: .9; display: none; }
-.handle::after { content: ""; position: absolute; left: 4px; top: 22px; width: 2px; height: 20px; background: #fff; border-radius: 1px; }
-.handle.l { left: 0; border-radius: 8px 0 0 8px; } .handle.r { right: 0; border-radius: 0 8px 8px 0; }
+.block .meta { position: absolute; left: 2px; top: 2px; font-size: 9px; line-height: 12px; padding: 0 3px; border-radius: 3px; color: #fff; background: rgba(0,0,0,.5); font-variant-numeric: tabular-nums; white-space: nowrap; pointer-events: none; }
+.block .cap { position: absolute; right: 2px; top: 2px; font-size: 9px; line-height: 12px; color: #fff; background: rgba(0,0,0,.5); padding: 0 4px; border-radius: 3px; max-width: 60%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
+.block .xf { position: absolute; left: 0; top: 0; bottom: 0; width: 8px; background: linear-gradient(90deg, rgba(0,0,0,.4), transparent); pointer-events: none; }
+.handle { position: absolute; top: 0; bottom: 0; width: 7px; background: var(--accent); cursor: col-resize; opacity: .95; display: none; }
+.handle::after { content: ""; position: absolute; left: 2.5px; top: 12px; width: 2px; height: 16px; background: #fff; border-radius: 1px; }
+.handle.l { left: 0; border-radius: 3px 0 0 3px; } .handle.r { right: 0; border-radius: 0 3px 3px 0; }
 .block.selected .handle { display: block; }
-#lanes { display: flex; flex-direction: column; gap: 4px; margin-top: 4px; }
-.lane { position: relative; height: 20px; border-radius: 6px; background: var(--surface2); }
-.lane .lanelbl { position: absolute; left: 6px; top: 0; line-height: 20px; font-size: 10px; color: var(--muted); pointer-events: none; }
-.lane .vo, .lane .mu, .lane .st { position: absolute; top: 2px; height: 16px; border-radius: 4px; font-size: 10px; line-height: 16px; padding: 0 6px; color: #fff; white-space: nowrap; overflow: hidden; cursor: pointer; }
+#lanes { display: flex; flex-direction: column; gap: 1px; margin-top: 1px; }
+.lane { position: relative; height: 16px; border-radius: 3px; background: var(--surface2); }
+.lane .vo, .lane .mu, .lane .st { position: absolute; top: 1px; height: 14px; border-radius: 3px; font-size: 9px; line-height: 14px; padding: 0 4px; color: #fff; white-space: nowrap; overflow: hidden; cursor: pointer; }
 .lane .vo { background: var(--vo); } .lane .st { background: #b8632a; } .lane .mu { background: var(--music); left: 0; right: 0; }
 .lane .vo.selected, .lane .mu.selected, .lane .st.selected { outline: 2px solid var(--accent); }
 #playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); pointer-events: none; z-index: 5; }
 #ghost { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); opacity: .35; pointer-events: none; z-index: 4; }
-#playhead .head { position: absolute; top: 0; left: -6px; width: 14px; height: 18px; background: var(--danger); border-radius: 3px 3px 7px 7px; pointer-events: auto; cursor: grab; touch-action: none; }
+#playhead .head { position: absolute; top: 0; left: -5px; width: 12px; height: 15px; background: var(--danger); border-radius: 3px 3px 6px 6px; pointer-events: auto; cursor: grab; touch-action: none; }
 #playhead .head:active { cursor: grabbing; }
 /* marked range (in / out) */
 #range { position: absolute; top: 0; bottom: 0; background: rgba(255,184,0,.2); border-left: 3px solid #f0a000; border-right: 3px solid #f0a000; pointer-events: none; z-index: 4; box-shadow: inset 0 -3px 0 #f0a000; }
-#range::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 22px; background: rgba(255,184,0,.5); }
+#range::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 16px; background: rgba(255,184,0,.5); }
 #range.live { border-right-style: dashed; }
 #range.single { border-right: 0; background: none; }
 #range.single::before { display: none; }
@@ -301,16 +305,15 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 #recMicBadge { color: #fff; background: var(--danger); border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
 
 /* ---------- pictures over the video: the images lane (above the clips) and the player layer */
-#imgLane { position: relative; margin-top: 4px; border-radius: 6px; background: #fbeff5; }
-#imgLane .lanelbl { position: absolute; left: 6px; top: 7px; font-size: 10px; color: #c06d93; pointer-events: none; }
-#imgLane .lanehint { position: absolute; inset: 0; display: flex; align-items: center; padding-left: 8px; font-size: 11px; color: #b65a84; pointer-events: none; white-space: nowrap; overflow: hidden; }
-.imgblk { position: absolute; height: 26px; border-radius: 6px; background: #d6438a; color: #fff; overflow: hidden; cursor: grab; display: flex; align-items: center; gap: 6px; font-size: 10.5px; font-weight: 500; user-select: none; touch-action: none; box-shadow: 0 1px 2px rgba(0,0,0,.18); z-index: 1; }
+#imgLane { position: relative; margin-top: 2px; border-radius: 3px; background: #fbeff5; }
+#imgLane .tlbl { color: #c06d93; background: rgba(251,239,245,.9); }
+.imgblk { position: absolute; height: 16px; border-radius: 3px; background: #d6438a; color: #fff; overflow: hidden; cursor: grab; display: flex; align-items: center; gap: 4px; font-size: 9px; font-weight: 500; user-select: none; touch-action: none; z-index: 1; }
 .imgblk:active { cursor: grabbing; }
-.imgblk img { height: 100%; width: 34px; object-fit: cover; flex: none; pointer-events: none; }
+.imgblk img { height: 100%; width: 22px; object-fit: cover; flex: none; pointer-events: none; }
 .imgblk span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; pointer-events: none; }
-.imgblk.selected { outline: 2px solid var(--accent); outline-offset: 1px; z-index: 2; }
+.imgblk.selected { outline: 2px solid var(--accent); outline-offset: 0; z-index: 2; }
 .imgblk.missing { background: repeating-linear-gradient(45deg, #e9a3c4, #e9a3c4 6px, #f3c6da 6px, #f3c6da 12px); }
-.imgblk .eh { position: absolute; top: 0; bottom: 0; width: 9px; cursor: ew-resize; }
+.imgblk .eh { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; }
 .imgblk .eh.l { left: 0; } .imgblk .eh.r { right: 0; }
 .imgblk.selected .eh, .imgblk:hover .eh { background: rgba(255,255,255,.32); }
 #layerLayer { position: absolute; inset: 0; pointer-events: none; z-index: 3; overflow: hidden; }
@@ -339,7 +342,7 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 
 /* ---------- markers: pink lines on clips, pins on the pictures lane, Space while recording */
 .block .mk { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: #ff4fa0; box-shadow: 0 0 0 1px rgba(255,255,255,.55); pointer-events: none; z-index: 1; }
-.block .mk::before { content: ""; position: absolute; top: -4px; left: -4px; width: 10px; height: 10px; background: #ff4fa0; transform: rotate(45deg); border-radius: 2px; }
+.block .mk::before { content: ""; position: absolute; top: -3px; left: -3px; width: 8px; height: 8px; background: #ff4fa0; transform: rotate(45deg); border-radius: 2px; }
 .mkpin { position: absolute; top: 3px; width: 18px; height: 18px; margin-left: -9px; border-radius: 50%; background: #fff; border: 2px solid #d6438a; color: #d6438a; font-weight: 700; font-size: 13px; line-height: 13px; z-index: 3; box-shadow: 0 1px 3px rgba(0,0,0,.18); padding: 0; }
 .mkpin:hover { background: #d6438a; color: #fff; }
 .mkpin.done { top: -4px; width: 9px; height: 9px; margin-left: -4.5px; border: 0; border-radius: 2px; background: #d6438a; transform: rotate(45deg); box-shadow: none; }
