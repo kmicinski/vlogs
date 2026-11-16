@@ -153,7 +153,12 @@ clip and voiceover when `audio.polish` (default on; `segment.polish`/`voiceover.
 *Voice* select, settings *Polish voices* + *Noise reduction*; the live player approximates with pre-gain + EQ
 (`VP.route(el, mode, fx)`). CLI: `vlog set PROJ s4 polish=off`, `vlog set PROJ audio polish=off denoise=6`.
 When Kris says "my audio sounds muffled/noisy/harsh" → check polish is on, raise/lower `denoise`; "leave this
-clip as recorded" → `polish=off` on that segment.
+clip as recorded" → `polish=off` on that segment. A take remembers its microphone (`segment.mic`: the browser's
+device label, sent by the recorder as `record/start {mic}`, kept in the manifest); `render.polish_on(p, setting, mic)`
+treats `auto` as off for a good mic (`media.good_mic`, the Python twin of app.js `GOOD_MIC`: DJI, Rode, Shure, interfaces…),
+so DJI takes stay as recorded and the Anker webcam-class takes get polished. Clips imported from files have no `mic`.
+On 2026-11-15 Kris wanted the polish off "most of the tracks": the one-channel takes were the DJI receiver, the stereo
+desk take the Anker, so `audio.polish: false` + `polish: on` on the Anker pieces.
 The polished sound of each clip is cached as `cache/<name>.voice.<ch>.<hash>.flac` (`media.polished_audio`, 16-bit,
 written `VOICE_HEADROOM` down): the denoiser is single-threaded at ~9× realtime and ffmpeg runs the whole filter graph
 in one thread, so with it inline a 15-min export took 25 min. `media.prepare` builds it in the background after import;

@@ -358,7 +358,8 @@ def create_app(cfg: Config) -> FastAPI:
                 d["channel_effective"] = media.effective_channel(f, p.cache_dir, s.channel, compute=False) if info else "stereo"
                 d["lufs"] = media.cached_loudness(f, p.cache_dir, s.channel) if info else None
                 d["polish"] = s.polish
-                d["polished"] = bool(info and info.has_audio and render.polish_on(p, s.polish))
+                d["mic"] = s.mic
+                d["polished"] = bool(info and info.has_audio and render.polish_on(p, s.polish, s.mic))
                 d["pregain"] = 0.0
                 if d["polished"]:      # the live player approximates the polish: pre-gain + EQ, level from the polished loudness
                     vs = media.voice_state(f, p.cache_dir, s.channel, p.audio.denoise)
@@ -636,7 +637,7 @@ def create_app(cfg: Config) -> FastAPI:
                     setattr(obj, k, v)
         if p.audio.polish and (p.audio.polish, p.audio.denoise) != before:
             for seg in p.timeline:
-                if seg.kind == "clip" and render.polish_on(p, seg.polish) and p.resolve(seg.src).exists():
+                if seg.kind == "clip" and render.polish_on(p, seg.polish, seg.mic) and p.resolve(seg.src).exists():
                     measure_voice_async(p, seg.src, seg.channel)
             for v in p.voiceovers:
                 if render.polish_on(p, v.polish) and p.resolve(v.file).exists():
@@ -763,11 +764,11 @@ def create_app(cfg: Config) -> FastAPI:
                 s.channel = v if v in CHANNELS else "auto"
                 if p.resolve(s.src).exists():      # measure the loudness of what will be heard (fast, audio only)
                     media.measure_loudness(p.resolve(s.src), p.cache_dir, s.channel)
-                    if render.polish_on(p, s.polish):
+                    if render.polish_on(p, s.polish, s.mic):
                         measure_voice_async(p, s.src, s.channel)
             elif k == "polish":
                 s.polish = polish_value(v)
-                if render.polish_on(p, s.polish) and p.resolve(s.src).exists():
+                if render.polish_on(p, s.polish, s.mic) and p.resolve(s.src).exists():
                     measure_voice_async(p, s.src, s.channel)
             elif k == "fit":
                 s.fit = "cover" if v == "cover" else "contain"
@@ -1008,6 +1009,8 @@ def create_app(cfg: Config) -> FastAPI:
                 seg.fit = m["fit"]
             if seg is not None and marks:
                 seg.markers = [round(t, 3) for t in marks]
+            if seg is not None and m.get("mic"):
+                seg.mic = str(m["mic"])
             if seg is not None:
                 seg.box = box4(m.get("box")) if m.get("box") else None
                 if pip_rel:
@@ -1030,7 +1033,7 @@ def create_app(cfg: Config) -> FastAPI:
         m = {"id": rid, "kind": body.get("kind", "clip"), "at": float(body.get("at") or 0), "fit": body.get("fit", ""),
              "add": bool(body.get("add", True)), "mime": mime, "ext": "mp4" if "mp4" in mime else "webm",
              "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0, "markers": [],
-             "name": str(body.get("name") or ""), "box": body.get("box") or None}
+             "name": str(body.get("name") or ""), "box": body.get("box") or None, "mic": str(body.get("mic") or "")[:80]}
         (rec_dir(p) / f"{rid}.part").write_bytes(b"")
         pb = body.get("pip")
         if isinstance(pb, dict):      # a second stream (the camera over a screen recording, or the other way round)

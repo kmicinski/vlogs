@@ -70,7 +70,7 @@ function bindSpeed(id, onCommit) {
 }
 const CORNERS = { tl: 'top left', tr: 'top right', bl: 'bottom left', br: 'bottom right' };
 // the Voice select of a clip / narration: auto follows the vlog's audio.polish setting
-const polishOptions = cur => [['auto', `${P && P.audio && P.audio.polish === false ? 'As recorded' : 'Polished'} (vlog setting)`], ['on', 'Polished'], ['off', 'As recorded']]
+const polishOptions = (cur, mic = '') => [['auto', mic && micQuality(mic) === 'good' ? `As recorded (${mic.replace(/\s*\(.*\)\s*$/, '')} is a good mic)` : `${P && P.audio && P.audio.polish === false ? 'As recorded' : 'Polished'} (vlog setting)`], ['on', 'Polished'], ['off', 'As recorded']]
   .map(([v, l]) => `<option value="${v}" ${(cur || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('');
 // the Channels select of a clip: what `auto` does to this file is spelled out
 const channelOptions = s => {
@@ -847,7 +847,7 @@ function renderInspector() {
       `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
       field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`) +
       (m.has_audio ? field('Channels', `<select data-k="channel">${channelOptions(s)}</select>`) : '') +
-      (m.has_audio ? field('Voice', `<select data-k="polish">${polishOptions(s.polish)}</select>` + (s.polished ? `<span class="muted" style="font-size:11px">Polished: room noise down, sibilance tamed, a little presence and evenness. The live player only approximates it — judge it in a preview.</span>` : '')) : '');
+      (m.has_audio ? field('Voice', `<select data-k="polish">${polishOptions(s.polish, s.mic)}</select>` + (s.polished ? `<span class="muted" style="font-size:11px">Polished: room noise down, sibilance tamed, a little presence and evenness. The live player only approximates it — judge it in a preview.</span>` : '')) : '');
   }
   html += field('Transition in', `<div class="inline"><select data-k="transition">${trOpts}</select><input type="number" data-k="transition_duration" step="0.1" min="0.1" max="3" value="${s.transition_duration ?? ''}" placeholder="${P.style.transition_duration}s" style="flex:0 0 64px"></div>`);
   html += `<div class="sep"></div><div class="actions"><button class="link" id="segUp" title="[">← Move</button><button class="link" id="segDown" title="]">Move →</button><button class="link" id="segDup">Duplicate</button><span class="spacer"></span><button class="link danger" id="segDelete">Delete</button></div>`;
@@ -2099,7 +2099,7 @@ async function startRecording() {
   REC.playFrom = T;
   // what gets recorded: the camera/mic stream, or for a screen take the shared screen (+ the camera as a
   // second stream, the inset) with the mic (+ computer sound) on both so either can be the main picture later
-  let mainStream = REC.stream, pipStream = null, body = { kind: REC.mode, at: REC.playFrom, fit: $('#recCover').checked ? 'cover' : 'contain', mime };
+  let mainStream = REC.stream, pipStream = null, body = { kind: REC.mode, at: REC.playFrom, fit: $('#recCover').checked ? 'cover' : 'contain', mime, mic: selectedMicLabel() };
   if (recIsScreen()) {
     if (!REC.screen) return toast('Choose a screen or window first', true);
     const src = recSources(), L = recLayoutBoxes();
@@ -2108,7 +2108,7 @@ async function startRecording() {
     mainStream = new MediaStream([src.main, ...(audio ? [audio] : [])]);
     if (src.pip) pipStream = new MediaStream([src.pip, ...(audio ? [audio.clone()] : [])]);
     const boxObj = b => b ? { x: b[0], y: b[1], w: b[2], h: b[3] } : null;
-    body = { kind: 'clip', at: REC.playFrom, fit: src.mainIsCam ? 'cover' : 'contain', mime, name: src.roles.main, box: boxObj(L.box),
+    body = { kind: 'clip', at: REC.playFrom, fit: src.mainIsCam ? 'cover' : 'contain', mime, name: src.roles.main, box: boxObj(L.box), mic: selectedMicLabel(),
              pip: pipStream ? { name: src.roles.pip, mime, box: boxObj(L.pip), shape: L.shape, fit: 'cover' } : null };
   }
   try { const r = await api('POST', `/api/projects/${P.name}/record/start`, body); REC.session = r.id; }

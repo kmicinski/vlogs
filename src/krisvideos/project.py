@@ -285,6 +285,7 @@ class Segment:
     channel: str = "auto"           # auto | stereo | left | right | mix: which channel(s) to hear (left/right: that
                                     # channel copied to both ears, for a mic plugged into one side; auto = detect)
     polish: str = "auto"            # voice polish (media.voice_chain): auto = the project's audio.polish | on | off
+    mic: str = ""                   # the microphone a take was recorded with (its browser label); auto polish skips good ones
     caption: str | None = None      # convenience: a lower-third shown for the whole clip
     fit: str = "contain"            # contain (letterbox) | cover (crop to fill the canvas)
     overlays: list[Overlay] = field(default_factory=list)
@@ -319,6 +320,7 @@ class Segment:
             if seg.channel not in CHANNELS:
                 seg.channel = "auto"
             seg.polish = polish_value(d.get("polish"))
+            seg.mic = str(d.get("mic") or "")
             seg.caption = d.get("caption")
             seg.fit = str(d.get("fit") or "contain")
             seg.overlays = [Overlay.from_dict(o) for o in d.get("overlays", []) or []]
@@ -362,6 +364,8 @@ class Segment:
                 d["channel"] = self.channel
             if self.polish != "auto":
                 d["polish"] = self.polish
+            if self.mic:
+                d["mic"] = self.mic
             if self.caption:
                 d["caption"] = self.caption
             if self.fit != "contain":

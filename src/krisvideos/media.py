@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import math
+import re
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
@@ -182,6 +183,15 @@ ONE_SIDED_DB = 20.0     # a channel this far below the other (and the other abov
 # No make-up gain here: the usual LUFS matching (measured on the polished signal) sets the level, and
 # VOICE_LIMITER after it catches the peaks. Tuned on an Anker USB mic take (noise floor -44 dB RMS).
 RNNOISE_MODEL = "rnnoise.rnnn"      # drop a model (e.g. rnnoise-models' bd.rnnn) under the config dir to use it
+# microphones that already sound produced (a DJI / Rode wireless, a real USB condenser or interface): a take
+# recorded with one keeps its sound as recorded unless the clip says `polish: on`. Mirrors app.js GOOD_MIC.
+GOOD_MIC_RE = re.compile(r"\bdji\b|wireless mic|mic mini|\bmic 2\b|\brx\b|\br[øo]de\b|yeti|snowball|shure|\bsm7|\bmv7|audio-?technica|\bat20\d\d|elgato wave|\bwave[: ]?[13]\b|wave link|focusrite|scarlett|clarett|\bmotu\b|apollo|universal audio|\bvolt \d|audient|\bevo \d|presonus|behringer|\bumc\d|tascam|\bzoom [hfp]\d|sennheiser|hollyland|\blark\b|saramonic|\bboya\b|samson|fifine|maono|quadcast|seiren|\bssl ?\d|steinberg|\bur\d\d|apogee|\brme\b|babyface|minifuse|\bm-?audio\b|komplete audio|audio interface", re.I)
+
+
+def good_mic(label: str | None) -> bool:
+    return bool(label) and bool(GOOD_MIC_RE.search(label))
+
+
 VOICE_PRE_LUFS = -23.0
 
 

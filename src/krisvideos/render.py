@@ -224,9 +224,14 @@ def pip_rect(pip: Pip, info: MediaInfo, W: int, H: int) -> tuple[int, int, int, 
     return left, top, pw, ph
 
 
-def polish_on(p: Project, setting: str) -> bool:
-    """Whether a clip/voiceover with this `polish` setting gets the voice polish."""
-    return setting == "on" or (setting != "off" and p.audio.polish)
+def polish_on(p: Project, setting: str, mic: str = "") -> bool:
+    """Does this clip / narration get the voice polish? on/off say so; auto follows the vlog's audio.polish,
+    except that a take recorded with a good microphone (`mic`, see media.good_mic) stays as recorded."""
+    if setting == "on":
+        return True
+    if setting == "off":
+        return False
+    return bool(p.audio.polish) and not media.good_mic(mic)
 
 
 def _atempo(speed: float) -> str:
@@ -251,7 +256,7 @@ def voice_jobs(p: Project, infos=None) -> list[tuple[Path, Path, str, float]]:
     """(file, cache dir, channel, denoise) for every clip whose sound gets the voice polish in a render."""
     out, seen = [], set()
     for s in p.timeline:
-        if s.kind != "clip" or s.mute or s.volume <= 0 or s.speed > MUTE_ABOVE or not polish_on(p, s.polish):
+        if s.kind != "clip" or s.mute or s.volume <= 0 or s.speed > MUTE_ABOVE or not polish_on(p, s.polish, s.mic):
             continue
         src = p.resolve(s.src)
         if not src.exists():
@@ -433,7 +438,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
                 achain = ["asetpts=PTS-STARTPTS"]
                 ch = media.effective_channel(src, p.cache_dir, s.channel)
-                polished = polish_on(p, s.polish)
+                polished = polish_on(p, s.polish, s.mic)
                 a_src, lift = f"{k}:a", 1.0
                 if polished:                     # voice polish: denoise / de-ess / EQ / compress, before any speed change
                     chain, lufs = media.voice_filters(src, p.cache_dir, ch, p.audio.denoise)
