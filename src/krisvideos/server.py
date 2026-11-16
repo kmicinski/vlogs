@@ -416,6 +416,7 @@ def create_app(cfg: Config) -> FastAPI:
                 "in_timeline": any(s.src == rel or (s.pip is not None and s.pip.src == rel) for s in p.timeline),
                 "thumb_url": media_url(p, f"cache/{f.name}.thumb.jpg") if st["thumb"] else None,
                 "proxy_url": media_url(p, f"cache/{f.name}.proxy.mp4") if st["proxy"] else (media_url(p, rel) if info and media.browser_playable(probe(f, p.cache_dir)) else None),
+                "src_url": media_url(p, rel),
             })
         preview = p.out_dir / "preview.mp4"
         final = p.out_dir / p.output_filename()
@@ -700,10 +701,40 @@ def create_app(cfg: Config) -> FastAPI:
                 seg.in_ = max(0.0, parse_time(body["in"]))
             if body.get("out") not in (None, ""):
                 seg.out = parse_time(body["out"])
+            if body.get("speed"):
+                seg.speed = max(0.01, float(body["speed"]))
             commit(p)
             return project_json(p) | {"new_id": seg.id}
         commit(p)
         return project_json(p)
+
+    @app.post("/api/projects/{name}/segments/batch")
+    def add_segments_batch(name: str, body: dict):
+        """Several trimmed clips at once (the trimmer's queue), in order, as one undo step:
+        {items: [{src, in?, out?, speed?}], at_time?} → project + new_ids. at_time inserts the run at a
+        timeline time (splitting the clip there); otherwise they go at the end."""
+        p = load(name)
+        items = [it for it in (body.get("items") or []) if it.get("src")]
+        if not items:
+            raise HTTPException(400, "nothing to add")
+        for it in items:
+            if not p.resolve(it["src"]).exists():
+                raise HTTPException(400, f"missing {it['src']}")
+        at = edits.insert_index_at(p, float(body["at_time"])) if body.get("at_time") is not None else None
+        ids = []
+        for it in items:
+            seg = p.add_clip(it["src"], at=at)
+            if it.get("in") not in (None, ""):
+                seg.in_ = max(0.0, parse_time(it["in"]))
+            if it.get("out") not in (None, ""):
+                seg.out = parse_time(it["out"])
+            if it.get("speed"):
+                seg.speed = max(0.01, float(it["speed"]))
+            ids.append(seg.id)
+            if at is not None:
+                at += 1
+        commit(p)
+        return project_json(p) | {"new_ids": ids, "new_id": ids[-1]}
 
     @app.patch("/api/projects/{name}/segments/{sid}")
     def patch_segment(name: str, sid: str, body: dict):
@@ -1438,7 +1469,11 @@ def create_app(cfg: Config) -> FastAPI:
                 path = im.download(a["id"], p.clips_dir, a.get("filename"))
                 rel = f"clips/{path.name}"
                 job.added.append(rel)
-                media.prepare(p, rel)
+                try:
+                    media.make_thumbnail(p, rel)       # one frame: the library card and the trimmer's queue
+                except Exception as e:
+                    print(f"[import] thumbnail failed for {rel}: {e}")
+                media.prepare_async(p, rel)            # loudness, and a proxy only if the browser needs one
                 pp = Project.load(p.folder)   # reload: UI may have changed things meanwhile
                 if add and not any(s.src == rel for s in pp.timeline):
                     pp.add_clip(rel)

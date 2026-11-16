@@ -261,6 +261,18 @@ kbd { background: var(--surface2); border-radius: 4px; padding: 0 5px; font-fami
 #trBar .ph { position: absolute; top: -8px; bottom: -8px; width: 3px; margin-left: -1.5px; background: #fff; border-radius: 2px; box-shadow: 0 0 0 1px rgba(0,0,0,.35), 0 1px 4px rgba(0,0,0,.3); pointer-events: none; z-index: 2; }
 #trUsed { position: relative; height: 4px; margin-top: 8px; }
 #trUsed i { position: absolute; top: 0; height: 4px; border-radius: 2px; background: var(--ok); opacity: .75; }
+#trQueue { display: flex; gap: 6px; overflow-x: auto; padding: 2px 2px 8px; margin: -4px 0 6px; scrollbar-width: thin; }
+#trQueue .qi { position: relative; flex: 0 0 auto; width: 88px; height: 56px; border-radius: 8px; overflow: hidden; background: var(--surface2); cursor: pointer; outline: 2px solid transparent; outline-offset: -2px; opacity: .8; transition: opacity .15s; }
+#trQueue .qi img { width: 100%; height: 100%; object-fit: cover; display: block; }
+#trQueue .qi .noimg { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); }
+#trQueue .qi.cur { outline-color: #ffc400; opacity: 1; }
+#trQueue .qi.take { outline-color: var(--ok); opacity: 1; }
+#trQueue .qi.take.cur { outline-color: #ffc400; box-shadow: inset 0 0 0 4px var(--ok); }
+#trQueue .qi.skip { opacity: .4; }
+#trQueue .qt { position: absolute; left: 0; right: 0; bottom: 0; padding: 12px 5px 3px; font-size: 10px; color: #fff; background: linear-gradient(transparent, rgba(0,0,0,.7)); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-variant-numeric: tabular-nums; }
+#trQueue .qi.take .qt { font-weight: 600; }
+.trspeed { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.trspeed .speedctl .sp-slider { width: 110px; }
 .trctl { display: flex; align-items: center; gap: 8px; margin-top: 8px; flex-wrap: wrap; }
 .trctl .playbtn { width: 32px; height: 32px; }
 .trctl select { max-width: 260px; }

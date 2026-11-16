@@ -1080,7 +1080,7 @@ let immichVids = [], picked = new Set();
 const trimOnImport = () => lsGet('kv.trimImport', '1') === '1';
 function openLibrary(tab) {
   sheet(`<div class="inline libhead"><div class="tabs"><button class="tab ${tab === 'immich' ? 'active' : ''}" data-t="immich">Immich</button><button class="tab ${tab === 'files' ? 'active' : ''}" data-t="files">Files</button><button class="tab ${tab === 'clips' ? 'active' : ''}" data-t="clips">In this project</button></div><span class="spacer"></span>
-    <label class="check libtrim" title="New clips open in the trimmer one by one: pick the part you want, press Enter for the next"><input type="checkbox" id="libTrim" ${trimOnImport() ? 'checked' : ''}> Trim each clip before it goes on the timeline</label></div>
+    <label class="check libtrim" title="New clips open in the trimmer: pick each one's part and speed (Enter to queue it, N to leave it out), then they all go on the timeline together"><input type="checkbox" id="libTrim" ${trimOnImport() ? 'checked' : ''}> Pick each clip's part and speed before it goes on the timeline</label></div>
     <div id="libBody"></div>`, { wide: true });
   $('#libTrim').onchange = e => lsSet('kv.trimImport', e.target.checked ? '1' : '0');
   $$('.tabs .tab').forEach(b => b.onclick = () => { $$('.tabs .tab').forEach(x => x.classList.toggle('active', x === b)); renderLib(b.dataset.t); });
@@ -1409,15 +1409,23 @@ function renderImageInspector(el, L, close) {
 // Watch a clip, drag the yellow handles (or press I / O) around the part you want, press Enter.
 // After an import the new clips come through one by one (Enter adds and moves on, N skips). For a
 // clip already on the timeline (double-click it) the handles start at its in/out on the whole source.
-const TR = { queue: [], i: 0, src: null, segId: null, dur: 0, in: 0, out: 0, stopAt: 0, raf: 0, poll: 0, added: 0 };
+// The trimmer: the source viewer for imports (a queue of clips: pick each one's part and speed, then add
+// them all at once), library clips and re-trimming a timeline clip. TR.items keeps every queued clip's
+// in / out / speed / decision so you can move between them freely; TR.in/out/speed/dur are the live copy
+// of the current item.
+const TR = { queue: [], items: [], i: 0, src: null, segId: null, dur: 0, in: 0, out: 0, speed: 1, playing: false, stopAt: 0, raf: 0, poll: 0, added: 0 };
+const trMulti = () => !TR.segId && TR.items.length > 1;
+const trItem = () => TR.items[TR.i];
+const trQueued = () => TR.items.filter(it => it.take);
 function openTrimmer(srcs, { segId = null } = {}) {
   srcs = (Array.isArray(srcs) ? srcs : [srcs]).filter(Boolean);
   if (!srcs.length || !P) return;
   stop();
-  Object.assign(TR, { queue: srcs, i: 0, segId, added: 0, src: null, dur: 0 });
-  const edit = !!segId, where = lsGet('kv.trWhere', 'end');
+  Object.assign(TR, { queue: srcs, items: srcs.map(src => ({ src, in: 0, out: null, speed: 1, take: false, seen: false })), i: 0, segId, added: 0, src: null, dur: 0, speed: 1, playing: false });
+  const edit = !!segId, where = lsGet('kv.trWhere', 'end'), multi = !edit && srcs.length > 1;
   sheet(`<div id="trimBox">
     <div class="trhead"><h2 id="trName"></h2><span id="trCount" class="muted"></span><span class="spacer"></span><button class="iconbtn" id="trClose" title="Close (esc)">✕</button></div>
+    <div id="trQueue" class="${multi ? '' : 'hidden'}"></div>
     <div class="trstage"><video id="trVideo" playsinline preload="auto"></video><div id="trWait" class="hidden">Preparing a preview of this clip…</div></div>
     <div id="trBar"><div class="frames"></div><img class="wave hidden" alt=""><div class="shade l"></div><div class="shade r"></div><div class="win"><div class="h l" title="Drag to set the start"></div><div class="h r" title="Drag to set the end"></div></div><div class="ph"></div></div>
     <div id="trUsed"></div>
@@ -1427,23 +1435,26 @@ function openTrimmer(srcs, { segId = null } = {}) {
       <button class="link" id="trIn" title="Start the part at the playhead (I)">Mark in <kbd>I</kbd></button>
       <button class="link" id="trOut" title="End the part at the playhead (O)">Mark out <kbd>O</kbd></button>
       <span id="trSel"></span>
+      ${edit ? '' : `<span class="trspeed" title="Play the part at this speed and put it on the timeline at this speed (8× turns a minute into 7½ s)">${speedControl('trSpeed', 1)}<span id="trLen" class="muted"></span></span>`}
       <span class="spacer"></span>
       ${edit ? '' : `<select id="trWhere" title="Where the part goes on the timeline"><option value="end" ${where === 'end' ? 'selected' : ''}>Add at the end</option><option value="playhead" ${where === 'playhead' ? 'selected' : ''}>Insert at the playhead</option><option value="frame" ${where === 'frame' ? 'selected' : ''}>In a frame over the clip at the playhead</option></select>`}
     </div>
     <div class="foot">
       ${edit ? `<span class="muted trhint">Drag the yellow handles, or play and press I / O.</span><span class="spacer"></span><button class="pill" id="trCancel">Cancel</button><button class="pill primary" id="trApply">Update clip <kbd>⏎</kbd></button>`
-             : `<span class="muted trhint" id="trHint"></span><span class="spacer"></span><button class="pill ghost" id="trSkip" title="Leave this clip in the library (N)">Skip <kbd>N</kbd></button><button class="pill" id="trMore" title="Add this part and keep picking parts of the same clip (⇧⏎)">Add & pick more <kbd>⇧⏎</kbd></button><button class="pill primary" id="trAdd">Add <kbd>⏎</kbd></button>`}
+             : `<span class="muted trhint" id="trHint"></span><span class="spacer"></span><button class="pill ghost" id="trSkip" title="${multi ? 'Leave this clip out (N)' : 'Leave this clip in the library (N)'}">Skip <kbd>N</kbd></button><button class="pill" id="trMore" title="Add this part now and keep picking parts of the same clip (⇧⏎)">Add & pick more <kbd>⇧⏎</kbd></button>${multi ? `<button class="pill primary" id="trAdd" title="Keep this part, with its speed, for the batch; queueing the last clip adds the whole batch (⏎)">Queue <kbd>⏎</kbd></button><button class="pill primary hidden" id="trAddAll" title="Put every queued part on the timeline, in this order, as one step">Add queued</button>` : `<button class="pill primary" id="trAdd">Add <kbd>⏎</kbd></button>`}`}
     </div>
   </div>`, { xl: true });
   $('#trClose').onclick = closeTrimmer;
-  $('#trPlay').onclick = () => { const v = $('#trVideo'); v && !v.paused ? trPause() : trPlay(); };
+  $('#trPlay').onclick = () => TR.playing ? trPause() : trPlay();
   $('#trIn').onclick = () => trMark('in'); $('#trOut').onclick = () => trMark('out');
   if (edit) { $('#trApply').onclick = trApply; $('#trCancel').onclick = closeTrimmer; }
   else {
-    $('#trAdd').onclick = () => trAdd(false); $('#trMore').onclick = () => trAdd(true); $('#trSkip').onclick = trNext;
-    $('#trWhere').onchange = e => { lsSet('kv.trWhere', e.target.value); e.target.blur(); };
+    $('#trAdd').onclick = () => multi ? trQueue() : trAdd(false); $('#trMore').onclick = () => trAdd(true); $('#trSkip').onclick = trSkip;
+    if ($('#trAddAll')) $('#trAddAll').onclick = trAddAll;
+    $('#trWhere').onchange = e => { lsSet('kv.trWhere', e.target.value); e.target.blur(); trRender(); };
+    bindSpeed('trSpeed', v => { TR.speed = Math.max(0.01, v); trSave(); trRate(); trRender(); });
   }
-  $('#trVideo').onclick = () => { const v = $('#trVideo'); v.paused ? trPlay() : trPause(); };
+  $('#trVideo').onclick = () => TR.playing ? trPause() : trPlay();
   dragOn($('#trBar'), {
     down: e => { if (!TR.dur) return false; trPause(); const h = e.target.closest('.h'); if (h) return { h: h.classList.contains('l') ? 'in' : 'out' }; trSeek(trBarT(e)); return {}; },
     move: (ev, c) => {
@@ -1452,34 +1463,66 @@ function openTrimmer(srcs, { segId = null } = {}) {
       else if (c.h === 'out') { TR.out = clamp(t, TR.in + 0.1, TR.dur); trSeek(TR.out); }
       else trSeek(t);
     },
+    up: (ev, c) => { if (c.h) { trSave(); trQueueRender(); } },
   });
+  trQueueRender();
   trLoad();
 }
 function trBarT(ev) { const r = $('#trBar').getBoundingClientRect(); return clamp((ev.clientX - r.left) / r.width, 0, 1) * TR.dur; }
+// Can this browser play the source file itself? Chrome on a Mac decodes HEVC (iPhone clips, HDR included)
+// in hardware, so there is no need to wait for the proxy to start trimming.
+const _probeVideo = document.createElement('video');
+function canPlaySource(m) {
+  if (!m || !m.codec) return false;
+  if (m.width && m.height && Math.max(m.width, m.height) > 3840) return false;
+  const codecs = { hevc: 'video/mp4; codecs="hvc1.1.6.L93.B0"', h265: 'video/mp4; codecs="hvc1.1.6.L93.B0"', h264: 'video/mp4; codecs="avc1.640028"', av1: 'video/mp4; codecs="av01.0.08M.08"', vp9: 'video/webm; codecs="vp9"' };
+  return codecs[m.codec] ? !!_probeVideo.canPlayType(codecs[m.codec]) : false;
+}
 function trSource(src) {
   const s = TR.segId ? P.timeline.find(x => x.id === TR.segId) : null;
   const c = (P.clips || []).find(x => x.src === src);
-  return { seg: s, media: (s && s.media) || (c && c.media) || null, url: (s && s.proxy_url) || (c && c.proxy_url) || null };
+  const media = (s && s.media) || (c && c.media) || null;
+  const own = (s && s.src_url) || (c && c.src_url) || null;
+  return { seg: s, media, url: (s && s.proxy_url) || (c && c.proxy_url) || (own && canPlaySource(media) ? own : null) };
+}
+// keep the current item's marks and speed (so you can come back to it)
+function trSave() {
+  const it = trItem(); if (!it || !TR.dur || TR.segId) return;
+  it.in = TR.in; it.out = TR.out >= TR.dur - 0.01 ? null : TR.out; it.speed = TR.speed; it.dur = TR.dur;
+}
+function trQueueRender() {
+  const q = $('#trQueue'); if (!q || !trMulti()) return;
+  q.innerHTML = TR.items.map((it, i) => {
+    const c = (P.clips || []).find(x => x.src === it.src), d = it.dur || (c && c.media ? c.media.duration : 0) || 0;
+    const len = it.take ? fmt(((it.out == null ? d : it.out) - it.in) / (it.speed || 1)) : fmt(d);
+    return `<div class="qi ${i === TR.i ? 'cur' : ''} ${it.take ? 'take' : it.seen ? 'skip' : ''}" data-i="${i}" title="${esc(it.src.replace(/^clips\//, ''))}${it.take ? ' · queued' : it.seen ? ' · skipped' : ''}">${c && c.thumb_url ? `<img src="${c.thumb_url}" alt="">` : '<div class="noimg">…</div>'}<span class="qt">${it.take ? '✓ ' : it.seen ? '– ' : ''}${len}${it.take && (it.speed || 1) !== 1 ? ' · ' + fmtSpeed(it.speed) : ''}</span></div>`;
+  }).join('');
+  $$('.qi', q).forEach(el => el.onclick = () => { trSave(); trPause(); TR.i = +el.dataset.i; trLoad(); });
+  const cur = $('.qi.cur', q); if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 }
 async function trLoad() {
-  clearTimeout(TR.poll); cancelAnimationFrame(TR.raf);
+  clearTimeout(TR.poll); cancelAnimationFrame(TR.raf); TR.playing = false;
   const box = $('#trimBox'); if (!box) return;
-  const src = TR.queue[TR.i]; TR.src = src;
+  const it = trItem(), src = it.src; TR.src = src;
   $('#trName').textContent = src.replace(/^clips\//, '');
-  $('#trCount').textContent = TR.queue.length > 1 ? `${TR.i + 1} of ${TR.queue.length}` : '';
+  $('#trCount').textContent = TR.items.length > 1 ? `${TR.i + 1} of ${TR.items.length}` : '';
   const { seg, media, url } = trSource(src), v = $('#trVideo');
-  if (!url || !media) {      // the browser-friendly proxy is still being made: check back shortly
-    TR.dur = 0; $('#trWait').classList.remove('hidden'); v.removeAttribute('src'); v.dataset.url = ''; trRender();
+  if (!url || !media) {      // a proxy is being made for a source the browser cannot play: check back shortly
+    TR.dur = 0; $('#trWait').classList.remove('hidden'); v.removeAttribute('src'); v.dataset.url = ''; trQueueRender(); trRender();
     TR.poll = setTimeout(async () => { try { await refresh(); } catch { } trLoad(); }, 1500);
     return;
   }
   $('#trWait').classList.add('hidden');
   TR.dur = media.duration || 0;
-  if (seg) { TR.in = seg.in || 0; TR.out = seg.out == null ? TR.dur : Math.min(seg.out, TR.dur); } else { TR.in = 0; TR.out = TR.dur; }
+  if (seg) { TR.in = seg.in || 0; TR.out = seg.out == null ? TR.dur : Math.min(seg.out, TR.dur); TR.speed = 1; }
+  else { TR.in = clamp(it.in || 0, 0, TR.dur); TR.out = it.out == null ? TR.dur : clamp(it.out, TR.in + 0.1, TR.dur); TR.speed = it.speed || 1; it.dur = TR.dur; }
+  const sp = $('#trSpeed'); if (sp) { $('.sp-slider', sp).value = speedToSlider(TR.speed); $('.sp-num', sp).value = +(+TR.speed).toFixed(3); }
   if (v.dataset.url !== url) { v.dataset.url = url; v.src = url; }
+  trRate();
   const toStart = () => { try { v.currentTime = TR.in; } catch { } trRender(); };
   if (v.readyState >= 1) toStart(); else v.onloadedmetadata = toStart;
   v.ontimeupdate = () => { if (v.paused) trRender(); };
+  trQueueRender();
   // filmstrip + waveform of the whole source
   const bar = $('#trBar'), bw = bar.clientWidth || 800;
   const ar = media.width && media.height ? media.width / media.height : 16 / 9;
@@ -1500,44 +1543,100 @@ function trRender() {
   $('#trTime').textContent = TR.dur ? `${fmt(t)} / ${fmt(TR.dur)}` : '';
   const whole = TR.in <= 0.01 && TR.out >= TR.dur - 0.01;
   $('#trSel').innerHTML = !TR.dur ? '' : whole ? `<span class="muted">whole clip · ${fmt(TR.dur)}</span>` : `<b>${fmt(TR.out - TR.in)}</b> <span class="muted">· ${fmt(TR.in)} → ${fmt(TR.out)}</span>`;
-  const hint = $('#trHint');
-  if (hint) hint.textContent = TR.added ? `${TR.added} part${TR.added > 1 ? 's' : ''} added` : TR.queue.length > 1 ? 'Skipped clips stay in + Add ▸ In this project' : '';
+  const len = $('#trLen'); if (len) len.textContent = TR.dur && (TR.speed || 1) !== 1 ? `→ ${fmt((TR.out - TR.in) / TR.speed)} on the timeline${TR.speed > MUTE_ABOVE ? ', silent' : ''}` : '';
+  const hint = $('#trHint'), n = trQueued().length, it = trItem();
+  if (hint) hint.textContent = TR.added ? `${TR.added} part${TR.added > 1 ? 's' : ''} added` : trMulti() ? (n ? `${n} queued · they go on the timeline together when you queue or skip the last clip` : 'Pick the part and speed of each clip, Enter to queue it, N to leave it out · click a clip above to go back to it') : '';
+  const qb = $('#trAdd'); if (qb && trMulti()) qb.innerHTML = it && it.take ? 'Queued ✓ · next <kbd>⏎</kbd>' : 'Queue <kbd>⏎</kbd>';
+  const all = $('#trAddAll'); if (all) { all.classList.toggle('hidden', !n); all.textContent = `Add ${n} queued`; }
 }
 function trSeek(t) { const v = $('#trVideo'); if (!v || !TR.dur) return; try { v.currentTime = clamp(t, 0, TR.dur); } catch { } trRender(); }
+// the preview plays at the chosen speed: the browser does up to 16×, faster is stepped frame by frame
+function trRate() { const v = $('#trVideo'); if (!v) return; try { v.playbackRate = TR.speed > 16 ? 1 : clamp(TR.speed || 1, 0.0625, 16); } catch { } v.muted = TR.speed > MUTE_ABOVE; }
 function trPlay() {
   const v = $('#trVideo'); if (!v || !TR.dur) return;
   let t = v.currentTime || 0;
   if (Math.abs(t - TR.out) < 0.08 || t >= TR.dur - 0.05) { t = TR.in; v.currentTime = t; }   // at the end of the part: replay it
   TR.stopAt = (t >= TR.in - 0.05 && t < TR.out) ? TR.out : TR.dur;                         // inside the part: stop at its end
-  v.play().catch(() => { }); $('#trPlayIcon').setAttribute('d', PAUSE_D);
-  const tick = () => { if (!$('#trimBox') || v.paused) return; if (v.currentTime >= TR.stopAt) { v.pause(); v.currentTime = TR.stopAt; trPause(); return; } trRender(); TR.raf = requestAnimationFrame(tick); };
+  TR.playing = true; trRate();
+  const fast = TR.speed > 16;
+  if (!fast) v.play().catch(() => { });
+  $('#trPlayIcon').setAttribute('d', PAUSE_D);
+  let last = performance.now();
+  const tick = now => {
+    if (!$('#trimBox') || !TR.playing) return;
+    if (fast) { if (!v.seeking) { try { v.currentTime = Math.min(TR.stopAt, (v.currentTime || 0) + TR.speed * (now - last) / 1000); } catch { } } last = now; }
+    else if (v.paused) return;
+    if (v.currentTime >= TR.stopAt - 0.001) { v.pause(); v.currentTime = TR.stopAt; trPause(); return; }
+    trRender(); TR.raf = requestAnimationFrame(tick);
+  };
   cancelAnimationFrame(TR.raf); TR.raf = requestAnimationFrame(tick);
 }
-function trPause() { const v = $('#trVideo'); if (v) v.pause(); cancelAnimationFrame(TR.raf); const ic = $('#trPlayIcon'); if (ic) ic.setAttribute('d', PLAY_D); trRender(); }
+function trPause() { TR.playing = false; const v = $('#trVideo'); if (v) v.pause(); cancelAnimationFrame(TR.raf); const ic = $('#trPlayIcon'); if (ic) ic.setAttribute('d', PLAY_D); trRender(); }
 function trMark(which) {
   const v = $('#trVideo'); if (!v || !TR.dur) return; const t = clamp(v.currentTime || 0, 0, TR.dur);
   if (which === 'in') { TR.in = Math.min(t, TR.dur - 0.1); if (TR.out <= TR.in + 0.1) TR.out = TR.dur; }
   else { TR.out = Math.max(t, 0.1); if (TR.in >= TR.out - 0.1) TR.in = 0; }
-  trRender();
+  trSave(); trQueueRender(); trRender();
+}
+function trBody(it) {    // the add-segment body for one queued part
+  const body = { src: it.src };
+  if (it.in > 0.01) body.in = +it.in.toFixed(3);
+  if (it.out != null && it.out < (it.dur || Infinity) - 0.01) body.out = +it.out.toFixed(3);
+  if ((it.speed || 1) !== 1) body.speed = +it.speed;
+  return body;
 }
 async function trAdd(more = false) {
   if (!TR.src || !TR.dur) return;
-  const where = $('#trWhere') ? $('#trWhere').value : 'end';
-  const body = { kind: 'clip', src: TR.src };
-  if (TR.in > 0.01) body.in = +TR.in.toFixed(3);
-  if (TR.out < TR.dur - 0.01) body.out = +TR.out.toFixed(3);
+  trSave();
+  const where = $('#trWhere') ? $('#trWhere').value : 'end', it = trItem();
+  const body = { kind: 'clip', ...trBody({ src: TR.src, in: TR.in, out: TR.out, speed: TR.speed, dur: TR.dur }) };
   if (where === 'playhead') body.at_time = T;
   if (where === 'frame') { body.kind = 'pip'; body.at_time = T; body.in = +TR.in.toFixed(3); body.out = +TR.out.toFixed(3); body.layout = 'corner:' + lsGet('kv.recPos', 'br'); }
   trPause();
   await guard(async () => {
     const p = await api('POST', `/api/projects/${P.name}/segments`, body);
     setProject(p); TR.added++;
+    if (it) { it.seen = true; it.take = false; }       // it is on the timeline already, not waiting in the queue
     const ns = p.new_id && p.timeline.find(x => x.id === p.new_id);
     if (where === 'playhead' && ns && ns.placed) { T = ns.placed.end; updatePlayhead(); }   // the next part lands after this one
-    if (where === 'frame' && ns) { select(ns.id); T = ns.placed.end; updatePlayhead(); toast('In a frame over the clip — set its speed and corner in the inspector, or drag it on the video'); trNext(); return; }
-    toast(`Added ${fmt(TR.out - TR.in)} to the timeline`);
-    if (more) { const from = TR.out >= TR.dur - 0.1 ? 0 : TR.out; TR.in = from; TR.out = TR.dur; trSeek(from); trLoadUsed(); }
-    else trNext();
+    if (where === 'frame' && ns) { select(ns.id); T = ns.placed.end; updatePlayhead(); toast('In a frame over the clip — set its speed and corner in the inspector, or drag it on the video'); trAdvance(); return; }
+    toast(`Added ${fmt((TR.out - TR.in) / (TR.speed || 1))} to the timeline${(TR.speed || 1) !== 1 ? ` at ${fmtSpeed(TR.speed)}` : ''}`);
+    if (more) { const from = TR.out >= TR.dur - 0.1 ? 0 : TR.out; TR.in = from; TR.out = TR.dur; trSave(); trSeek(from); trLoadUsed(); trQueueRender(); }
+    else trAdvance();
+  });
+}
+// queue mode (several clips): Enter keeps this clip's part + speed for the batch, N leaves it out; the
+// batch goes on the timeline, in order and as one undo step, when the last clip has been decided
+function trQueue() { const it = trItem(); if (!it || !TR.dur) return; trSave(); it.take = true; it.seen = true; trAdvance(); }
+function trSkip() { const it = trItem(); if (it) { trSave(); it.take = false; it.seen = true; } trAdvance(); }
+function trAdvance() {
+  trPause();
+  const next = TR.items.findIndex((x, i) => i > TR.i && !x.seen);
+  if (next >= 0) { TR.i = next; trLoad(); return; }
+  const left = TR.items.findIndex(x => !x.seen);
+  if (left >= 0 && trMulti()) { TR.i = left; trLoad(); return; }
+  if (trMulti() && trQueued().length) { trAddAll(); return; }
+  const n = TR.added, many = TR.items.length > 1; closeTrimmer();
+  if (many) toast(n ? `Done: ${n} part${n > 1 ? 's' : ''} added` : 'Done');
+}
+async function trAddAll() {
+  trSave();
+  const items = trQueued(); if (!items.length) return;
+  const where = $('#trWhere') ? $('#trWhere').value : 'end';
+  trPause();
+  await guard(async () => {
+    let p;
+    if (where === 'frame') {       // frames are placed one by one (each splits the clip under the playhead)
+      for (const it of items) { p = await api('POST', `/api/projects/${P.name}/segments`, { kind: 'pip', at_time: T, in: it.in, out: it.out == null ? it.dur : it.out, speed: it.speed || 1, src: it.src, layout: 'corner:' + lsGet('kv.recPos', 'br') }); const ns = p.timeline.find(x => x.id === p.new_id); if (ns) T = ns.placed.end; }
+    } else {
+      const body = { items: items.map(trBody) }; if (where === 'playhead') body.at_time = T;
+      p = await api('POST', `/api/projects/${P.name}/segments/batch`, body);
+      const last = p.timeline.find(x => x.id === p.new_id); if (where === 'playhead' && last && last.placed) T = last.placed.end;
+    }
+    setProject(p); TR.added += items.length; updatePlayhead();
+    const total = items.reduce((a, it) => a + ((it.out == null ? it.dur : it.out) - it.in) / (it.speed || 1), 0);
+    closeTrimmer();
+    toast(`Added ${items.length} clip${items.length > 1 ? 's' : ''} · ${fmt(total)} on the timeline`);
   });
 }
 function trLoadUsed() {    // parts of this clip that are already on the timeline, in green under the strip
@@ -1547,18 +1646,13 @@ function trLoadUsed() {    // parts of this clip that are already on the timelin
   for (const m of mk) { const i = document.createElement('i'); i.className = 'trmk'; i.style.left = `${clamp(m / TR.dur, 0, 1) * 100}%`; i.title = `marker at ${fmt(m)}`; $('#trBar').appendChild(i); }
   $('#trUsed').innerHTML = P.timeline.filter(x => x.kind === 'clip' && x.clip === TR.src && x.id !== TR.segId).map(x => { const a = x.in || 0, b = x.out == null ? TR.dur : x.out; return `<i style="left:${a / TR.dur * 100}%;width:${Math.max(0.3, (b - a) / TR.dur * 100)}%" title="already on the timeline: ${fmt(a)} → ${fmt(b)}"></i>`; }).join('');
 }
-function trNext() {
-  if (TR.i + 1 < TR.queue.length) { TR.i++; trPause(); trLoad(); return; }
-  const n = TR.added, many = TR.queue.length > 1; closeTrimmer();
-  if (many) toast(n ? `Done: ${n} part${n > 1 ? 's' : ''} added` : 'Done');
-}
 async function trApply() {
   const s = P.timeline.find(x => x.id === TR.segId); if (!s || !TR.dur) return closeTrimmer();
   const body = { in: +TR.in.toFixed(3), out: TR.out >= TR.dur - 0.01 ? '' : +TR.out.toFixed(3) };
   await guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/segments/${s.id}`, body)); closeTrimmer(); const ns = P.timeline.find(x => x.id === s.id); if (ns && ns.placed) seek(ns.placed.start, true); toast('Clip updated'); });
 }
 function closeTrimmer() {
-  clearTimeout(TR.poll); cancelAnimationFrame(TR.raf);
+  clearTimeout(TR.poll); cancelAnimationFrame(TR.raf); TR.playing = false;
   const v = $('#trVideo'); if (v) { v.pause(); v.removeAttribute('src'); v.load(); }
   closeSheet();
 }
@@ -1567,11 +1661,13 @@ function trimKey(e) {
   if (k === 'Escape') { e.preventDefault(); closeTrimmer(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   switch (k) {
-    case ' ': e.preventDefault(); v && !v.paused ? trPause() : trPlay(); break;
+    case ' ': e.preventDefault(); TR.playing ? trPause() : trPlay(); break;
     case 'i': trMark('in'); break;
     case 'o': trMark('out'); break;
-    case 'Enter': e.preventDefault(); TR.segId ? trApply() : trAdd(e.shiftKey); break;
-    case 'n': if (!TR.segId) trNext(); break;
+    case 'Enter': e.preventDefault(); TR.segId ? trApply() : e.shiftKey ? trAdd(true) : trMulti() ? trQueue() : trAdd(false); break;
+    case 'n': if (!TR.segId) trSkip(); break;
+    case 'j': if (trMulti() && TR.i > 0) { trSave(); trPause(); TR.i--; trLoad(); } break;
+    case 'l': if (trMulti() && TR.i + 1 < TR.items.length) { trSave(); trPause(); TR.i++; trLoad(); } break;
     case 'ArrowLeft': e.preventDefault(); trPause(); trSeek((v.currentTime || 0) - (e.shiftKey ? 1 : 1 / 30)); break;
     case 'ArrowRight': e.preventDefault(); trPause(); trSeek((v.currentTime || 0) + (e.shiftKey ? 1 : 1 / 30)); break;
     case 'Home': trPause(); trSeek(TR.in); break;

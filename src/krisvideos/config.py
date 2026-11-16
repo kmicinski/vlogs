@@ -41,6 +41,10 @@ class Config:
     @classmethod
     def load(cls) -> "Config":
         c = cls()
+        if "KRISVIDEOS_CONFIG_DIR" in os.environ:
+            # An explicitly pointed config dir is a sandbox (tests, a second library): its vlogs live next
+            # to it, never in the real ~/Vlogs — even when its config.yaml is missing.
+            c.vlogs_dir = str(CONFIG_DIR / "vlogs")
         if CONFIG_FILE.exists():
             data = yaml.safe_load(CONFIG_FILE.read_text()) or {}
             for k, v in data.items():

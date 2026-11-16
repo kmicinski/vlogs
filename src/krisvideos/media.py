@@ -12,6 +12,12 @@ from .project import CHANNELS, Project
 
 PROXY_H = 540
 _pool = ThreadPoolExecutor(max_workers=2)
+_bg = __import__("threading").local()       # set in the pool's workers: run ffmpeg at low priority there
+
+
+def _nice(cmd: list[str]) -> list[str]:
+    """Background preparation must never make the editor stutter: its ffmpeg runs at low CPU priority."""
+    return (["nice", "-n", "12"] + cmd) if getattr(_bg, "low", False) else cmd
 
 
 def proxy_path(p: Project, src_rel: str) -> Path:
@@ -78,12 +84,12 @@ def make_proxy(p: Project, src_rel: str, force: bool = False) -> Path:
             "-pix_fmt", "yuv420p", "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
     cmd += (["-c:a", "aac", "-b:a", "96k", "-ac", "2"] if info.has_audio else ["-an"])
     cmd += ["-movflags", "+faststart", str(tmp)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(_nice(cmd), capture_output=True, text=True)
     if r.returncode != 0 and info.hdr:
         vf = f"scale={fw}:{fh}:out_transfer=bt709:out_primaries=bt709:out_color_matrix=bt709,fps=30,format=yuv420p"
         cmd = [c for c in cmd if c not in ("-init_hw_device", "videotoolbox=vt", "-filter_hw_device", "vt")]
         cmd[cmd.index("-vf") + 1] = vf
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(_nice(cmd), capture_output=True, text=True)
     if r.returncode != 0:
         raise RuntimeError(r.stderr)
     tmp.rename(dst)
@@ -111,8 +117,9 @@ def import_file(p: Project, src: Path, copy: bool = True) -> str:
 
 
 def prepare_async(p: Project, src_rel: str) -> None:
-    """Kick off thumbnail + proxy generation in the background."""
+    """Kick off thumbnail + (if needed) proxy + loudness in the background, at low CPU priority."""
     def work():
+        _bg.low = True
         try:
             prepare(p, src_rel)
         except Exception as e:  # pragma: no cover
@@ -120,12 +127,24 @@ def prepare_async(p: Project, src_rel: str) -> None:
     _pool.submit(work)
 
 
+def needs_proxy(info: MediaInfo | None) -> bool:
+    """Only sources the browser cannot play as they are get a 540p proxy: HDR, HEVC/ProRes/..., above
+    1080p. A camera take (H.264 1080p) or a phone's SDR H.264 clip is used directly, like Premiere plays
+    its sources, so a new clip is ready the moment it lands."""
+    return not browser_playable(info)
+
+
 def prepare(p: Project, src_rel: str) -> None:
+    """Everything a clip needs to be edited, cheapest first: thumbnail (one frame), loudness (one audio
+    pass), the loudness after the voice polish (a second audio pass), and a proxy only when the browser
+    cannot play the source itself."""
     make_thumbnail(p, src_rel)
-    make_proxy(p, src_rel)
-    measure_loudness(p.resolve(src_rel), p.cache_dir, "auto")    # + one-sided detection
+    src = p.resolve(src_rel)
+    measure_loudness(src, p.cache_dir, "auto")    # + one-sided detection
     if p.audio.polish:
-        voice_filters(p.resolve(src_rel), p.cache_dir, "auto", p.audio.denoise)   # loudness after the voice polish
+        voice_filters(src, p.cache_dir, "auto", p.audio.denoise)   # loudness after the voice polish
+    if needs_proxy(probe(src, p.cache_dir)):
+        make_proxy(p, src_rel)
 
 
 def media_status(p: Project, src_rel: str) -> dict:
@@ -169,14 +188,16 @@ def rnnoise_model() -> Path | None:
     return f if f.exists() else None
 
 
-def voice_chain(denoise: float = 10.0, model: Path | None = None, pregain_db: float = 0.0) -> str:
+def voice_chain(denoise: float = 10.0, model: Path | None = None, pregain_db: float = 0.0, measure: bool = False) -> str:
     """The voice-polish filter chain (see above). `denoise` is roughly the dB taken off the noise floor
-    (0 = none); `pregain_db` brings the take to VOICE_PRE_LUFS before the chain (level_gain_db)."""
+    (0 = none); `pregain_db` brings the take to VOICE_PRE_LUFS before the chain (level_gain_db).
+    measure=True leaves the denoiser out: it changes the integrated loudness by under 0.2 LU (measured)
+    but costs seconds per minute, so the level is measured without it."""
     parts = []
     if abs(pregain_db) > 0.05:
         parts.append(f"volume={pregain_db:.2f}dB")
     parts.append("highpass=f=90:p=2")
-    if denoise > 0:
+    if denoise > 0 and not measure:
         if model:
             parts.append(f"arnndn=m={_fpath(model)}:mix={min(1.0, denoise / 15):.2f}")
         else:
@@ -198,15 +219,15 @@ def voice_state(path: Path, cache_dir: Path | None, channel: str, denoise: float
     raw = cached_loudness(path, cache_dir, channel)
     pre = level_gain_db(raw, VOICE_PRE_LUFS)
     ch = effective_channel(path, cache_dir, channel, compute=False)
-    return {"pregain": round(pre, 2), "lufs": cached_loudness(path, cache_dir, ch, voice_chain(denoise, rnnoise_model(), pre))}
+    return {"pregain": round(pre, 2), "lufs": cached_loudness(path, cache_dir, ch, voice_chain(denoise, rnnoise_model(), pre, measure=True))}
 
 
 def voice_filters(path: Path, cache_dir: Path | None, channel: str, denoise: float) -> tuple[str, float | None]:
     """(polish chain for this file, loudness after it) — the chain includes the pre-gain from the file's
     own loudness; both cached."""
     pre = level_gain_db(measure_loudness(path, cache_dir, channel), VOICE_PRE_LUFS)
-    chain = voice_chain(denoise, rnnoise_model(), pre)
-    return chain, measure_loudness(path, cache_dir, channel, chain)
+    lufs = measure_loudness(path, cache_dir, channel, voice_chain(denoise, rnnoise_model(), pre, measure=True))
+    return voice_chain(denoise, rnnoise_model(), pre), lufs
 
 
 def _fpath(f: Path) -> str:
@@ -234,18 +255,20 @@ def _read_cache(f: Path | None, path: Path) -> dict | None:
 
 
 def _audio_stats(path: Path, af: str) -> tuple[float | None, list[float]]:
-    """One ffmpeg pass over the audio: (integrated LUFS or None if silent, per-channel RMS dB)."""
-    import json, re
-    r = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-vn", "-i", str(path), "-af",
-                        af + "astats=measure_overall=none:measure_perchannel=RMS_level,loudnorm=print_format=json",
-                        "-f", "null", "-"], capture_output=True, text=True)
+    """One ffmpeg pass over the audio: (integrated LUFS or None if silent, per-channel RMS dB).
+    Measured with ebur128 — loudnorm's measuring mode resamples to 192 kHz and is ten times slower for
+    the same integrated loudness."""
+    import re
+    r = subprocess.run(_nice(["ffmpeg", "-hide_banner", "-nostats", "-vn", "-i", str(path), "-af",
+                              af + "astats=measure_overall=none:measure_perchannel=RMS_level,ebur128=framelog=quiet",
+                              "-f", "null", "-"]), capture_output=True, text=True)
     lufs: float | None = None
-    m = re.search(r"\{[^{}]*\"input_i\"[^{}]*\}", r.stderr, re.S)
-    if m:
+    m = re.search(r"Integrated loudness:\s*I:\s*(-?[0-9.]+|-inf)\s*LUFS", r.stderr)
+    if m and m.group(1) != "-inf":
         try:
-            v = float(json.loads(m.group(0))["input_i"])
+            v = float(m.group(1))
             lufs = v if v > -60 else None
-        except Exception:
+        except ValueError:
             lufs = None
     rms = []
     for v in re.findall(r"Channel: \d+\s*\n.*?RMS level dB: (\S+)", r.stderr, re.S):
@@ -411,6 +434,9 @@ def ingest_recording(p: Project, blob: Path, kind: str, stamp: str, container: s
 
 # --------------------------------------------------------------------------- filmstrips
 
+KEYFRAME_STRIP_SPACING = 4.0    # seconds between filmstrip frames above which keyframe-only decoding is used
+
+
 def filmstrip(p: Project, src_rel: str, n: int = 8, start: float = 0.0, end: float | None = None, height: int = 72) -> Path:
     """n evenly spaced frames between start and end tiled into one JPEG (from the proxy when available)."""
     import hashlib
@@ -419,7 +445,7 @@ def filmstrip(p: Project, src_rel: str, n: int = 8, start: float = 0.0, end: flo
     end = info.duration if end is None else min(end, info.duration)
     start = max(0.0, min(start, end))
     dur = max(0.05, end - start)
-    key = hashlib.sha1(f"v2|{src_rel}|{n}|{start:.2f}|{end:.2f}|{height}|{src.stat().st_mtime}".encode()).hexdigest()[:16]
+    key = hashlib.sha1(f"v3|{src_rel}|{n}|{start:.2f}|{end:.2f}|{height}|{src.stat().st_mtime}".encode()).hexdigest()[:16]
     out = p.cache_dir / "strips" / f"{key}.jpg"
     if out.exists():
         return out
@@ -433,7 +459,16 @@ def filmstrip(p: Project, src_rel: str, n: int = 8, start: float = 0.0, end: flo
     vf = f"select='{sel}',scale={fw}:{height},tile={n}x1"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{seek:.3f}", "-t", f"{dur + 1.5:.3f}",
            "-i", str(src), "-vf", vf, "-frames:v", "1", "-fps_mode", "passthrough", "-q:v", "5", str(out)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = None
+    if dur / n >= KEYFRAME_STRIP_SPACING:
+        # frames far apart: decode keyframes only, in hardware (a 1080p take: ~1 s instead of ~10 s for the
+        # whole clip). Cameras put a keyframe every 1–3 s, so the strip is still on the frame it should be.
+        fast = cmd[:1] + ["-hwaccel", "videotoolbox", "-skip_frame", "nokey"] + cmd[1:]
+        r = subprocess.run(fast, capture_output=True, text=True)
+        if r.returncode != 0 or not out.exists():
+            r = subprocess.run(cmd[:1] + ["-skip_frame", "nokey"] + cmd[1:], capture_output=True, text=True)
+    if r is None or r.returncode != 0 or not out.exists():
+        r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not out.exists():
         # fallback: evenly sampled by fps
         vf = f"fps={n / dur:.6f},scale={fw}:{height},tile={n}x1"

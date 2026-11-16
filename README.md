@@ -42,11 +42,17 @@ between masthead and date card (`intro_black_hold`), title-card colors for new v
    October 23", 2 s), with the intro **sting** (a slice of a song) fading in over the masthead
    and out as the first clip cuts in. Put the playhead at the start and press `R` to record
    yourself in front of it. Timings, the song and where in it to start are in Settings ▸ App.
-2. **+ Add ▸ From Immich** (or Files) → pick the day → *Add all*. With *Trim each clip before
-   it goes on the timeline* on (the default), the new clips then open one by one in the
-   **trimmer**: drag the yellow handles (or play and press `I` / `O`) around the part you want
-   and press `⏎` to add it and move to the next clip; `⇧⏎` adds it and lets you pick another
-   part of the same clip; `N` skips (skipped clips stay in *+ Add ▸ In this project*).
+2. **+ Add ▸ From Immich** (or Files) → pick the day → *Add all*. With *Pick each clip's part and
+   speed before it goes on the timeline* on (the default), the new clips open in the **trimmer**
+   as a queue: a strip of the clips along the top, the current one playing below. Drag the yellow
+   handles (or play and press `I` / `O`) around the part you want, set a **speed** (8× turns a
+   minute of walking into 7½ s; the preview plays at that speed) and press `⏎` to queue it; `N`
+   leaves a clip out; `J` / `L` or a click on the strip go back to an earlier clip, whose marks are
+   kept. When the last clip is decided, everything queued goes on the timeline together, in order,
+   as one undo step (*Add N queued* does it earlier). `⇧⏎` adds the current part right away and lets
+   you pick another part of the same clip. Clips you leave out stay in *+ Add ▸ In this project*.
+   Trimming starts the moment a clip has landed: the browser plays camera takes and iPhone HEVC
+   clips directly, so nothing waits for a proxy.
 3. Edit on the timeline. Drag the red playhead (or anywhere on the ruler) to scrub; the player
    plays the timeline **live from proxies**, including title cards, captions, crossfades, music
    and narration. Mark a part with `I` and `O` (or shift-drag the ruler, or `X` for the whole
@@ -120,6 +126,13 @@ is loudness-normalized. Per-clip volume/mute and fit are in the inspector. A tak
 reached one channel (a DJI Mic plugged into the right input) is detected on import and that channel
 is copied to both ears, in the live player and the render; the inspector's *Channels* select overrides
 it (stereo as recorded, left or right to both ears, mix to mono) — `channel:` in the YAML.
+
+Preparing clips is cheap by design: a new clip gets a thumbnail (one frame) and two quick audio passes
+for its loudness, all at low CPU priority in the background, and a 540p proxy *only* when the browser
+cannot play the source itself (HDR, HEVC, above 1080p) — a camera take or an SDR H.264 clip is used as
+it is, like Premiere plays its sources. An 8-minute 1080p take is ready in about four seconds. Imports
+from Immich download everything first and prepare in the background, so the trimmer opens right away.
+Filmstrips decode keyframes only, in hardware.
 
 Voice polish (on by default, *Settings → This vlog → Polish voices*): every clip and narration goes
 through a gentle produced-voice chain in the render — the take is brought to a fixed level, rumble

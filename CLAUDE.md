@@ -91,6 +91,19 @@ their pictures. Server: `POST /split` `/cut` `/keep`; `POST /segments` takes `in
 `at_time` (insert at a timeline time, splitting there) and returns `new_id`. Imports take
 `add: false` (Immich jobs report `added`) so the GUI can open the clips in the trimmer instead.
 
+Preparing clips (`media.prepare`, run by `prepare_async` at low priority via `_nice`): thumbnail, loudness
+(`_audio_stats` uses `ebur128`, not `loudnorm`'s measuring mode which is 10× slower), the loudness after the
+voice polish measured *without* the denoiser (`voice_chain(..., measure=True)`: loudness-neutral, seconds per
+minute saved), and a proxy only when `media.needs_proxy(info)` (= not `browser_playable`: HDR, HEVC, >1080p).
+`filmstrip` decodes keyframes only with `-hwaccel videotoolbox -skip_frame nokey` when the frames are ≥
+`KEYFRAME_STRIP_SPACING` apart (falls back to a full decode). The Immich job downloads everything, makes
+thumbnails and calls `prepare_async`; nothing waits on a transcode. The GUI trimmer (`TR.items`) plays a
+clip's own file when the browser can (`canPlaySource`: HEVC on a Mac) instead of waiting for a proxy.
+Trimmer queue: each item keeps `in/out/speed/take`; Enter = `trQueue`, N = `trSkip`, deciding the last one
+runs `trAddAll` → `POST /api/projects/{name}/segments/batch {items: [{src, in, out, speed}], at_time?}`
+(one undo step; `POST /segments` kind clip also takes `speed`). The preview plays at the item's speed
+(`trRate`; >16× is stepped).
+
 GUI timeline (`app.js`): blocks get log-scaled widths (`layoutTimeline`, `TL`), time is linear
 inside a block, and `tToX`/`xToT` map everything (ruler, lanes, marks, playhead). Marks are `MK`
 (timeline time). The trimmer (`openTrimmer`, `TR`) is the source viewer for import queues, library
