@@ -220,8 +220,13 @@ const VP = (() => {
   }
   function reset() { for (const v of videos) { v.pause(); v.removeAttribute('src'); v.dataset.url = ''; v.load(); v.classList.add('hidden'); } cards.forEach(c => c.classList.add('hidden')); owner.clear(); paintLayers(-1); paintCredits(-1); syncPip(null); }
   // keep a <video> on `want` at `rate`: the browser plays up to 16×, anything faster is stepped frame by frame
-  function drive(el, rate, want, key) {
-    const fast = rate > 16;
+  function drive(el, rate, want, key, hold = false) {
+    // hold: the footage has run out (or the time is at its very end) — park on the last frame and
+    // never call play(): play() on an ended <video> restarts it from the first frame, which then
+    // gets seeked back to the end, ends again… two frames flickering back and forth.
+    const end = isFinite(el.duration) && el.duration > 0 ? el.duration : null;
+    if (end != null && want >= end - 0.08) { hold = true; want = Math.max(0, end - 0.08); }
+    const fast = rate > 16 || hold;
     try { el.playbackRate = fast ? 1 : clamp(rate, 0.0625, 16); } catch { }
     const drift = Math.abs(el.currentTime - want);
     if (fast) {
@@ -234,7 +239,7 @@ const VP = (() => {
     // Never reseek while a seek is in flight (the stall from the last seek is what causes the drift).
     const tol = playing ? 0.3 * Math.max(1, rate) : 0.04;
     if (el.dataset.seg !== key || (!el.seeking && drift > tol)) { try { el.currentTime = want; } catch { } el.dataset.seg = key; }
-    if (playing && el.paused) el.play().catch(() => { });
+    if (playing && el.paused && !el.ended) el.play().catch(() => { });
     if (!playing && !el.paused) el.pause();
     return false;
   }
@@ -247,12 +252,12 @@ const VP = (() => {
     setSrc(v, url);
     // inset time = offset + inset speed × clip source time; it runs at its own speed on top of the clip's
     let want = Math.max(0, (pip.offset || 0) + (pip.speed || 1) * ((s.in || 0) + (t - s.placed.start) * (s.speed || 1)));
-    const pd = pip.media && pip.media.duration;
-    if (pd) want = Math.min(want, Math.max(0, pd - 0.05));     // past its footage: hold the last frame (like the render), never seek past the end
+    const pd = pip.media && pip.media.duration, over = !!pd && want >= pd - 0.08;   // past its footage: hold the last frame (like the render)
+    if (over) want = Math.max(0, pd - 0.08);
     const rate = (s.speed || 1) * (pip.speed || 1), full = pipIsFull(pip);
-    v.muted = !(pip.volume > 0) || !playing || rate > MUTE_ABOVE;
+    v.muted = !(pip.volume > 0) || !playing || rate > MUTE_ABOVE || over;
     v.volume = clamp((pip.volume || 0) * opacity, 0, 1);
-    drive(v, rate, want, s.id);
+    drive(v, rate, want, s.id, over);
     const [W, H] = canvasWH(), cr = $('#canvas').getBoundingClientRect();
     box.className = `pipbox ${pip.shape || 'round'}${sel === s.id ? ' sel' : ''}${full ? ' full' : ''}`;
     box.style.borderRadius = pip.shape === 'circle' ? '50%' : pip.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width, cr.height) * 0.02)}px`;
