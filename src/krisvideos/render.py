@@ -22,6 +22,7 @@ from .project import Overlay, Pip, Project, Segment
 AUDIO_FMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
 MASTER_LUFS = -16.0      # loudness of the final mix (clips are matched to audio.target_lufs, then gained to this)
 MUTE_ABOVE = 20.0     # a clip faster than this plays silent (a timelapse): sped-up speech is just noise
+PIP_FADE = 0.5        # seconds a video over a clip dissolves out when its footage runs out before the clip does
 CANVAS = {"portrait": (1080, 1920), "landscape": (1920, 1080), "square": (1080, 1080)}
 
 
@@ -335,8 +336,14 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 pin = pip.time(pl.src_in)
                 seek = ["-ss", f"{pin:.3f}"] if pin > 0 else []
                 kp = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
+                # where (in output seconds from the clip's start) the inset's footage runs out; past that
+                # it dissolves away over PIP_FADE and the clip shows again
+                pend = (pinfo.duration - pin) / rate if pinfo.duration and rate > 0 else dur
+                ends_early = pend < dur - 0.05
+                pdur = min(dur, max(0.1, pend)) if ends_early else dur
+                pfade = f"fade=t=out:st={max(0.0, pdur - PIP_FADE):.3f}:d={min(PIP_FADE, pdur):.3f}:alpha=1"
                 if pip.volume > 0 and pinfo.has_audio and rate <= MUTE_ABOVE:
-                    pip_audio = (kp, pin, rate, pip.volume)       # mixed into the clip's sound below
+                    pip_audio = (kp, pin, rate, pip.volume, pdur if ends_early else None)   # mixed into the clip's sound below
                 full = px <= 0 and py <= 0 and px + pw >= W and py + ph >= H     # B-roll: covers the picture
                 pchain = ["setpts=PTS-STARTPTS"]
                 if pin < 0:            # the inset's file starts after the clip's in point: hold its first frame until then
@@ -351,26 +358,29 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     pchain.append(f"scale={qw}:{qh}:flags=bicubic,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black")
                 else:
                     pchain.append(f"scale={pw}:{ph}:force_original_aspect_ratio=increase:flags=bicubic,crop={pw}:{ph}")
-                pchain.append(f"setsar=1,format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
+                pchain.append(f"setsar=1,format=yuv420p,trim=duration={pdur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
                 radius = max(2, int(min(W, H) * 0.02))
+                # when the footage runs out early the inset (and its shadow) dissolve out and the overlay
+                # ends (eof_action=pass: the clip shows again); otherwise the last frame stays up to the end
+                eof = "pass" if ends_early else "repeat"
                 if full:                       # no mask, no shadow: the inset simply replaces the picture
-                    filters.append(f"[{kp}:v]{','.join(pchain)}[pa{i}]")
-                    filters.append(f"[{cur}][pa{i}]overlay=0:0:eof_action=repeat[pp{i}]")
+                    filters.append(f"[{kp}:v]{','.join(pchain)}" + (f",format=yuva420p,{pfade}" if ends_early else "") + f"[pa{i}]")
+                    filters.append(f"[{cur}][pa{i}]overlay=0:0:eof_action={eof}[pp{i}]")
                     cur = f"pp{i}"
-                elif pip.shape in ("round", "circle"):
-                    km = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
-                                    "-i", str(titles.render_pip_mask(p.cache_dir, pw, ph, pip.shape, radius))])
-                    filters.append(f"[{kp}:v]{','.join(pchain)}[pv{i}]")
-                    filters.append(f"[{km}:v]format=gray,fps={FPS}[pm{i}]")
-                    filters.append(f"[pv{i}][pm{i}]alphamerge[pa{i}]")
                 else:
-                    filters.append(f"[{kp}:v]{','.join(pchain)}[pa{i}]")
-                if not full:
-                    ks = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}",
+                    if pip.shape in ("round", "circle"):
+                        km = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{pdur:.3f}",
+                                        "-i", str(titles.render_pip_mask(p.cache_dir, pw, ph, pip.shape, radius))])
+                        filters.append(f"[{kp}:v]{','.join(pchain)}[pv{i}]")
+                        filters.append(f"[{km}:v]format=gray,fps={FPS}[pm{i}]")
+                        filters.append(f"[pv{i}][pm{i}]alphamerge" + (f",{pfade}" if ends_early else "") + f"[pa{i}]")
+                    else:
+                        filters.append(f"[{kp}:v]{','.join(pchain)}" + (f",format=yuva420p,{pfade}" if ends_early else "") + f"[pa{i}]")
+                    ks = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{pdur:.3f}",
                                     "-i", str(titles.render_pip_shadow(p.cache_dir, W, H, px, py, pw, ph, pip.shape, radius))])
-                    filters.append(f"[{cur}][{ks}:v]overlay=0:0:eof_action=pass[ps{i}]")
-                    # eof_action=repeat: if the inset's file ends early its last frame stays up
-                    filters.append(f"[ps{i}][pa{i}]overlay={px}:{py}:eof_action=repeat[pp{i}]")
+                    filters.append(f"[{ks}:v]format=yuva420p,fps={FPS}" + (f",{pfade}" if ends_early else "") + f"[psh{i}]")
+                    filters.append(f"[{cur}][psh{i}]overlay=0:0:eof_action=pass[ps{i}]")
+                    filters.append(f"[ps{i}][pa{i}]overlay={px}:{py}:eof_action={eof}[pp{i}]")
                     cur = f"pp{i}"
             # captions/overlays
             ovs = list(s.overlays)
@@ -418,7 +428,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             else:
                 filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[{a_main}]")
             if pip_audio:
-                kp, pin, rate, vol = pip_audio
+                kp, pin, rate, vol, pend_ = pip_audio
                 pch = ["asetpts=PTS-STARTPTS"]
                 if pin < 0:
                     pch.append(f"adelay={int(-pin * 1000)}:all=1")
@@ -430,7 +440,10 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 # level-matched like a clip (ambient sound under the picture sits at `vol` of the target level)
                 plufs = media.measure_loudness(ppath, p.cache_dir, pch_) if p.audio.match_levels else None
                 pgain = media.level_gain_db(plufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
-                pch += [AUDIO_FMT, f"volume={vol:.3f}*{10 ** (pgain / 20):.4f}", f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}"]
+                pch += [AUDIO_FMT, f"volume={vol:.3f}*{10 ** (pgain / 20):.4f}"]
+                if pend_ is not None:          # its sound fades with its picture
+                    pch.append(f"afade=t=out:st={max(0.0, pend_ - PIP_FADE):.3f}:d={min(PIP_FADE, pend_):.3f}")
+                pch.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
                 filters.append(f"[{kp}:a]{','.join(pch)}[ap{i}]")
                 filters.append(f"[{a_main}][ap{i}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a{i}]")
         v_labels.append(f"v{i}")

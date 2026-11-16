@@ -56,7 +56,7 @@ function closePopover() { const el = $('#popover'); el.classList.add('hidden'); 
 const field = (label, inner) => `<div class="field"><label>${label}</label>${inner}</div>`;
 // speed: a log slider from 0.1× to 1000× (1× in the middle, detents at round numbers) plus a typed number
 // that takes any positive value. The browser can only *play* up to 16×; faster clips are stepped frame by frame.
-const SPEED_MIN = 0.1, SPEED_MAX = 1000, MUTE_ABOVE = 20;
+const SPEED_MIN = 0.1, SPEED_MAX = 1000, MUTE_ABOVE = 20, PIP_FADE = 0.5;   // PIP_FADE: a video over a clip dissolves out over this when its footage runs out first (render.PIP_FADE)
 const speedToSlider = v => Math.round(clamp(Math.log10(Math.max(SPEED_MIN, Math.min(SPEED_MAX, +v || 1))) + 1, 0, 4) * 100);   // 0..400
 const sliderToSpeed = x => { const v = Math.pow(10, x / 100 - 1); return v >= 10 ? Math.round(v) : v >= 2 ? Math.round(v * 4) / 4 : Math.round(v * 20) / 20; };
 const fmtSpeed = v => { v = +v || 1; return (v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1).replace(/\.0$/, '') : (+v.toFixed(3)).toString()) + '×'; };
@@ -252,12 +252,17 @@ const VP = (() => {
     setSrc(v, url);
     // inset time = offset + inset speed × clip source time; it runs at its own speed on top of the clip's
     let want = Math.max(0, (pip.offset || 0) + (pip.speed || 1) * ((s.in || 0) + (t - s.placed.start) * (s.speed || 1)));
-    const pd = pip.media && pip.media.duration, over = !!pd && want >= pd - 0.08;   // past its footage: hold the last frame (like the render)
-    if (over) want = Math.max(0, pd - 0.08);
     const rate = (s.speed || 1) * (pip.speed || 1), full = pipIsFull(pip);
+    // when its footage runs out before the clip does, it dissolves away over PIP_FADE and the clip shows again
+    const pd = pip.media && pip.media.duration, pend = pd ? s.placed.start + (pd - ((pip.offset || 0) + (pip.speed || 1) * (s.in || 0))) / rate : Infinity;
+    const ends = pend < s.placed.end - 0.05, over = ends && t >= pend - 0.08, gone = ends && t >= pend;
+    if (gone) { box.classList.add('hidden'); box.dataset.seg = ''; if (!v.paused) v.pause(); return; }
+    const fadeK = ends ? clamp((pend - t) / PIP_FADE, 0, 1) : 1;
+    if (over) want = Math.max(0, pd - 0.08);
     v.muted = !(pip.volume > 0) || !playing || rate > MUTE_ABOVE || over;
-    v.volume = clamp((pip.volume || 0) * opacity, 0, 1);
+    v.volume = clamp((pip.volume || 0) * opacity * fadeK, 0, 1);
     drive(v, rate, want, s.id, over);
+    opacity *= fadeK;
     const [W, H] = canvasWH(), cr = $('#canvas').getBoundingClientRect();
     box.className = `pipbox ${pip.shape || 'round'}${sel === s.id ? ' sel' : ''}${full ? ' full' : ''}`;
     box.style.borderRadius = pip.shape === 'circle' ? '50%' : pip.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width, cr.height) * 0.02)}px`;

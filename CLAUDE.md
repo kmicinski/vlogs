@@ -77,8 +77,11 @@ layout: "full" | "corner:br", volume?}`; `PATCH segments/{id} {pip: {volume}}`; 
 --at 0:32 --layout full [--in 0:05 --out 0:20 --speed 4 --sound 0.3]`, `vlog pip PROJ s3 --layout full
 --sound 0.5`; the trimmer's targets "Over the video at the playhead" (default label) and "In a small frame…"
 use it. When Kris says "put this clip over the video while I keep talking" → `--layout full` (sound off);
-"let me hear it a bit" → `--sound 0.3`. The live player holds the inset's last frame past its footage
-(`syncPip` clamps to `media.duration`) and never lets the full inset be dragged. Clip `speed` takes any positive number
+"let me hear it a bit" → `--sound 0.3`. When the footage runs out before the clip piece does (a trim that
+outgrew it), the inset dissolves out over `render.PIP_FADE` (0.5 s, alpha fade + `eof_action=pass`, its sound
+`afade`s with it) and the clip shows again; the live player mirrors it (`syncPip`: `pend`, `PIP_FADE`) and
+never calls play() on an ended `<video>` (that restarts it from frame 0: the old first/last-frame flicker).
+A full inset can't be dragged. Clip `speed` takes any positive number
 (GUI: log slider 0.1–1000× + typed number); above `render.MUTE_ABOVE` (20×) the clip's audio is
 dropped; the live player steps frames for clips faster than 16× (`VP.drive`). `edits.pip_layout(seg, corner|corner-large|stacked|hidden,
 (W, H), aspect, pos)` sets the standard layouts (the JS `pipLayoutBoxes` mirrors it). `render.py` places
