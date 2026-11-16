@@ -247,6 +247,28 @@ def _hexcolor(s: str) -> str:
     return "0x" + s.strip().lstrip("#")[:6]
 
 
+def voice_jobs(p: Project, infos=None) -> list[tuple[Path, Path, str, float]]:
+    """(file, cache dir, channel, denoise) for every clip whose sound gets the voice polish in a render."""
+    out, seen = [], set()
+    for s in p.timeline:
+        if s.kind != "clip" or s.mute or s.volume <= 0 or s.speed > MUTE_ABOVE or not polish_on(p, s.polish):
+            continue
+        src = p.resolve(s.src)
+        if not src.exists():
+            continue
+        try:
+            info = (infos or {}).get(s.src) or probe(src, p.cache_dir)
+        except Exception:
+            continue
+        if not info.has_audio:
+            continue
+        ch = media.effective_channel(src, p.cache_dir, s.channel)
+        if (src, ch) not in seen:
+            seen.add((src, ch))
+            out.append((src, p.cache_dir, ch, p.audio.denoise))
+    return out
+
+
 def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None) -> Plan:
     """mode: 'final' or 'preview' (half-res, fast encode)."""
     infos = infos if infos is not None else probe_project(p)
@@ -304,6 +326,8 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             vchain = ["setpts=PTS-STARTPTS"]
             if s.speed != 1.0:
                 vchain.append(f"setpts=PTS/{s.speed:.6g}")
+                if s.speed > 1.0:        # drop the frames a faster clip won't show *before* the costly conversions (a 4x HDR clip: 4x fewer tone-maps)
+                    vchain.append(f"fps={FPS}")
             # the picture fills the frame, or the box it was given (screen + camera layouts)
             bx, by, bw, bh = region(s.box, W, H)
             fw, fh = _fit(info.width, info.height, bw, bh)
@@ -350,6 +374,8 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
                 if rate != 1.0:
                     pchain.append(f"setpts=PTS/{rate:.6g}")
+                    if rate > 1.0:       # decimate first: the tone-map / scale below then see only the frames that are kept
+                        pchain.append(f"fps={FPS}")
                 if pinfo.hdr and hdr_mode != "none":
                     any_hdr = True
                     pchain.append(_hdr_chain(hdr_mode, *_fit(pinfo.width, pinfo.height, pw, ph)).rstrip(","))
@@ -407,24 +433,32 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
                 achain = ["asetpts=PTS-STARTPTS"]
                 ch = media.effective_channel(src, p.cache_dir, s.channel)
-                if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
-                    achain.append(media.CHANNEL_PAN[ch])
                 polished = polish_on(p, s.polish)
+                a_src, lift = f"{k}:a", 1.0
                 if polished:                     # voice polish: denoise / de-ess / EQ / compress, before any speed change
                     chain, lufs = media.voice_filters(src, p.cache_dir, ch, p.audio.denoise)
-                    achain.append(chain)
+                    vf = media.polished_audio(src, p.cache_dir, ch, p.audio.denoise, build=False)
+                    if vf is not None:           # the cached polished sound: the (slow, single-threaded) chain stays out of the graph
+                        kv = add_input(["-ss", f"{pl.src_in:.3f}", "-t", f"{pl.src_out - pl.src_in + 0.1:.3f}", "-i", str(vf)])
+                        a_src, lift = f"{kv}:a", 1.0 / media.VOICE_HEADROOM
+                    else:
+                        if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
+                            achain.append(media.CHANNEL_PAN[ch])
+                        achain.append(chain)
                 else:
+                    if ch in media.CHANNEL_PAN:
+                        achain.append(media.CHANNEL_PAN[ch])
                     lufs = media.measure_loudness(src, p.cache_dir, ch) if p.audio.match_levels else None
                 if s.speed != 1.0:
                     achain.append(_atempo(s.speed))
                 achain.append(AUDIO_FMT)
                 gain = media.level_gain_db(lufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
-                if s.volume != 1.0 or abs(gain) > 0.1:
-                    achain.append(f"volume={s.volume}*{10 ** (gain / 20):.4f}")
+                if s.volume != 1.0 or abs(gain) > 0.1 or lift != 1.0:
+                    achain.append(f"volume={s.volume * lift:.4g}*{10 ** (gain / 20):.4f}")
                 if polished:
                     achain.append(media.VOICE_LIMITER)
                 achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
-                filters.append(f"[{k}:a]{','.join(achain)}[{a_main}]")
+                filters.append(f"[{a_src}]{','.join(achain)}[{a_main}]")
             else:
                 filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[{a_main}]")
             if pip_audio:
@@ -697,9 +731,14 @@ def run_plan(plan: Plan, progress: Callable[[float, float], None] | None = None,
     return plan.output
 
 
-def render(p: Project, mode: str = "final", progress=None, cancel=None, hdr_mode: str = "vt") -> Plan:
-    """Build + run, retrying with software HDR conversion if VideoToolbox path fails."""
+def render(p: Project, mode: str = "final", progress=None, cancel=None, hdr_mode: str = "vt", status=None) -> Plan:
+    """Build + run, retrying with software HDR conversion if VideoToolbox path fails. `status(text)` gets
+    what is going on before the ffmpeg run (polishing voices ahead of it, in parallel, cached)."""
     infos = probe_project(p)
+    if p.audio.polish:
+        media.polish_many(voice_jobs(p, infos), cancel=cancel, status=status)
+    if status:
+        status("")
     plan = build_plan(p, mode=mode, hdr_mode=hdr_mode, infos=infos)
     try:
         run_plan(plan, progress, cancel)

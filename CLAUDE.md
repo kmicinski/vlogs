@@ -154,6 +154,15 @@ clip and voiceover when `audio.polish` (default on; `segment.polish`/`voiceover.
 (`VP.route(el, mode, fx)`). CLI: `vlog set PROJ s4 polish=off`, `vlog set PROJ audio polish=off denoise=6`.
 When Kris says "my audio sounds muffled/noisy/harsh" → check polish is on, raise/lower `denoise`; "leave this
 clip as recorded" → `polish=off` on that segment.
+The polished sound of each clip is cached as `cache/<name>.voice.<ch>.<hash>.flac` (`media.polished_audio`, 16-bit,
+written `VOICE_HEADROOM` down): the denoiser is single-threaded at ~9× realtime and ffmpeg runs the whole filter graph
+in one thread, so with it inline a 15-min export took 25 min. `media.prepare` builds it in the background after import;
+`render.render` builds the missing ones in parallel first (`render.voice_jobs` → `media.polish_many`, `status()` →
+`job.message` "polishing voice tracks…"); `build_plan` uses the file as an extra `-ss in -t len -i` input when it is
+there, else the inline chain (same sound within 0.1 dB). Faster-than-1× clips and insets put `fps=N` right after the
+`setpts` speed change so the HDR tone-map / scale only see kept frames (a 4× HDR B-roll: 0.5× → 1.6× realtime).
+Jobs: `POST render` while an export runs returns the running job (the GUI joins it; a preview no longer cancels an
+export); `openProject` re-attaches to a running job after a reload (`GET /api/jobs`).
 The final master (`render.MASTER_LUFS` -16) is a static gain + true-peak limiter when `match_levels` is on
 (single-pass `loudnorm` is an AGC that pumped room noise up between phrases); `loudnorm` only when it is off.
 

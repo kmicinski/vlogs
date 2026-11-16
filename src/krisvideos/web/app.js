@@ -94,7 +94,13 @@ async function openProject(name) {
   VP.reset(); AUD.reset();
   setProject(await api('GET', `/api/projects/${name}`));
   checkRecoverable();
+  // a render or export still running for this vlog (the page was reloaded while it ran): show it again
+  try {
+    const run = (await api('GET', '/api/jobs')).find(j => j.status === 'running' && j.project === name && (j.kind === 'render' || j.kind === 'preview'));
+    if (run) watchJob(run, jobDone(run.kind, 0));
+  } catch { }
 }
+const jobDone = (kind, t) => async () => { await refresh(); if (kind === 'preview') { seek(t, true); toast('Preview ready — the player now shows the real mix'); } else toast('Export complete'); };
 function setProject(p) {
   P = p;
   if (sel && !P.timeline.some(s => s.id === sel)) sel = null;
@@ -1741,7 +1747,8 @@ $('#jobCancel').onclick = () => job && api('POST', `/api/jobs/${job.id}/cancel`)
 function startRender(kind) {
   if (!P.timeline.length) return toast('Nothing to render yet');
   stop();
-  guard(async () => { const j = await api('POST', `/api/projects/${P.name}/${kind}`); const t = T; watchJob(j, async () => { await refresh(); if (kind === 'preview') { seek(t, true); toast('Preview ready — the player now shows the real mix'); } else toast('Export complete'); }); });
+  if (job && job.kind === kind && job.status === 'running') return toast(kind === 'render' ? 'Already exporting — it carries on' : 'Already rendering');
+  guard(async () => { const j = await api('POST', `/api/projects/${P.name}/${kind}`); watchJob(j, jobDone(kind, T)); });
 }
 $('#renderPreviewBtn').onclick = () => startRender('preview');
 const PRESETS = [

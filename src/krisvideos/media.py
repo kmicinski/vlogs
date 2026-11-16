@@ -141,10 +141,13 @@ def prepare(p: Project, src_rel: str) -> None:
     make_thumbnail(p, src_rel)
     src = p.resolve(src_rel)
     measure_loudness(src, p.cache_dir, "auto")    # + one-sided detection
-    if p.audio.polish:
+    info = probe(src, p.cache_dir)
+    if p.audio.polish and info.has_audio:
         voice_filters(src, p.cache_dir, "auto", p.audio.denoise)   # loudness after the voice polish
-    if needs_proxy(probe(src, p.cache_dir)):
+    if needs_proxy(info):
         make_proxy(p, src_rel)
+    if p.audio.polish and info.has_audio:
+        polished_audio(src, p.cache_dir, "auto", p.audio.denoise)  # the polished sound itself, for renders
 
 
 def media_status(p: Project, src_rel: str) -> dict:
@@ -211,6 +214,70 @@ def voice_chain(denoise: float = 10.0, model: Path | None = None, pregain_db: fl
 
 
 VOICE_LIMITER = "alimiter=limit=0.891:attack=3:release=80:level=0"     # -1 dBFS ceiling after the gain stage
+VOICE_HEADROOM = 0.25     # the cached polished sound is written 12 dB down (16-bit flac) and brought back up on read
+_voice_pool = ThreadPoolExecutor(max_workers=max(2, ((__import__("os").cpu_count() or 4) + 1) // 2))
+
+
+def voice_cache_path(path: Path, cache_dir: Path, channel: str, af: str) -> Path:
+    import hashlib
+    return cache_dir / f"{path.name}.voice.{channel}.{hashlib.sha1(af.encode()).hexdigest()[:10]}.flac"
+
+
+def polished_audio(path: Path, cache_dir: Path | None, channel: str, denoise: float, build: bool = True) -> Path | None:
+    """The file's whole sound after the voice polish (channel pan, pre-gain, the chain — not the level gain
+    or the limiter), as a flac in the cache, written VOICE_HEADROOM down. The denoiser runs single-threaded
+    at ~9× realtime and ffmpeg runs a whole filter graph in one thread, so polishing inside a render made
+    a 15-minute vlog take 25 minutes; built once (in the background after import, or in parallel ahead
+    of a render) it is reused by every render. None when there is no cache dir or `build` is False and it
+    is not there yet."""
+    if not cache_dir:
+        return None
+    ch = effective_channel(path, cache_dir, channel)
+    chain, _ = voice_filters(path, cache_dir, ch, denoise)        # also caches the polished loudness
+    pan = CHANNEL_PAN.get(ch, "")
+    af = (pan + "," if pan else "") + chain + f",volume={VOICE_HEADROOM:g}"
+    out = voice_cache_path(path, cache_dir, ch, af)
+    if out.exists() and out.stat().st_size > 0:
+        return out
+    if not build:
+        return None
+    tmp = out.with_name(out.name + ".part")
+    r = subprocess.run(_nice(["ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-vn", "-i", str(path), "-af", af,
+                              "-c:a", "flac", "-sample_fmt", "s16", "-compression_level", "3", "-f", "flac", str(tmp)]),
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.exists() or tmp.stat().st_size == 0:
+        tmp.unlink(missing_ok=True)
+        raise RuntimeError(f"voice polish of {path.name} failed: {r.stderr.strip()[-300:]}")
+    for old in cache_dir.glob(f"{path.name}.voice.{ch}.*.flac"):     # an earlier chain's version
+        if old != out:
+            old.unlink(missing_ok=True)
+    tmp.replace(out)
+    return out
+
+
+def polish_many(jobs: list[tuple[Path, Path, str, float]], cancel=None, status=None) -> list[Path | None]:
+    """Build the polished sound of several files in parallel (one single-threaded ffmpeg each)."""
+    todo = [(i, j) for i, j in enumerate(jobs) if polished_audio(*j, build=False) is None]
+    out: list[Path | None] = [polished_audio(*j, build=False) for j in jobs]
+    if not todo:
+        return out
+    done = 0
+    if status:
+        status(f"polishing {len(todo)} voice track{'s' if len(todo) > 1 else ''}…")
+    futs = {_voice_pool.submit(polished_audio, *j): i for i, j in todo}
+    for f in futs:
+        if cancel is not None and cancel.is_set():
+            raise RuntimeError("cancelled")
+        try:
+            out[futs[f]] = f.result()
+        except Exception as e:      # noqa: the render falls back to polishing inline
+            out[futs[f]] = None
+            if status:
+                status(str(e)[:120])
+        done += 1
+        if status and done < len(todo):
+            status(f"polishing voice tracks… {done}/{len(todo)}")
+    return out
 
 
 def voice_state(path: Path, cache_dir: Path | None, channel: str, denoise: float) -> dict:

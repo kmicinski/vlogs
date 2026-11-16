@@ -1487,15 +1487,20 @@ def create_app(cfg: Config) -> FastAPI:
     # ------------------------------------------------------------------ render
     def start_render(name: str, mode: str):
         p = load(name)
+        kind = "preview" if mode == "preview" else "render"
         for j in JOBS.values():
-            if j.project == name and j.kind in ("preview", "render") and j.status == "running":
-                j.cancel.set()
-        job = Job("preview" if mode == "preview" else "render", name)
+            if j.project == name and j.kind == kind and j.status == "running":
+                if kind == "render":
+                    return j.to_dict()            # an export already under way: join it rather than start over
+                j.cancel.set()                    # a newer preview replaces the one in progress
+        job = Job(kind, name)
 
         def work(job: Job):
             def prog(frac, secs):
                 job.progress, job.secs = frac, secs
-            plan = render.render(p, mode=mode, progress=prog, cancel=job.cancel)
+            def status(text):
+                job.message = text
+            plan = render.render(p, mode=mode, progress=prog, cancel=job.cancel, status=status)
             job.warnings = plan.warnings
             job.output = str(plan.output)
 
