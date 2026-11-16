@@ -229,7 +229,11 @@ const VP = (() => {
       if (!el.seeking && (drift > 0.04 || el.dataset.seg !== key)) { try { el.currentTime = want; } catch { } el.dataset.seg = key; }
       return true;
     }
-    if (drift > (playing ? 0.3 : 0.04) || el.dataset.seg !== key) { try { el.currentTime = want; } catch { } el.dataset.seg = key; }
+    // the drift we tolerate while playing is wall-clock, so it scales with the rate: a 6x inset drifts
+    // 0.3 s of its own time in 50 ms of ours, and reseeking at that pace stalls the decoder and skips.
+    // Never reseek while a seek is in flight (the stall from the last seek is what causes the drift).
+    const tol = playing ? 0.3 * Math.max(1, rate) : 0.04;
+    if (el.dataset.seg !== key || (!el.seeking && drift > tol)) { try { el.currentTime = want; } catch { } el.dataset.seg = key; }
     if (playing && el.paused) el.play().catch(() => { });
     if (!playing && !el.paused) el.pause();
     return false;
