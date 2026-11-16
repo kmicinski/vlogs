@@ -188,8 +188,11 @@ RNNOISE_MODEL = "rnnoise.rnnn"      # drop a model (e.g. rnnoise-models' bd.rnnn
 GOOD_MIC_RE = re.compile(r"\bdji\b|wireless mic|mic mini|\bmic 2\b|\brx\b|\br[øo]de\b|yeti|snowball|shure|\bsm7|\bmv7|audio-?technica|\bat20\d\d|elgato wave|\bwave[: ]?[13]\b|wave link|focusrite|scarlett|clarett|\bmotu\b|apollo|universal audio|\bvolt \d|audient|\bevo \d|presonus|behringer|\bumc\d|tascam|\bzoom [hfp]\d|sennheiser|hollyland|\blark\b|saramonic|\bboya\b|samson|fifine|maono|quadcast|seiren|\bssl ?\d|steinberg|\bur\d\d|apogee|\brme\b|babyface|minifuse|\bm-?audio\b|komplete audio|audio interface", re.I)
 
 
-def good_mic(label: str | None) -> bool:
-    return bool(label) and bool(GOOD_MIC_RE.search(label))
+def good_mic(label: str | None, extra=()) -> bool:
+    """A microphone whose takes are kept as recorded: on the built-in list, or one Kris marked as good."""
+    if not label:
+        return False
+    return bool(GOOD_MIC_RE.search(label)) or any(x and x.lower() == label.lower() for x in extra or ())
 
 
 VOICE_PRE_LUFS = -23.0

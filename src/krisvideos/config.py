@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
 import yaml
@@ -33,6 +33,7 @@ class Config:
     title_fg: str = "#ffffff"
     title_accent: str = "#9aa0b4"
     port: int = 8765
+    good_mics: list = field(default_factory=list)   # mic labels Kris marked as good (besides media.GOOD_MIC_RE): takes stay as recorded
 
     @property
     def vlogs_path(self) -> Path:

@@ -70,7 +70,10 @@ function bindSpeed(id, onCommit) {
 }
 const CORNERS = { tl: 'top left', tr: 'top right', bl: 'bottom left', br: 'bottom right' };
 // the Voice select of a clip / narration: auto follows the vlog's audio.polish setting
-const polishOptions = (cur, mic = '') => [['auto', mic && micQuality(mic) === 'good' ? `As recorded (${mic.replace(/\s*\(.*\)\s*$/, '')} is a good mic)` : `${P && P.audio && P.audio.polish === false ? 'As recorded' : 'Polished'} (vlog setting)`], ['on', 'Polished'], ['off', 'As recorded']]
+const micShort = mic => (mic || '').replace(/\s*\(.*\)\s*$/, '');
+const polishOptions = (cur, mic = '', good = false) => (good
+  ? [['off', `As recorded — ${micShort(mic)} is a good mic`], ['on', 'Cleaned up anyway (forced)']]
+  : [['auto', `${P && P.audio && P.audio.polish === false ? 'As recorded' : 'Polished'} (vlog setting)`], ['on', 'Polished'], ['off', 'As recorded']])
   .map(([v, l]) => `<option value="${v}" ${(cur || 'auto') === v ? 'selected' : ''}>${l}</option>`).join('');
 // the Channels select of a clip: what `auto` does to this file is spelled out
 const channelOptions = s => {
@@ -847,7 +850,7 @@ function renderInspector() {
       `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
       field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`) +
       (m.has_audio ? field('Channels', `<select data-k="channel">${channelOptions(s)}</select>`) : '') +
-      (m.has_audio ? field('Voice', `<select data-k="polish">${polishOptions(s.polish, s.mic)}</select>` + (s.polished ? `<span class="muted" style="font-size:11px">Polished: room noise down, sibilance tamed, a little presence and evenness. The live player only approximates it — judge it in a preview.</span>` : '')) : '');
+      (m.has_audio ? field('Voice', `<select data-k="polish">${polishOptions(s.good_mic && s.polish !== 'on' ? 'off' : s.polish, s.mic, s.good_mic)}</select>` + (s.polished ? `<span class="muted" style="font-size:11px">Polished: room noise down, sibilance tamed, a little presence and evenness. The live player only approximates it — judge it in a preview.</span>` : '')) : '');
   }
   html += field('Transition in', `<div class="inline"><select data-k="transition">${trOpts}</select><input type="number" data-k="transition_duration" step="0.1" min="0.1" max="3" value="${s.transition_duration ?? ''}" placeholder="${P.style.transition_duration}s" style="flex:0 0 64px"></div>`);
   html += `<div class="sep"></div><div class="actions"><button class="link" id="segUp" title="[">← Move</button><button class="link" id="segDown" title="]">Move →</button><button class="link" id="segDup">Duplicate</button><span class="spacer"></span><button class="link danger" id="segDelete">Delete</button></div>`;
@@ -855,7 +858,13 @@ function renderInspector() {
   $('#inspClose').onclick = () => select(null);
   $$('[data-k]', el).forEach(inp => {
     const k = inp.dataset.k;
-    const commit = () => patchSeg(s.id, { [k]: inp.type === 'number' || inp.type === 'range' ? (inp.value === '' ? '' : +inp.value) : inp.value });
+    const commit = () => {
+      if (k === 'polish' && s.good_mic && inp.value === 'on') {    // a good mic's take stays as recorded unless Kris forces it
+        if (!confirm(`This take was recorded with ${micShort(s.mic)}, a good mic, and is kept as recorded.\nClean it up anyway?`)) { renderInspector(); return; }
+        return patchSeg(s.id, { polish: 'on', force: true });
+      }
+      patchSeg(s.id, { [k]: inp.type === 'number' || inp.type === 'range' ? (inp.value === '' ? '' : +inp.value) : inp.value });
+    };
     if (inp.type === 'range') inp.onchange = commit;
     else { inp.onchange = commit; inp.onkeydown = e => { if (e.key === 'Enter') inp.blur(); }; }
   });
@@ -1950,7 +1959,10 @@ function micQuality(label) {
   if (GOOD_MIC.test(label)) return 'good';
   return BAD_MIC.test(label) ? 'bad' : 'unknown';
 }
-function trustMic(label) { const l = trustedMics(); if (!l.includes(label)) l.push(label); lsSet('kv.goodMics', JSON.stringify(l)); }
+function trustMic(label) {   // remembered in the browser (the recorder's warning) and in the config (the server keeps such takes as recorded)
+  const l = trustedMics(); if (!l.includes(label)) l.push(label); lsSet('kv.goodMics', JSON.stringify(l));
+  api('PUT', '/api/settings', { good_mics: l }).catch(() => { });
+}
 function selectedMicLabel() {
   const tr = REC.stream && REC.stream.getAudioTracks()[0];
   if (tr && tr.label) return tr.label;

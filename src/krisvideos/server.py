@@ -71,6 +71,7 @@ def _run_job(job: Job, fn):
 
 class SettingsIn(BaseModel):
     vlogs_dir: str | None = None
+    good_mics: list[str] | None = None
     immich_url: str | None = None
     immich_api_key: str | None = None
     default_orientation: str | None = None
@@ -359,6 +360,7 @@ def create_app(cfg: Config) -> FastAPI:
                 d["lufs"] = media.cached_loudness(f, p.cache_dir, s.channel) if info else None
                 d["polish"] = s.polish
                 d["mic"] = s.mic
+                d["good_mic"] = media.good_mic(s.mic, cfg.good_mics)
                 d["polished"] = bool(info and info.has_audio and render.polish_on(p, s.polish, s.mic))
                 d["pregain"] = 0.0
                 if d["polished"]:      # the live player approximates the polish: pre-gain + EQ, level from the polished loudness
@@ -766,7 +768,12 @@ def create_app(cfg: Config) -> FastAPI:
                     media.measure_loudness(p.resolve(s.src), p.cache_dir, s.channel)
                     if render.polish_on(p, s.polish, s.mic):
                         measure_voice_async(p, s.src, s.channel)
+            elif k == "force":
+                pass                              # a flag for the polish rule below, not a field
             elif k == "polish":
+                if polish_value(v) == "on" and media.good_mic(s.mic, cfg.good_mics) and not body.get("force"):
+                    raise HTTPException(409, f"This take was recorded with {s.mic}, a good mic, and is kept as recorded. "
+                                             "Send force: true to clean it up anyway.")
                 s.polish = polish_value(v)
                 if render.polish_on(p, s.polish, s.mic) and p.resolve(s.src).exists():
                     measure_voice_async(p, s.src, s.channel)
@@ -1011,6 +1018,8 @@ def create_app(cfg: Config) -> FastAPI:
                 seg.markers = [round(t, 3) for t in marks]
             if seg is not None and m.get("mic"):
                 seg.mic = str(m["mic"])
+                if media.good_mic(seg.mic, cfg.good_mics):
+                    seg.polish = "off"            # remembered on the clip: a good mic's take is never cleaned up unless forced
             if seg is not None:
                 seg.box = box4(m.get("box")) if m.get("box") else None
                 if pip_rel:

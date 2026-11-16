@@ -333,6 +333,9 @@ def cmd_set(cfg, a):
             sys.exit(f"unknown field {k}")
         if k == "polish":
             from .project import polish_value
+            from . import media
+            if polish_value(v) == "on" and media.good_mic(getattr(s, "mic", ""), cfg.good_mics) and not a.force:
+                sys.exit(f"{s.id} was recorded with {s.mic}, a good mic, and is kept as recorded. Add --force to clean it up anyway.")
             setattr(s, k, polish_value(v))
             continue
         cur = getattr(s, k)
@@ -628,6 +631,8 @@ def cmd_show(cfg, a):
                 desc += f"  audio={s.channel}" + (f"→{ch} to both ears" if ch in ("left", "right") else "→mono" if ch == "mix" else "")
             if s.polish != "auto":
                 desc += f"  voice={'polished' if s.polish == 'on' else 'as recorded'}"
+            if getattr(s, "mic", ""):
+                desc += f"  mic={s.mic}"
             if s.caption:
                 desc += f"  caption={s.caption!r}"
             for ov in s.overlays:
@@ -713,7 +718,7 @@ def main(argv=None):
     s = sub.add_parser("keep", help="trim the clip(s) there to just that stretch"); s.add_argument("project"); s.add_argument("start"); s.add_argument("end"); s.set_defaults(fn=cmd_keep)
     s = sub.add_parser("caption"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("text"); s.add_argument("--at"); s.add_argument("--dur", type=float); s.add_argument("--position", default="bottom"); s.set_defaults(fn=cmd_caption)
     s = sub.add_parser("trim"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("--in", dest="in_"); s.add_argument("--out"); s.set_defaults(fn=cmd_trim)
-    s = sub.add_parser("set"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("pairs", nargs="+"); s.set_defaults(fn=cmd_set)
+    s = sub.add_parser("set"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("pairs", nargs="+"); s.add_argument("--force", action="store_true", help="polish=on even on a take from a good mic"); s.set_defaults(fn=cmd_set)
     s = sub.add_parser("rm"); s.add_argument("project"); s.add_argument("seg"); s.set_defaults(fn=cmd_rm)
     s = sub.add_parser("pip", help="a second clip in a box over a clip (camera over a screen recording)"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("file", nargs="?", help="the inset's clip (omit to change an existing inset)"); s.add_argument("--layout", choices=list(edits.PIP_LAYOUTS), help="corner | corner-large | stacked | full (B-roll over the picture) | hidden"); s.add_argument("--pos", choices=list(edits.PIP_POSITIONS), help="corner for the corner layouts"); s.add_argument("--shape", choices=["round", "rect", "circle"]); s.add_argument("--box", help="x,y,w[,h] fractions of the frame (centre and size)"); s.add_argument("--offset", help="inset time = offset + speed × clip source time"); s.add_argument("--speed", type=float, help="the inset's own speed (4 = a 4x timelapse in the frame)"); s.add_argument("--sound", type=float, help="the inset's own sound, 0 (off, the default) to 1"); s.add_argument("--in", dest="in_", help="where in its file the inset is when the clip starts"); s.add_argument("--swap", action="store_true", help="exchange the clip and its inset"); s.add_argument("--rm", action="store_true", help="remove the inset"); s.set_defaults(fn=cmd_pip)
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)

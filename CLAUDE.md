@@ -157,6 +157,11 @@ clip as recorded" → `polish=off` on that segment. A take remembers its microph
 device label, sent by the recorder as `record/start {mic}`, kept in the manifest); `render.polish_on(p, setting, mic)`
 treats `auto` as off for a good mic (`media.good_mic`, the Python twin of app.js `GOOD_MIC`: DJI, Rode, Shure, interfaces…),
 so DJI takes stay as recorded and the Anker webcam-class takes get polished. Clips imported from files have no `mic`.
+`finalize_recording` writes `polish: off` onto a good-mic take so the decision is remembered on the clip itself;
+changing it needs an explicit force: `PATCH segments/{id} {polish: "on", force: true}` (409 without it), the GUI's
+Voice select asks "Clean it up anyway?", `vlog set PROJ sN polish=on --force`. Mics Kris marks as good in the recorder
+("trust this mic") go to config `good_mics` (`PUT /api/settings {good_mics}`) and count like the built-in list
+(`media.good_mic(label, cfg.good_mics)`; segment JSON `good_mic`). Level matching (gain only) still applies to them.
 On 2026-11-15 Kris wanted the polish off "most of the tracks": the one-channel takes were the DJI receiver, the stereo
 desk take the Anker, so `audio.polish: false` + `polish: on` on the Anker pieces.
 The polished sound of each clip is cached as `cache/<name>.voice.<ch>.<hash>.flac` (`media.polished_audio`, 16-bit,
