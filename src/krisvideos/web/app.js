@@ -730,6 +730,7 @@ function renderInspector() {
       `<div class="field"><label>Text overlays</label><div id="ovList"></div><button class="link" id="ovAdd" style="align-self:flex-start">+ Add overlay at playhead</button></div>` +
       field('Speed', `<div class="inline"><input type="range" data-k="speed" min="0.25" max="4" step="0.25" value="${s.speed || 1}"><span id="speedLbl" style="width:34px">${s.speed || 1}×</span></div>`) +
       field('Fit', `<select data-k="fit"><option value="contain" ${s.fit !== 'cover' ? 'selected' : ''}>Letterbox (show everything)</option><option value="cover" ${s.fit === 'cover' ? 'selected' : ''}>Crop to fill</option></select>`) +
+      lensInspectorHtml(s) +
       pipInspectorHtml(s) +
       `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
       field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`) +
@@ -749,7 +750,7 @@ function renderInspector() {
   if ($('#imgPick')) $('#imgPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'image' }); if (r.paths[0]) await patchSeg(s.id, { image: r.paths[0] }); });
   if ($('#imgClear')) $('#imgClear').onclick = () => patchSeg(s.id, { image: '' });
   if ($('#muteChk')) $('#muteChk').onchange = e => patchSeg(s.id, { mute: e.target.checked });
-  if (s.kind === 'clip') bindPipInspector(s);
+  if (s.kind === 'clip') { bindPipInspector(s); bindLensInspector(s); }
   if ($('#segTrim')) $('#segTrim').onclick = () => openTrimmer([s.clip], { segId: s.id });
   $$('[data-mkgo]', el).forEach(b => b.onclick = () => { stop(); seek(+b.dataset.mkgo, true); });
   $$('[data-mkrm]', el).forEach(b => b.onclick = () => patchSeg(s.id, { markers: (s.markers || []).filter(m => Math.abs(m - +b.dataset.mkrm) > 1e-4) }));
@@ -764,6 +765,52 @@ function renderInspector() {
     await refresh();
   });
   if (s.kind === 'clip') renderOverlays(s);
+}
+// lens: straighten a wide-angle webcam's barrel distortion in the export (ffmpeg lenscorrection k1/k2).
+// "For this camera" writes the config's `lenses` entry for the take's camera label (every clip from it follows);
+// "this clip only" keeps k1/k2 on the segment (`lens:`); "no correction" is `lens: off`. The live player can't
+// apply it, so a corrected still from GET /frame stands in.
+function lensModeOf(s) { return s.lens === 'off' ? 'off' : (s.lens && typeof s.lens === 'object') ? 'clip' : (s.cam ? 'camera' : 'clip'); }
+function lensInspectorHtml(s) {
+  const k = s.lens_effective || { k1: 0, k2: 0 }, mode = lensModeOf(s), cam = s.cam || '';
+  const slider = (id, label, v) => `<div class="inline lens-k"><span class="muted" style="width:18px">${label}</span><input type="range" id="${id}" min="-0.5" max="0.5" step="0.005" value="${v}"><span id="${id}Lbl" class="lens-val">${(+v).toFixed(3)}</span></div>`;
+  return `<div class="field" id="lensField"><label>Lens (wide-angle correction)</label>
+    <div class="muted lens-cam">${cam ? `Camera: ${esc(cam)}` : 'Camera unknown — an imported file, or recorded before the app kept camera names'}</div>
+    <select id="lensMode"><option value="camera" ${mode === 'camera' ? 'selected' : ''} ${cam ? '' : 'disabled'}>For this camera (every clip from it)</option><option value="clip" ${mode === 'clip' ? 'selected' : ''}>This clip only</option><option value="off" ${mode === 'off' ? 'selected' : ''}>No correction</option></select>
+    <div id="lensK" class="${mode === 'off' ? 'hidden' : ''}">${slider('lensK1', 'k1', k.k1)}${slider('lensK2', 'k2', k.k2)}
+      <div class="lens-prev"><img alt="corrected still"></div>
+      <div class="muted lens-note">k1 below 0 straightens barrel distortion (a 0.1-step is a lot). The live player shows the clip uncorrected; this still, previews and the export apply it.</div>
+    </div>
+  </div>`;
+}
+function bindLensInspector(s) {
+  const modeEl = $('#lensMode'); if (!modeEl) return;
+  const k1 = $('#lensK1'), k2 = $('#lensK2'), img = $('#lensField .lens-prev img');
+  const vals = () => ({ k1: +(+k1.value).toFixed(3), k2: +(+k2.value).toFixed(3) });
+  const srcT = () => { const L = locate(T); return L && L.seg.id === s.id ? L.seg.placed.src_in + L.off * (L.seg.speed || 1) : (s.in || 0); };
+  const preview = () => { const v = vals(); img.src = `/api/projects/${P.name}/frame?src=${encodeURIComponent(s.clip)}&t=${srcT().toFixed(2)}&k1=${v.k1}&k2=${v.k2}&w=640`; };
+  let timer = 0;
+  const onInput = () => { $('#lensK1Lbl').textContent = (+k1.value).toFixed(3); $('#lensK2Lbl').textContent = (+k2.value).toFixed(3); clearTimeout(timer); timer = setTimeout(preview, 250); };
+  const saveCamera = async v => {   // the config entry this camera matches (or a new one named after it)
+    const cfg = await api('GET', '/api/settings'), lenses = (cfg.lenses || []).slice();
+    const i = lenses.findIndex(l => l.match === s.lens_match);
+    if (i >= 0) lenses[i] = { ...lenses[i], ...v }; else lenses.push({ match: s.cam, ...v });
+    await api('PUT', '/api/settings', { lenses });
+    await refresh();
+  };
+  const commit = () => guard(async () => {
+    const v = vals();
+    if (modeEl.value === 'camera' && s.cam) await saveCamera(v);
+    else if (modeEl.value !== 'off') await patchSeg(s.id, { lens: v });
+  });
+  k1.oninput = k2.oninput = onInput; k1.onchange = k2.onchange = commit;
+  modeEl.onchange = () => {
+    const m = modeEl.value;
+    if (m === 'off') return patchSeg(s.id, { lens: 'off' });
+    if (m === 'clip') return patchSeg(s.id, { lens: vals() });
+    patchSeg(s.id, { lens: null });     // back to the camera's configured correction
+  };
+  if (modeEl.value !== 'off' && !s.missing) preview();
 }
 // picture in picture: the inset's layout (small / large corner, stacked, hidden), corner, shape, swap
 function pipInspectorHtml(s) {
@@ -1567,6 +1614,13 @@ function selectedMicLabel() {
   const o = $('#recMic') && $('#recMic').selectedOptions[0];
   return o && o.value ? o.textContent.replace(/ ✓$/, '') : '';
 }
+// the camera's device label goes on the take (Segment.cam) so the export can straighten a wide-angle webcam
+function selectedCamLabel() {
+  const tr = REC.stream && REC.stream.getVideoTracks()[0];
+  if (tr && tr.label) return tr.label;
+  const o = $('#recCam') && $('#recCam').selectedOptions[0];
+  return o && o.value ? o.textContent : '';
+}
 function updateMicWarn() {
   const el = $('#micWarn'); if (!el) return;
   const label = selectedMicLabel(), q = micQuality(label);
@@ -1709,7 +1763,8 @@ async function startRecording() {
   REC.playFrom = T;
   // what gets recorded: the camera/mic stream, or for a screen take the shared screen (+ the camera as a
   // second stream, the inset) with the mic (+ computer sound) on both so either can be the main picture later
-  let mainStream = REC.stream, pipStream = null, body = { kind: REC.mode, at: REC.playFrom, fit: $('#recCover').checked ? 'cover' : 'contain', mime };
+  const cam = REC.mode === 'voiceover' ? '' : selectedCamLabel();
+  let mainStream = REC.stream, pipStream = null, body = { kind: REC.mode, at: REC.playFrom, fit: $('#recCover').checked ? 'cover' : 'contain', mime, cam };
   if (recIsScreen()) {
     if (!REC.screen) return toast('Choose a screen or window first', true);
     const src = recSources(), L = recLayoutBoxes();
@@ -1718,7 +1773,7 @@ async function startRecording() {
     mainStream = new MediaStream([src.main, ...(audio ? [audio] : [])]);
     if (src.pip) pipStream = new MediaStream([src.pip, ...(audio ? [audio.clone()] : [])]);
     const boxObj = b => b ? { x: b[0], y: b[1], w: b[2], h: b[3] } : null;
-    body = { kind: 'clip', at: REC.playFrom, fit: src.mainIsCam ? 'cover' : 'contain', mime, name: src.roles.main, box: boxObj(L.box),
+    body = { kind: 'clip', at: REC.playFrom, fit: src.mainIsCam ? 'cover' : 'contain', mime, name: src.roles.main, box: boxObj(L.box), cam,
              pip: pipStream ? { name: src.roles.pip, mime, box: boxObj(L.pip), shape: L.shape, fit: 'cover' } : null };
   }
   try { const r = await api('POST', `/api/projects/${P.name}/record/start`, body); REC.session = r.id; }

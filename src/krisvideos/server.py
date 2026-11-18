@@ -20,9 +20,9 @@ from pydantic import BaseModel
 from . import edits, media, render, titles
 from .cli import new_project as make_project, masthead_rel, sting_rel
 from .edits import title_at
-from .config import Config
+from .config import Config, clean_lenses, lens_for
 from .probe import is_video, probe
-from .project import CHANNELS, Overlay, Pip, Project, Segment, Voiceover, box4
+from .project import CHANNELS, Overlay, Pip, Project, Segment, Voiceover, box4, lens_value
 from .timeutil import parse_time
 
 WEB = Path(__file__).parent / "web"
@@ -88,6 +88,7 @@ class SettingsIn(BaseModel):
     title_bg: str | None = None
     title_fg: str | None = None
     title_accent: str | None = None
+    lenses: list | None = None      # [{match, k1, k2}]: lens corrections per camera label (see Config.lenses)
 
 
 class NewProject(BaseModel):
@@ -288,7 +289,7 @@ def create_app(cfg: Config) -> FastAPI:
             info = None
         st = media.media_status(p, pip.src)
         return {"src": pip.src, "offset": pip.offset, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
-                "hidden": pip.hidden, "media": info.to_dict() if info else None, "missing": info is None,
+                "hidden": pip.hidden, "cam": pip.cam, "media": info.to_dict() if info else None, "missing": info is None,
                 "proxy_url": media_url(p, f"cache/{Path(pip.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, pip.src) if media.browser_playable(info) else None),
                 "thumb_url": media_url(p, f"cache/{Path(pip.src).name}.thumb.jpg") if st["thumb"] else None,
                 "src_url": media_url(p, pip.src) if f.exists() else None}
@@ -341,6 +342,14 @@ def create_app(cfg: Config) -> FastAPI:
                 d["lufs"] = media.cached_loudness(f, p.cache_dir, s.channel) if info else None
                 d["box"] = list(s.box) if s.box else None
                 d["pip"] = pip_json(p, s.pip) if s.pip else None
+                d["cam"] = s.cam
+                # lens: the clip's own setting (null = the camera's configured one); lens_effective: what the export applies
+                d["lens"] = "off" if s.lens == "off" else ({"k1": s.lens[0], "k2": s.lens[1]} if isinstance(s.lens, tuple) else None)
+                k = render.lens_params(s.lens, s.cam, cfg.lenses)
+                d["lens_effective"] = {"k1": k[0], "k2": k[1]} if k else None
+                d["lens_source"] = "off" if s.lens == "off" else "clip" if isinstance(s.lens, tuple) else "camera" if k else None
+                hit = lens_for(s.cam, cfg.lenses)
+                d["lens_match"] = hit["match"] if hit else None     # the config entry this camera falls under
             segs.append(d)
         vos = []
         for v in p.voiceovers:
@@ -480,6 +489,8 @@ def create_app(cfg: Config) -> FastAPI:
                 continue
             if k == "immich_api_key" and v.startswith("••••"):
                 continue
+            if k == "lenses":
+                v = clean_lenses(v)
             setattr(cfg, k, v)
         cfg.save()
         nonlocal root
@@ -635,6 +646,14 @@ def create_app(cfg: Config) -> FastAPI:
                     media.measure_loudness(p.resolve(s.src), p.cache_dir, s.channel)
             elif k == "fit":
                 s.fit = "cover" if v == "cover" else "contain"
+            elif k == "lens":
+                # null/"auto" = the camera's configured correction, "off" = none, {k1, k2} = this clip's own
+                try:
+                    s.lens = lens_value(v)
+                except (TypeError, ValueError) as e:
+                    raise HTTPException(400, str(e))
+            elif k == "cam":
+                s.cam = str(v or "")
             elif k == "box":
                 s.box = box4(v) if v else None
             elif k == "pip":
@@ -875,6 +894,15 @@ def create_app(cfg: Config) -> FastAPI:
                                   fit=pm.get("fit") or "cover", shape=pm.get("shape") or "round")
                 elif seg.box and not pm:
                     seg.box = None
+                # the camera's label goes on the picture that came from the camera (a screen take's main or inset)
+                cam = str(m.get("cam") or "")
+                if cam and not pm:
+                    seg.cam = cam
+                elif cam and pm:
+                    if m.get("name") == "cam":
+                        seg.cam = cam
+                    if seg.pip is not None and pm.get("name") == "cam":
+                        seg.pip.cam = cam
             new_id = seg.id if seg else None
         commit(p)
         part.unlink(missing_ok=True)
@@ -890,7 +918,8 @@ def create_app(cfg: Config) -> FastAPI:
         m = {"id": rid, "kind": body.get("kind", "clip"), "at": float(body.get("at") or 0), "fit": body.get("fit", ""),
              "add": bool(body.get("add", True)), "mime": mime, "ext": "mp4" if "mp4" in mime else "webm",
              "started": dt.datetime.now().isoformat(timespec="seconds"), "bytes": 0, "seq": 0, "markers": [],
-             "name": str(body.get("name") or ""), "box": body.get("box") or None}
+             "name": str(body.get("name") or ""), "box": body.get("box") or None,
+             "cam": str(body.get("cam") or "")}     # the camera's device label, kept on the clip like a mic name
         (rec_dir(p) / f"{rid}.part").write_bytes(b"")
         pb = body.get("pip")
         if isinstance(pb, dict):      # a second stream (the camera over a screen recording, or the other way round)
@@ -1167,6 +1196,46 @@ def create_app(cfg: Config) -> FastAPI:
         p.images = [x for x in p.images if x.id != iid]
         commit(p)
         return project_json(p)
+
+    # ------------------------------------------------------------------ still frames (lens preview)
+    @app.get("/api/projects/{name}/frame")
+    def frame(name: str, src: str, t: float = 0.0, k1: float = 0.0, k2: float = 0.0, w: int = 480):
+        """One JPEG frame of a clip at source time `t`, run through `lenscorrection=k1:k2` (none when both are 0),
+        `w` pixels wide. Cached per parameter set in cache/, so dragging a slider back and forth stays fast."""
+        p = load(name)
+        f = p.resolve(src)
+        try:
+            f.resolve().relative_to(p.folder.resolve())
+        except ValueError:
+            raise HTTPException(400, "src must be inside the project")
+        if not f.exists():
+            raise HTTPException(404, f"missing {src}")
+        w = max(64, min(1920, int(w) // 2 * 2))
+        t = max(0.0, float(t))
+        k1, k2 = max(-1.0, min(1.0, float(k1))), max(-1.0, min(1.0, float(k2)))
+        out = p.cache_dir / f"{f.name}.frame.{t:.2f}.{k1:+.4f}.{k2:+.4f}.{w}.jpg"
+        if not out.exists():
+            try:
+                info = probe(f, p.cache_dir)
+            except Exception as e:
+                raise HTTPException(400, f"cannot read {src}: {e}")
+            vf = [render.lens_filter((k1, k2)) if (abs(k1) > 1e-6 or abs(k2) > 1e-6) else ""]
+            if info.hdr:
+                vf.append(f"scale={w}:-2:out_transfer=bt709:out_primaries=bt709:out_color_matrix=bt709:intent=perceptual")
+            else:
+                vf.append(f"scale={w}:-2:flags=bicubic")
+            vf.append("format=yuv420p")
+            t_in = min(t, max(0.0, (info.duration or 0) - 0.05)) if info.duration else t
+            cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-ss", f"{t_in:.3f}", "-i", str(f), "-vf", ",".join(x for x in vf if x),
+                   "-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "-q:v", "4", "pipe:1"]
+            r = subprocess.run(cmd, capture_output=True)
+            if r.returncode != 0 or not r.stdout:
+                raise HTTPException(500, f"ffmpeg: {r.stderr.decode(errors='replace')[-400:]}")
+            p.cache_dir.mkdir(parents=True, exist_ok=True)
+            tmp = out.with_suffix(".tmp")
+            tmp.write_bytes(r.stdout)
+            tmp.replace(out)
+        return Response(content=out.read_bytes(), media_type="image/jpeg", headers={"Cache-Control": "max-age=86400"})
 
     # ------------------------------------------------------------------ immich
     @app.get("/api/immich/videos")

@@ -136,6 +136,8 @@ def swap_pip(seg: Segment) -> None:
     seg.markers = sorted(round(max(0.0, m + off), 3) for m in seg.markers)
     pip.offset = round(-off, 3) + 0.0      # (+ 0.0: never -0.0)
     seg.channel = "auto"                  # the audio now comes from the other file
+    seg.cam, pip.cam = pip.cam, seg.cam   # the lens correction follows the camera's picture
+    seg.lens = None
 
 
 PIP_LAYOUTS = ("corner", "corner-large", "stacked", "hidden")

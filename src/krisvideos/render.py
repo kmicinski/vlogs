@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import media, titles
+from .config import Config, lens_for
 from .probe import MediaInfo, probe
 from .project import Overlay, Pip, Project, Segment
 
@@ -175,6 +176,30 @@ def _hdr_chain(mode: str, fit_w: int, fit_h: int) -> str:
     return ""
 
 
+def lens_params(override, cam: str, lenses: list) -> tuple[float, float] | None:
+    """The (k1, k2) barrel-distortion correction for a picture: the clip's own setting (a tuple), nothing
+    for "off", else the config `lenses` entry matching the camera label it was recorded with."""
+    if override == "off":
+        return None
+    if isinstance(override, tuple):
+        k1, k2 = override
+    else:
+        hit = lens_for(cam, lenses)
+        if not hit:
+            return None
+        k1, k2 = float(hit.get("k1") or 0.0), float(hit.get("k2") or 0.0)
+    if abs(k1) < 1e-6 and abs(k2) < 1e-6:
+        return None
+    return (k1, k2)
+
+
+def lens_filter(k: tuple[float, float] | None) -> str:
+    """ffmpeg `lenscorrection` for (k1, k2); negative k1 straightens a wide-angle webcam's barrel distortion."""
+    if not k:
+        return ""
+    return f"lenscorrection=k1={k[0]:.4f}:k2={k[1]:.4f}:i=bilinear"
+
+
 def _fit(iw: int, ih: int, W: int, H: int) -> tuple[int, int]:
     if iw <= 0 or ih <= 0:
         return W, H
@@ -220,9 +245,15 @@ def _hexcolor(s: str) -> str:
     return "0x" + s.strip().lstrip("#")[:6]
 
 
-def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None) -> Plan:
-    """mode: 'final' or 'preview' (half-res, fast encode)."""
+def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None, lenses: list | None = None) -> Plan:
+    """mode: 'final' or 'preview' (half-res, fast encode). `lenses`: the config's camera lens corrections
+    (default: read from the config file)."""
     infos = infos if infos is not None else probe_project(p)
+    if lenses is None:
+        try:
+            lenses = Config.load().lenses
+        except Exception:
+            lenses = []
     scale = 0.5 if mode == "preview" else 1.0
     layout = compute_layout(p, infos, scale=scale)
     W, H, FPS = layout.width, layout.height, layout.fps
@@ -280,9 +311,16 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             # the picture fills the frame, or the box it was given (screen + camera layouts)
             bx, by, bw, bh = region(s.box, W, H)
             fw, fh = _fit(info.width, info.height, bw, bh)
+            # wide-angle webcam: straighten the barrel distortion at the source resolution, before scaling
+            # (an HDR source goes through the tone-map first: lenscorrection is 8-bit only)
+            lens = lens_filter(lens_params(s.lens, s.cam, lenses))
+            if lens and not (info.hdr and hdr_mode != "none"):
+                vchain.append(lens)
             if info.hdr and hdr_mode != "none":
                 any_hdr = True
                 vchain.append(_hdr_chain(hdr_mode, fw, fh).rstrip(","))
+                if lens:
+                    vchain.append(lens)
             if s.fit == "cover":
                 vchain.append(f"scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bicubic,crop={bw}:{bh}")
                 fw, fh = bw, bh
@@ -313,9 +351,14 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
                 if s.speed != 1.0:
                     pchain.append(f"setpts=PTS/{s.speed}")
+                plens = lens_filter(lens_params(None, pip.cam, lenses))   # the camera as the inset of a screen take
+                if plens and not (pinfo.hdr and hdr_mode != "none"):
+                    pchain.append(plens)
                 if pinfo.hdr and hdr_mode != "none":
                     any_hdr = True
                     pchain.append(_hdr_chain(hdr_mode, *_fit(pinfo.width, pinfo.height, pw, ph)).rstrip(","))
+                    if plens:
+                        pchain.append(plens)
                 if pip.fit == "contain":
                     qw, qh = _fit(pinfo.width, pinfo.height, pw, ph)
                     pchain.append(f"scale={qw}:{qh}:flags=bicubic,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black")
