@@ -14,6 +14,7 @@ const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
 const isMac = navigator.platform.includes('Mac');
 
 let P = null, sel = null, selVo = null, selSting = null, selImg = null, selMusic = false;
+const SELS = new Set();   // every selected id: clips (sN) and sounds on A2 / narration (vN); `sel` / `selVo` are the primary ones
 let T = 0, playing = false, job = null, pollTimer = null, lastYaml = '';
 const clock = { t0: 0, wall: 0 };
 
@@ -93,7 +94,7 @@ async function loadProjects(selectName) {
 }
 async function openProject(name) {
   localStorage.setItem('kv.project', name);
-  sel = selVo = selSting = selImg = null; selMusic = false; T = 0; stop(); TL.zoom = 1; MK.in = MK.out = null;
+  SELS.clear(); sel = selVo = selSting = selImg = null; selMusic = false; T = 0; stop(); TL.zoom = 1; MK.in = MK.out = null;
   VP.reset(); AUD.reset();
   setProject(await api('GET', `/api/projects/${name}`));
   checkRecoverable();
@@ -106,6 +107,7 @@ async function openProject(name) {
 const jobDone = (kind, t) => async () => { await refresh(); if (kind === 'preview') { seek(t, true); toast('Preview ready — the player now shows the real mix'); } else toast('Export complete'); };
 function setProject(p) {
   P = p;
+  for (const id of [...SELS]) if (!P.timeline.some(s => s.id === id) && !(P.voiceovers || []).some(v => v.id === id)) SELS.delete(id);
   if (sel && !P.timeline.some(s => s.id === sel)) sel = null;
   if (selVo && !(P.voiceovers || []).some(v => v.id === selVo)) selVo = null;
   if (selSting && !(P.stings || []).some(m => m.id === selSting)) selSting = null;
@@ -155,10 +157,15 @@ const AUD = (() => {
   function sync(t, play) {
     let voActive = false, anyVoDuck = false;
     for (const { v, el } of vos) {
-      const active = t >= v.at && t < v.at + (v.duration || 0);
+      const snd = (v.kind || 'voice') === 'clip', spd = snd ? (v.speed || 1) : 1;      // a clip's sound unlinked from its picture
+      const active = t >= v.at && t < v.at + (v.duration || 0) && spd <= 16;
       if (active) { voActive = true; if (v.duck_clips) anyVoDuck = true; }
-      const want = t - v.at;
-      if (play && active) { el.volume = clamp(v.volume * gainFactor(v), 0, 1); if (el.paused || Math.abs(el.currentTime - want) > 0.35) { try { el.currentTime = Math.max(0, want); } catch { } el.play().catch(() => { }); } }
+      const want = (snd ? v.in || 0 : 0) + (t - v.at) * spd;
+      if (play && active) {
+        if (snd) { VP.route(el, v.channel_effective, v.polished ? { pregain: v.pregain } : null); try { el.playbackRate = clamp(spd, 0.0625, 16); } catch { } }
+        el.volume = clamp(v.volume * gainFactor(v), 0, 1);
+        if (el.paused || Math.abs(el.currentTime - want) > 0.35 * Math.max(1, spd)) { try { el.currentTime = Math.max(0, want); } catch { } el.play().catch(() => { }); }
+      }
       else if (!el.paused) el.pause();
     }
     const L = locate(t); const speech = L && L.seg.kind === 'clip' && !L.seg.mute && L.seg.media && L.seg.media.has_audio;
@@ -424,7 +431,7 @@ const VP = (() => {
   }
   function pauseAll() { videos.forEach(v => v.pause()); $('#vP').pause(); AUD.pause(); }
   const mainVideo = () => videos[0];
-  return { sync, showSource, pauseAll, reset, projectChanged, fitCanvas, isRendered: () => rendered, mainVideo, channelRoutes: () => [...routes].map(([el, r]) => el.id + ":" + (r.gains ? r.mode : "unavailable")) };
+  return { sync, showSource, pauseAll, reset, projectChanged, fitCanvas, route, isRendered: () => rendered, mainVideo, channelRoutes: () => [...routes].map(([el, r]) => el.id + ":" + (r.gains ? r.mode : "unavailable")) };
 })();
 
 function play() {
@@ -540,7 +547,8 @@ function renderTimeline() {
   for (const blk of TL.blocks) {
     const s = blk.s, b = document.createElement('div');
     const w = Math.max(6, blk.x1 - blk.x0 - TL_GAP);
-    b.className = `block ${s.kind}${s.missing ? ' missing' : ''}${s.id === sel ? ' selected' : ''}${s.kind === 'clip' && !s.missing && !s.proxy_url ? ' pending' : ''}`;
+    b.className = `block ${s.kind}${s.missing ? ' missing' : ''}${SELS.has(s.id) ? ' selected' : ''}${s.kind === 'clip' && !s.missing && !s.proxy_url ? ' pending' : ''}${s.group ? ' grouped' : ''}`;
+    if (s.group) b.style.setProperty('--gc', groupColor(s.group));
     b.style.left = `${blk.x0}px`; b.style.width = `${w}px`; b.dataset.id = s.id; b.draggable = true;
     const xf = s.placed.transition !== 'cut' ? '<div class="xf"></div>' : '';
     const flags = `${s.speed && s.speed !== 1 ? ` ${fmtSpeed(s.speed)}` : ''}${s.fit === 'cover' ? ' ⤢' : ''}${s.pip && !s.pip.hidden ? ' ⧉' : ''}`;
@@ -559,18 +567,18 @@ function renderTimeline() {
       const strip = s.proxy_url ? `<img class="strip" src="/api/projects/${P.name}/strip?v=2&${q}&n=${n}&h=${V1_H}" draggable="false">` : (s.thumb_url ? `<img class="strip" src="${s.thumb_url}" draggable="false">` : '');
       const mks = segMarkers(s).map(mk => `<i class="mk" style="left:${tToX(mk.t) - blk.x0}px"></i>`).join('');
       b.innerHTML = `${strip}${xf}${mks}${meta}${s.caption ? `<div class="cap">${esc(s.caption)}</div>` : ''}<div class="handle l"></div><div class="handle r"></div>`;
-      b.title = `${s.clip.replace(/^clips\//, '')} · ${fmt(s.placed.duration)}${flags} · double-click to re-trim against the whole clip`;
+      b.title = `${s.clip.replace(/^clips\//, '')} · ${fmt(s.placed.duration)}${flags}${s.group ? ` · group ${s.group}` : ''} · double-click to re-trim against the whole clip`;
       // its sound, on the audio track: silent when muted, too fast to keep speech, or without a track
-      const a = document.createElement('div'), silent = !!s.mute || !m.has_audio || (s.speed || 1) > MUTE_ABOVE;
-      a.className = `ablk${silent ? ' silent' : ''}${s.id === sel ? ' selected' : ''}`; a.dataset.id = s.id;
+      const unlinked = !!s.audio_unlinked, a = document.createElement('div'), silent = !!s.mute || !m.has_audio || (s.speed || 1) > MUTE_ABOVE;
+      a.className = `ablk${silent ? ' silent' : ''}${unlinked ? ' unlinked' : ''}${SELS.has(s.id) ? ' selected' : ''}`; a.dataset.id = s.id;
       a.style.left = `${blk.x0}px`; a.style.width = `${w}px`;
       a.innerHTML = (!silent && s.proxy_url && w > 10) ? `<img src="/api/projects/${P.name}/wave?${q}&w=${Math.ceil(w / 50) * 50}&h=${A1_H}&color=ffffff" draggable="false">` : '';
-      a.title = silent ? (s.mute ? 'Muted' : !m.has_audio ? 'No sound in this clip' : 'Silent: faster than ' + MUTE_ABOVE + '×') : `${s.clip.replace(/^clips\//, '')} · sound${s.polished ? ' · voice polished' : ''}`;
-      a.onclick = e => { select(s.id); seek(xToT(contentX(e)), true); };
+      a.title = unlinked ? 'Sound unlinked: it plays from its own block on A2 (⌘L links it back)' : silent ? (s.mute ? 'Muted' : !m.has_audio ? 'No sound in this clip' : 'Silent: faster than ' + MUTE_ABOVE + '×') : `${s.clip.replace(/^clips\//, '')} · sound${s.polished ? ' · voice polished' : ''} · ⌘L unlinks it from the picture`;
+      a.onclick = e => { const md = mods(e); select(s.id, md); if (!md.toggle && !md.range) seek(xToT(contentX(e)), true); };
       a.ondblclick = e => { if (!s.missing) { e.preventDefault(); openTrimmer([s.clip], { segId: s.id }); } };
       atrack.appendChild(a);
     }
-    b.onclick = e => { if (e.target.classList.contains('handle')) return; select(s.id); seek(xToT(contentX(e)), true); };
+    b.onclick = e => { if (e.target.classList.contains('handle')) return; const md = mods(e); select(s.id, md); if (!md.toggle && !md.range) seek(xToT(contentX(e)), true); };
     b.ondblclick = e => { if (s.kind === 'clip' && !s.missing) { e.preventDefault(); openTrimmer([s.clip], { segId: s.id }); } };
     b.ondragstart = e => { e.dataTransfer.setData('text/seg', s.id); e.dataTransfer.effectAllowed = 'move'; };
     b.ondragover = e => { e.preventDefault(); b.classList.add('dragover'); };
@@ -589,12 +597,20 @@ function renderLanes() {
   const W = TL.W, tot = Math.max(total(), 1);
   const place = (el, a, b) => { const x0 = tToX(a), w = Math.max(14, tToX(b) - x0); el.style.left = `${x0}px`; el.style.width = `${w}px`; return w; };
   const vos = P.voiceovers || [];
-  if (vos.length) {
-    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.innerHTML = trackLabel('VO', 'Narration recorded over the clips');
-    for (const v of vos) {
-      const d = document.createElement('div'); d.className = 'vo' + (v.id === selVo ? ' selected' : ''); const w = place(d, v.at, v.at + (v.duration || 1));
-      d.innerHTML = `${v.url ? `<img src="/api/projects/${P.name}/wave?src=${encodeURIComponent(v.file)}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>${fmt(v.duration || 0)}</span>`;
-      d.onclick = e => { e.stopPropagation(); selVo = v.id; sel = selSting = selImg = null; selMusic = false; renderTimeline(); renderInspector(); seek(v.at, true); }; l.appendChild(d);
+  // A2: clips' sound unlinked from their pictures · VO: narration. Sounds that overlap stack in rows.
+  for (const [kind, label, tip, cls] of [['clip', 'A2', "Sound unlinked from its clip: drag it in time, ⌘L links it back", 'snd'], ['voice', 'VO', 'Narration recorded over the clips', 'vo']]) {
+    const items = vos.filter(v => (v.kind || 'voice') === kind); if (!items.length) continue;
+    const rows = [], rowOf = new Map();
+    for (const v of [...items].sort((a, b) => a.at - b.at)) { let r = rows.findIndex(end => end <= v.at + 1e-3); if (r < 0) { r = rows.length; rows.push(0); } rows[r] = v.at + (v.duration || 1); rowOf.set(v.id, r); }
+    const l = document.createElement('div'); l.className = 'lane'; l.style.width = `${W}px`; l.style.height = `${rows.length * 17 - 1}px`; l.innerHTML = trackLabel(label, tip);
+    for (const v of items) {
+      const d = document.createElement('div'); d.className = cls + (SELS.has(v.id) ? ' selected' : '') + (v.missing ? ' missing' : ''); d.dataset.id = v.id;
+      const w = place(d, v.at, v.at + (v.duration || 1)); d.style.top = `${1 + rowOf.get(v.id) * 17}px`;
+      const q = kind === 'clip' ? `src=${encodeURIComponent(v.file)}&start=${v.in || 0}&end=${v.out}` : `src=${encodeURIComponent(v.file)}`;
+      d.innerHTML = `${v.url ? `<img src="/api/projects/${P.name}/wave?${q}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>${kind === 'clip' ? `⛓ ${esc(v.file.replace(/^clips\//, ''))}${(v.speed || 1) !== 1 ? ' ' + fmtSpeed(v.speed) : ''} · ` : ''}${fmt(v.duration || 0)}</span>`;
+      d.title = kind === 'clip' ? `The sound of ${v.from || 'a clip'}${v.from_present ? '' : ' (that clip is gone)'} · drag to move it · ⌘L links it back` : `Narration · ${fmt(v.duration || 0)} · drag to move it`;
+      voDrag(d, v);
+      l.appendChild(d);
     }
     lanes.appendChild(l);
   }
@@ -605,7 +621,7 @@ function renderLanes() {
       const d = document.createElement('div'); d.className = 'st' + (m.id === selSting ? ' selected' : ''); const w = place(d, m.at, m.end);
       d.title = `${m.file.split('/').pop()} · from ${fmt(m.start || 0)} in the song${m.loop ? ' · repeats' : ''}${m.credit ? ' · shows a credit' : ''}`;
       d.innerHTML = `${m.url ? `<img src="/api/projects/${P.name}/wave?src=${encodeURIComponent(m.file)}&start=${m.start || 0}&end=${(m.start || 0) + (m.end - m.at)}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>♪ ${esc(m.file.split('/').pop())}${m.loop ? ' ⟳' : ''}${m.credit ? ' ©' : ''}</span>`;
-      d.onclick = e => { e.stopPropagation(); selSting = m.id; sel = selVo = selImg = null; selMusic = false; renderTimeline(); renderInspector(); seek(m.at, true); }; l.appendChild(d);
+      d.onclick = e => { e.stopPropagation(); selSting = m.id; SELS.clear(); sel = selVo = selImg = null; selMusic = false; renderTimeline(); renderInspector(); seek(m.at, true); }; l.appendChild(d);
     }
     lanes.appendChild(l);
   }
@@ -614,8 +630,26 @@ function renderLanes() {
     const d = document.createElement('div'); d.className = 'mu' + (selMusic ? ' selected' : '');
     // the waveform image is linear in time, so it only lines up with a linear timeline
     d.innerHTML = `${TL.log ? '' : `<img src="/api/projects/${P.name}/wave?src=music&start=${P.music.start || 0}&end=${(P.music.start || 0) + tot}&w=${Math.ceil(W / 100) * 100}&h=16&color=ffffff">`}<span>♫ ${esc(P.music.file.split('/').pop())} · ${Math.round(P.music.volume * 100)}%${P.music.duck ? ' · ducks under speech' : ''}</span>`;
-    d.onclick = e => { e.stopPropagation(); selMusic = true; sel = selVo = selSting = selImg = null; renderTimeline(); renderInspector(); }; l.appendChild(d); lanes.appendChild(l);
+    d.onclick = e => { e.stopPropagation(); selMusic = true; SELS.clear(); sel = selVo = selSting = selImg = null; renderTimeline(); renderInspector(); }; l.appendChild(d); lanes.appendChild(l);
   }
+}
+// a sound block on A2 / VO: a click selects it (⌘ / ⇧ add it to the selection), a drag moves it in time
+// (snapping to the playhead); the time it lands on is written as its `at`
+function voDrag(d, v) {
+  dragOn(d, {
+    down: e => ({ x0: e.clientX, moved: false, nat: v.at, e0: e }),
+    move: (ev, c) => {
+      const dx = ev.clientX - c.x0; if (!c.moved && Math.abs(dx) < 4) return; c.moved = true;
+      c.nat = clamp(xToT(tToX(v.at) + dx), 0, Math.max(0, total() - 0.05));
+      if (Math.abs(tToX(c.nat) - tToX(T)) < 8) c.nat = T;
+      d.style.left = `${tToX(c.nat)}px`; $('span', d).textContent = fmt(c.nat);
+    },
+    up: (ev, c) => {
+      if (!c.moved) { const md = mods(c.e0); selectVo(v.id, { toggle: md.toggle || md.range }); if (!md.toggle && !md.range) seek(v.at, true); return; }
+      if (Math.abs(c.nat - v.at) < 0.005) { renderTimeline(); return; }
+      patchVo(v.id, { at: c.nat });
+    },
+  });
 }
 function updatePlayhead() {
   const x = tToX(T), ph = $('#playhead');
@@ -768,10 +802,81 @@ async function onDrop(e, targetId) {
   const segId = e.dataTransfer.getData('text/seg'); if (!segId) return;
   const ids = P.timeline.map(s => s.id); let at = targetId ? ids.indexOf(targetId) : ids.length;
   if (targetId) { const r = e.currentTarget.getBoundingClientRect(); if (e.clientX > r.left + r.width / 2) at++; }
-  const from = ids.indexOf(segId); if (from < 0) return; ids.splice(from, 1); if (at > from) at--; ids.splice(at, 0, segId);
-  await guard(async () => setProject(await api('POST', `/api/projects/${P.name}/reorder`, { ids })));
+  // a selected block drags the whole selection (and groups) along, in their order
+  const moving = SELS.has(segId) ? ids.filter(i => SELS.has(i)) : groupOf(segId);
+  if (!moving.length || moving.includes(targetId)) return;
+  at -= ids.slice(0, at).filter(i => moving.includes(i)).length;
+  const rest = ids.filter(i => !moving.includes(i)); rest.splice(at, 0, ...moving);
+  await guard(async () => setProject(await api('POST', `/api/projects/${P.name}/reorder`, { ids: rest })));
 }
-function select(id) { sel = id; selVo = selSting = selImg = null; selMusic = false; if (P) setTimeout(() => VP.sync(T), 0); $$('#track .block').forEach(b => b.classList.toggle('selected', b.dataset.id === id)); $$('#lanes .selected').forEach(x => x.classList.remove('selected')); renderInspector(); }
+// ---- selection. A click selects one clip (and its group); ⌘-click adds it to / takes it out of the selection;
+// ⇧-click selects every clip between the last one clicked and this one. SELS holds the ids, `sel` is the
+// clip the inspector and the keyboard act on, `selVo` the sound (A2 / narration) they act on.
+let selAnchor = null;
+const groupOf = id => { const s = P.timeline.find(x => x.id === id); return s && s.group ? P.timeline.filter(x => x.group === s.group).map(x => x.id) : [id]; };
+const selSegs = () => P ? P.timeline.filter(s => SELS.has(s.id)) : [];
+const selVos = () => P ? (P.voiceovers || []).filter(v => SELS.has(v.id)) : [];
+const mods = e => ({ toggle: e.metaKey || e.ctrlKey, range: e.shiftKey });
+const groupColor = tag => `hsl(${(parseInt(String(tag).replace(/\D/g, '') || '1', 10) * 67) % 360} 70% 55%)`;
+function paintSelection() {
+  $$('#track .block, #atrack .ablk, #lanes .vo, #lanes .snd').forEach(b => b.classList.toggle('selected', SELS.has(b.dataset.id)));
+  $$('#lanes .st, #lanes .mu, #imgLane .imgblk').forEach(x => x.classList.remove('selected'));
+}
+function selectionChanged() { if (sel && !SELS.has(sel)) sel = (selSegs()[0] || {}).id || null; if (selVo && !SELS.has(selVo)) selVo = (selVos()[0] || {}).id || null; if (P) setTimeout(() => VP.sync(T), 0); paintSelection(); renderInspector(); }
+function select(id, { toggle = false, range = false } = {}) {
+  selSting = selImg = null; selMusic = false;
+  if (id == null) { SELS.clear(); sel = selVo = selAnchor = null; }
+  else if (range && selAnchor && P.timeline.some(x => x.id === selAnchor)) {
+    const ids = P.timeline.map(x => x.id), a = ids.indexOf(selAnchor), b = ids.indexOf(id);
+    if (!toggle) { SELS.clear(); selVo = null; }
+    ids.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(x => groupOf(x).forEach(y => SELS.add(y)));
+    sel = id;
+  } else if (toggle) {
+    if (SELS.has(id)) groupOf(id).forEach(x => SELS.delete(x));
+    else { groupOf(id).forEach(x => SELS.add(x)); sel = id; selAnchor = id; }
+  } else { SELS.clear(); selVo = null; groupOf(id).forEach(x => SELS.add(x)); sel = id; selAnchor = id; }
+  selectionChanged();
+}
+function selectVo(id, { toggle = false } = {}) {
+  selSting = selImg = null; selMusic = false;
+  if (toggle && SELS.has(id)) SELS.delete(id);
+  else { if (!toggle) { SELS.clear(); sel = null; } SELS.add(id); selVo = id; }
+  selectionChanged();
+}
+function selectAll() { if (!P) return; SELS.clear(); P.timeline.forEach(s => SELS.add(s.id)); sel = P.timeline.length ? P.timeline[P.timeline.length - 1].id : null; selVo = null; selectionChanged(); }
+// ---- what the selection can do together (one undo step each)
+const patchSegs = (ids, patch) => guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/segments/patch`, { ids, patch })); });
+const patchVo = (id, body) => guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/voiceovers/${id}`, body)); });
+async function removeSel() {
+  const ids = [...SELS]; if (!ids.length) return;
+  await guard(async () => { const p = await api('POST', `/api/projects/${P.name}/segments/remove`, { ids }); SELS.clear(); sel = selVo = null; setProject(p); toast(`Deleted ${p.removed} · ⌘Z undoes`); });
+}
+async function groupSel() {
+  const ids = selSegs().map(s => s.id); if (ids.length < 2) return toast('Select two or more clips first (⇧-click a range, ⌘-click to add)');
+  await guard(async () => { const p = await api('POST', `/api/projects/${P.name}/segments/group`, { ids }); setProject(p); toast(`Grouped: they now select and move together · ⇧⌘G ungroups`); });
+}
+async function ungroupSel() {
+  const ids = selSegs().filter(s => s.group).map(s => s.id); if (!ids.length) return toast('Nothing grouped is selected');
+  await guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/segments/ungroup`, { ids })); toast('Ungrouped'); });
+}
+const unlinkSeg = id => guard(async () => { const p = await api('POST', `/api/projects/${P.name}/segments/${id}/unlink`); setProject(p); toast('Sound unlinked: it is its own block on A2 now — drag it, or ⌘L on it to link it back'); });
+const linkVo = id => guard(async () => { const p = await api('POST', `/api/projects/${P.name}/voiceovers/${id}/link`); if (SELS.has(id)) { SELS.delete(id); SELS.add(p.seg_id); sel = p.seg_id; selVo = null; } setProject(p); toast('Sound linked back to its clip'); });
+async function toggleLinkSel() {
+  const segs = selSegs().filter(s => s.kind === 'clip' && s.media && s.media.has_audio), vos = selVos().filter(v => (v.kind || 'voice') === 'clip' && v.from_present);
+  const toUnlink = segs.filter(s => !s.audio_unlinked), toLink = [...vos, ...segs.filter(s => s.audio_unlinked && !vos.some(v => v.id === s.audio_unlinked)).map(s => ({ id: s.audio_unlinked }))];
+  if (!toUnlink.length && !toLink.length) return toast('Select a clip with sound (⌘L unlinks it) or an unlinked sound on A2 (⌘L links it back)');
+  if (toUnlink.length) { for (const s of toUnlink) await unlinkSeg(s.id); }
+  else for (const v of toLink) await linkVo(v.id);
+}
+async function moveSelection(d) {
+  const moving = P.timeline.filter(s => SELS.has(s.id)).map(s => s.id); if (!moving.length) return;
+  const ids = P.timeline.map(s => s.id), rest = ids.filter(i => !moving.includes(i));
+  const first = ids.indexOf(moving[0]), last = ids.indexOf(moving[moving.length - 1]);
+  const at = d < 0 ? rest.indexOf(ids[first - 1]) : rest.indexOf(ids[last + 1]) + 1;   // hop over the neighbour
+  if ((d < 0 && first === 0) || (d > 0 && last === ids.length - 1)) return;
+  rest.splice(Math.max(0, at), 0, ...moving);
+  await guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/reorder`, { ids: rest })); const ns = seg(); if (ns && ns.placed) seek(ns.placed.start, true); });
+}
 
 // ================================================================== edits
 async function patchSeg(id, body) { return guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/segments/${id}`, body)); }); }
@@ -791,7 +896,7 @@ const ctxActions = {
   trimEnd: () => { const L = locate(T); if (L && L.seg.kind === 'clip') patchSeg(L.seg.id, { out: L.seg.placed.src_in + L.off * (L.seg.speed || 1) }); },
   addTitle: () => addTitleSheet(),
   record: () => openRecorder('clip'),
-  music: () => { selMusic = true; sel = selVo = selSting = selImg = null; renderInspector(); renderTimeline(); if (!(P.music && P.music.file)) pickMusic(); },
+  music: () => { selMusic = true; SELS.clear(); sel = selVo = selSting = selImg = null; renderInspector(); renderTimeline(); if (!(P.music && P.music.file)) pickMusic(); },
   musicMenu: () => musicMenu($('[data-act=musicMenu]')),
 };
 $$('#ctx [data-act]').forEach(b => b.onclick = () => ctxActions[b.dataset.act]());
@@ -820,6 +925,7 @@ function renderInspector() {
   if (!s && !v && !m && !im && !selMusic) { closeInspector(); return; }
   openInspector();
   const close = '<button class="close" id="inspClose">✕</button>';
+  if (SELS.size > 1) { renderMultiInspector(el, close); return; }
   if (selMusic) { renderMusicInspector(el, close); return; }
   if (v) { renderVoInspector(el, v, close); return; }
   if (m) { renderStingInspector(el, m, close); return; }
@@ -838,7 +944,7 @@ function renderInspector() {
   } else {
     const m = s.media || {};
     html = `<h3>Clip <span class="sub" title="${esc(s.clip)}">${esc(s.clip.replace(/^clips\//, ''))}</span>${close}</h3>` +
-      `<div class="muted" style="margin:-6px 0 12px">${m.width ? `${m.width}×${m.height}${m.hdr ? ' HDR' : ''} · ${fmt(m.duration)}` : ''}${s.lufs != null ? ` · ${s.lufs.toFixed(0)} LUFS${P.match_levels ? ` (${(20 * Math.log10(gainFactor(s))).toFixed(0) >= 0 ? '+' : ''}${(20 * Math.log10(gainFactor(s))).toFixed(0)} dB)` : ''}` : ''}${s.missing ? ' · <b style="color:var(--danger)">file missing</b>' : ''}</div>` +
+      `<div class="muted" style="margin:-6px 0 12px">${m.width ? `${m.width}×${m.height}${m.hdr ? ' HDR' : ''} · ${fmt(m.duration)}` : ''}${s.lufs != null ? ` · ${s.lufs.toFixed(0)} LUFS${P.match_levels ? ` (${(20 * Math.log10(gainFactor(s))).toFixed(0) >= 0 ? '+' : ''}${(20 * Math.log10(gainFactor(s))).toFixed(0)} dB)` : ''}` : ''}${s.missing ? ' · <b style="color:var(--danger)">file missing</b>' : ''}${s.group ? ` · group ${s.group} (${P.timeline.filter(x => x.group === s.group).length} clips move together · ⇧⌘G ungroups)` : ''}</div>` +
       field('In → out (source time)', `<div class="inline"><input type="text" data-k="in" value="${fmt(s.in || 0, 2)}"><span class="muted">→</span><input type="text" data-k="out" value="${s.out == null ? 'end' : fmt(s.out, 2)}"></div>`) +
       `<button class="link" id="segTrim" style="margin:-8px 0 10px -8px" ${s.missing ? 'disabled' : ''}>Re-trim against the whole clip…</button>` +
       (segMarkers(s).length ? field('Markers', `<div class="mklist">${segMarkers(s).map(mk => `<span class="mkchip"><button class="link" data-mkgo="${mk.t}" title="Jump here">◆ ${fmt(mk.t)}</button><button class="link muted" data-mkrm="${mk.src}" title="Remove this marker">✕</button></span>`).join('')}</div>`) : '') +
@@ -848,7 +954,7 @@ function renderInspector() {
       field('Fit', `<select data-k="fit"><option value="contain" ${s.fit !== 'cover' ? 'selected' : ''}>Letterbox (show everything)</option><option value="cover" ${s.fit === 'cover' ? 'selected' : ''}>Crop to fill</option></select>`) +
       lensInspectorHtml(s) +
       pipInspectorHtml(s) +
-      `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label></div>` +
+      `<div class="check"><input type="checkbox" id="muteChk" ${s.mute ? 'checked' : ''}><label for="muteChk">Mute</label>${m.has_audio ? (s.audio_unlinked ? `<button class="link muted" id="segLink" title="⌘L" style="margin-left:auto">sound unlinked → link it back</button>` : `<button class="link muted" id="segUnlink" title="⌘L: the sound becomes its own block on A2 that you can move on its own" style="margin-left:auto">unlink sound</button>`) : ''}</div>` +
       field('Volume', `<input type="range" data-k="volume" min="0" max="2" step="0.1" value="${s.volume ?? 1}">`) +
       (m.has_audio ? field('Channels', `<select data-k="channel">${channelOptions(s)}</select>`) : '') +
       (m.has_audio ? field('Voice', `<select data-k="polish">${polishOptions(s.good_mic && s.polish !== 'on' ? 'off' : s.polish, s.mic, s.good_mic)}</select>` + (s.polished ? `<span class="muted" style="font-size:11px">Polished: room noise down, sibilance tamed, a little presence and evenness. The live player only approximates it — judge it in a preview.</span>` : '')) : '');
@@ -873,6 +979,8 @@ function renderInspector() {
   if ($('#imgPick')) $('#imgPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'image' }); if (r.paths[0]) await patchSeg(s.id, { image: r.paths[0] }); });
   if ($('#imgClear')) $('#imgClear').onclick = () => patchSeg(s.id, { image: '' });
   if ($('#muteChk')) $('#muteChk').onchange = e => patchSeg(s.id, { mute: e.target.checked });
+  if ($('#segUnlink')) $('#segUnlink').onclick = () => unlinkSeg(s.id);
+  if ($('#segLink')) $('#segLink').onclick = () => linkVo(s.audio_unlinked);
   bindSpeed('segSpeed', v => patchSeg(s.id, { speed: v }));
   if (s.kind === 'clip') { bindPipInspector(s); bindLensInspector(s); }
   if ($('#segTrim')) $('#segTrim').onclick = () => openTrimmer([s.clip], { segId: s.id });
@@ -976,20 +1084,56 @@ function renderOverlays(s) {
   $('#ovAdd').onclick = () => { const L = locate(T); const at = L && L.seg.id === s.id ? +L.off.toFixed(2) : 0; patchSeg(s.id, { overlays: [...s.overlays, { text: 'new overlay', at, for: 3 }] }); };
 }
 function renderVoInspector(el, v, close) {
-  el.innerHTML = `<h3>Narration ${close}</h3><div class="muted" style="margin:-6px 0 12px">${fmt(v.duration || 0)}${v.lufs != null ? ` · ${v.lufs.toFixed(0)} LUFS` : ''}</div>` +
+  const snd = (v.kind || 'voice') === 'clip';     // a clip's sound unlinked from its picture
+  el.innerHTML = `<h3>${snd ? `Sound of ${esc(v.from || 'a clip')} <span class="sub" title="${esc(v.file)}">${esc(v.file.replace(/^clips\//, ''))}</span>` : 'Narration'} ${close}</h3><div class="muted" style="margin:-6px 0 12px">${fmt(v.duration || 0)}${v.lufs != null ? ` · ${v.lufs.toFixed(0)} LUFS` : ''}${snd ? ` · unlinked from its picture: it plays wherever you put it${v.from_present ? '' : ' (that clip is gone)'}` : ''}</div>` +
     field('Starts at', `<div class="inline"><input type="text" id="voAt" value="${fmt(v.at, 2)}"><button class="link" id="voAtPh" title="move to playhead">← playhead</button></div>`) +
+    (snd ? field('In → out (source time)', `<div class="inline"><input type="text" id="voIn" value="${fmt(v.in || 0, 2)}"><span class="muted">→</span><input type="text" id="voOut" value="${fmt(v.out || 0, 2)}"></div>`) + field('Speed', speedControl('voSpeed', v.speed || 1)) : '') +
     field('Volume', `<input type="range" id="voVol" min="0" max="2" step="0.1" value="${v.volume}">`) +
-    `<div class="check"><input type="checkbox" id="voDuck" ${v.duck_clips ? 'checked' : ''}><label for="voDuck">Lower clip audio while this plays</label></div>` +
-    field('Voice', `<select id="voPolish">${polishOptions(v.polish)}</select>`) +
-    `<div class="sep"></div><div class="actions"><span class="spacer"></span><button class="link danger" id="voDel">Delete</button></div>`;
-  $('#inspClose').onclick = () => { selVo = null; renderTimeline(); renderInspector(); };
-  const patch = body => guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/voiceovers/${v.id}`, body)); });
-  $('#voAt').onchange = e => patch({ at: e.target.value }); $('#voAt').onkeydown = e => { if (e.key === 'Enter') e.target.blur(); };
+    (snd ? field('Channels', `<select id="voChannel">${channelOptions(v)}</select>`) : `<div class="check"><input type="checkbox" id="voDuck" ${v.duck_clips ? 'checked' : ''}><label for="voDuck">Lower clip audio while this plays</label></div>`) +
+    field('Voice', `<select id="voPolish">${polishOptions(v.polish, v.mic, false)}</select>`) +
+    `<div class="sep"></div><div class="actions">${snd && v.from_present ? `<button class="link" id="voLink" title="⌘L">⛓ Link back to its clip</button>` : ''}<span class="spacer"></span><button class="link danger" id="voDel">Delete</button></div>`;
+  $('#inspClose').onclick = () => select(null);
+  const patch = body => patchVo(v.id, body);
+  const enter = id => { const x = $(id); if (x) x.onkeydown = e => { if (e.key === 'Enter') e.target.blur(); }; };
+  $('#voAt').onchange = e => patch({ at: e.target.value }); enter('#voAt');
   $('#voAtPh').onclick = () => patch({ at: T });
   $('#voVol').onchange = e => patch({ volume: +e.target.value });
-  $('#voDuck').onchange = e => patch({ duck_clips: e.target.checked });
+  if ($('#voDuck')) $('#voDuck').onchange = e => patch({ duck_clips: e.target.checked });
+  if ($('#voIn')) { $('#voIn').onchange = e => patch({ in: e.target.value }); enter('#voIn'); $('#voOut').onchange = e => patch({ out: e.target.value }); enter('#voOut'); }
+  bindSpeed('voSpeed', x => patch({ speed: x }));
+  if ($('#voChannel')) $('#voChannel').onchange = e => patch({ channel: e.target.value });
   $('#voPolish').onchange = e => patch({ polish: e.target.value });
-  $('#voDel').onclick = () => guard(async () => { setProject(await api('DELETE', `/api/projects/${P.name}/voiceovers/${v.id}`)); selVo = null; renderInspector(); });
+  if ($('#voLink')) $('#voLink').onclick = () => linkVo(v.id);
+  $('#voDel').onclick = () => guard(async () => { setProject(await api('DELETE', `/api/projects/${P.name}/voiceovers/${v.id}`)); SELS.delete(v.id); selVo = null; renderInspector(); });
+}
+// several things selected: what they can do together
+function renderMultiInspector(el, close) {
+  const segs = selSegs(), vos = selVos(), clips = segs.filter(s => s.kind === 'clip');
+  const dur = segs.reduce((a, s) => a + (s.placed ? s.placed.duration : 0), 0) + vos.reduce((a, v) => a + (v.duration || 0), 0);
+  const allGrouped = segs.length > 1 && segs.every(s => s.group && s.group === segs[0].group);
+  const canUnlink = clips.filter(s => !s.audio_unlinked && s.media && s.media.has_audio), canLink = vos.filter(v => (v.kind || 'voice') === 'clip' && v.from_present);
+  const what = [segs.length ? `${segs.length} clip${segs.length > 1 ? 's' : ''}` : '', vos.length ? `${vos.length} sound${vos.length > 1 ? 's' : ''}` : ''].filter(Boolean).join(' + ');
+  el.innerHTML = `<h3>${what} ${close}</h3><div class="muted" style="margin:-6px 0 12px">${fmt(dur)} together · ⇧-click a range, ⌘-click to add or take out</div>
+    <div class="actions" style="flex-wrap:wrap;gap:4px 12px">${segs.length > 1 ? `<button class="link" id="mGroup" title="${allGrouped ? '⇧⌘G' : '⌘G'}">${allGrouped ? 'Ungroup' : 'Group'}</button>` : ''}${clips.length ? `<button class="link" id="mMute">${clips.every(s => s.mute) ? 'Unmute' : 'Mute'}</button>` : ''}${canUnlink.length ? `<button class="link" id="mUnlink" title="⌘L">Unlink sound</button>` : ''}${canLink.length ? `<button class="link" id="mLink" title="⌘L">Link sound back</button>` : ''}<span class="spacer"></span><button class="link danger" id="mDelete" title="⌫">Delete all</button></div>` +
+    (clips.length ? `<div class="sep"></div>` + field('Speed (every clip)', speedControl('mSpeed', clips[0].speed || 1)) + (clips.some(s => s.media && s.media.has_audio) ? field('Voice (every clip)', `<select id="mPolish"><option value="">— leave as is —</option>${polishOptions(null)}</select>`) : '') : '') +
+    (segs.length ? field('Transition in (every segment)', `<select id="mTrans"><option value="">— leave as is —</option><option value="cut">cut</option><option value="fade">fade</option><option value="dip">dip</option><option value="default">default (${P.style.transition})</option></select>`) : '') +
+    `<div class="sep"></div><div class="actions"><button class="link" id="mUp" title="[">← Move</button><button class="link" id="mDown" title="]">Move →</button></div>`;
+  $('#inspClose').onclick = () => select(null);
+  const ids = segs.map(s => s.id), cids = clips.map(s => s.id);
+  if ($('#mGroup')) $('#mGroup').onclick = () => allGrouped ? ungroupSel() : groupSel();
+  if ($('#mMute')) $('#mMute').onclick = () => patchSegs(cids, { mute: !clips.every(s => s.mute) });
+  if ($('#mUnlink')) $('#mUnlink').onclick = async () => { for (const s of canUnlink) await unlinkSeg(s.id); };
+  if ($('#mLink')) $('#mLink').onclick = async () => { for (const v of canLink) await linkVo(v.id); };
+  $('#mDelete').onclick = removeSel;
+  bindSpeed('mSpeed', x => patchSegs(cids, { speed: x }));
+  if ($('#mPolish')) $('#mPolish').onchange = e => {
+    const val = e.target.value; if (!val) return;
+    const good = clips.filter(s => s.good_mic);
+    if (val === 'on' && good.length && !confirm(`${good.length} of these take${good.length > 1 ? 's were' : ' was'} recorded with a good mic and ${good.length > 1 ? 'are' : 'is'} kept as recorded.\nClean them up anyway?`)) { renderInspector(); return; }
+    patchSegs(cids, { polish: val, force: true });
+  };
+  if ($('#mTrans')) $('#mTrans').onchange = e => { const val = e.target.value; if (val) patchSegs(ids, { transition: val === 'default' ? '' : val }); };
+  $('#mUp').onclick = () => moveSelection(-1); $('#mDown').onclick = () => moveSelection(1);
 }
 function renderStingInspector(el, m, close) {
   const segOpt = cur => P.timeline.map(s => `<option value="${s.id}" ${s.id === cur ? 'selected' : ''}>${esc(s.kind === 'title' ? (s.title || (s.image ? s.image.split('/').pop() : 'black')) : s.clip.replace(/^clips\//, ''))}</option>`).join('');
@@ -1311,7 +1455,7 @@ function currentAnchor(L) {
 }
 const sizeName = L => !L.box ? 'full' : ((IMG_SIZES.find(z => z[2] && Math.abs(z[2] - L.box[2]) < 0.01) || [0, 'box'])[1]).toLowerCase();
 function selectImage(id, { seekInto = true } = {}) {
-  selImg = id; sel = selVo = selSting = null; selMusic = false;
+  selImg = id; SELS.clear(); sel = selVo = selSting = null; selMusic = false;
   $$('#track .block.selected, #lanes .selected').forEach(x => x.classList.remove('selected'));
   $$('#imgLane .imgblk').forEach(x => x.classList.toggle('selected', x.dataset.id === id));
   const L = imgOf(id);
@@ -1931,7 +2075,7 @@ async function newProjectSheet() {
 }
 $('#helpBtn').onclick = showHelp;
 function showHelp() {
-  const rows = [['space', 'play / pause'], ['I / O', 'mark in / out at the playhead'], ['X', 'mark the whole clip under the playhead'], ['⌫', 'cut out the marked part (no marks: delete the selected segment)'], ['K', 'keep only the marked part of the clip(s)'], ['S', 'split at the playhead (also C, ⌘K)'], ['Q / W', 'trim the clip\'s start / end to the playhead'], ['T', 'cut to a title card here'], ['← →', 'step one frame (⇧ for a second)'], ['↑ ↓', 'select previous / next segment'], ['[ ]', 'move the selected segment'], ['R', 'record (Space during a recording drops a marker)'], ['M', 'add / remove a marker at the playhead'], [', .', 'jump to the previous / next marker'], ['⌘V', 'paste a picture over the video at the playhead'], ['⌘Z / ⇧⌘Z', 'undo / redo'], ['⌘+ ⌘− ⌘0', 'zoom the timeline / fit'], ['esc', 'clear the marks / deselect / close'], ['F', 'fullscreen player'], ['⌘⏎', 'render preview'], ['⇧⌘⏎', 'export'], ['⌘N', 'new vlog']];
+  const rows = [['space', 'play / pause'], ['I / O', 'mark in / out at the playhead'], ['X', 'mark the whole clip under the playhead'], ['⌫', 'cut out the marked part (no marks: delete the selected segment)'], ['K', 'keep only the marked part of the clip(s)'], ['S', 'split at the playhead (also C, ⌘K)'], ['Q / W', 'trim the clip\'s start / end to the playhead'], ['T', 'cut to a title card here'], ['← →', 'step one frame (⇧ for a second)'], ['↑ ↓', 'select previous / next segment (⇧ extends the selection)'], ['⇧-click / ⌘-click', 'select a range of clips / add or take out one (groups come along)'], ['⌘A', 'select every clip'], ['⌘G / ⇧⌘G', 'group the selected clips so they select and move together / ungroup'], ['⌘L', 'unlink a clip\'s sound from its picture (it gets its own block on A2) / link it back'], ['[ ]', 'move the selected segment(s)'], ['R', 'record (Space during a recording drops a marker)'], ['M', 'add / remove a marker at the playhead'], [', .', 'jump to the previous / next marker'], ['⌘V', 'paste a picture over the video at the playhead'], ['⌘Z / ⇧⌘Z', 'undo / redo'], ['⌘+ ⌘− ⌘0', 'zoom the timeline / fit'], ['esc', 'clear the marks / deselect / close'], ['F', 'fullscreen player'], ['⌘⏎', 'render preview'], ['⇧⌘⏎', 'export'], ['⌘N', 'new vlog']];
   sheet(`<h2>Keyboard</h2><div class="kbd-grid">${rows.map(([k, d]) => `<kbd>${k}</kbd><span>${d}</span>`).join('')}</div><p class="muted" style="margin-top:14px">Click the ruler to jump there (the faint red line shows where a click lands); drag the red playhead, or drag on the ruler while paused, to scrub — while playing, the playhead only moves when you let go. Shift-drag the ruler to mark a range and drag its edges to adjust it. Double-click a clip to re-trim it against the whole source. Pictures over the video sit on the pink lane above the clips: drag them to move, drag their ends to change how long they show, and drag them on the video to place them (corners resize). Drag the blue handles on a selected clip to trim, drag blocks to reorder. Music lives on the orange lane, anchored to the clips: splitting a clip keeps the song playing over both halves; select the music and use <b>✂ Split at playhead</b> to make pieces you can fade or delete on their own. <b>Log / Linear</b> switches how wide clips are drawn; ⌘-scroll zooms.</p><div class="foot"><button class="pill" data-close>Close</button></div>`);
 }
 
@@ -2278,6 +2422,9 @@ document.addEventListener('keydown', e => {
   if (mod && e.key === '-') { e.preventDefault(); $('#zoomOut').click(); return; }
   if (mod && e.key === '0') { e.preventDefault(); $('#zoomFit').click(); return; }
   if (mod && e.key.toLowerCase() === 'k') { e.preventDefault(); ctxActions.split(); return; }   // Premiere's "add edit"
+  if (mod && e.key.toLowerCase() === 'a') { e.preventDefault(); selectAll(); return; }
+  if (mod && e.key.toLowerCase() === 'g') { e.preventDefault(); e.shiftKey ? ungroupSel() : groupSel(); return; }
+  if (mod && e.key.toLowerCase() === 'l') { e.preventDefault(); toggleLinkSel(); return; }
   if (e.metaKey || e.ctrlKey || e.altKey) return;
   const s = seg(); const fr = 1 / ((P.layout && P.layout.fps) || 30);
   const k = e.key.length === 1 ? e.key.toLowerCase() : e.key;
@@ -2297,14 +2444,14 @@ document.addEventListener('keydown', e => {
     case 'r': openRecorder('clip'); break;
     case 'f': { const c = $('#canvas'); document.fullscreenElement ? document.exitFullscreen() : c.requestFullscreen && c.requestFullscreen(); break; }
     case '?': showHelp(); break;
-    case 'Backspace': case 'Delete': e.preventDefault(); if (markRange()) cutRange(); else if (s) $('#segDelete').click(); else if (selImg) deleteImage(selImg); else if (selVo) $('#voDel').click(); else if (selSting) $('#stDel').click(); break;
+    case 'Backspace': case 'Delete': e.preventDefault(); if (markRange()) cutRange(); else if (SELS.size > 1) removeSel(); else if (s) $('#segDelete').click(); else if (selImg) deleteImage(selImg); else if (selVo) $('#voDel').click(); else if (selSting) $('#stDel').click(); break;
     case 'ArrowLeft': e.preventDefault(); stop(); seek(T - (e.shiftKey ? 1 : fr), true); break;
     case 'ArrowRight': e.preventDefault(); stop(); seek(T + (e.shiftKey ? 1 : fr), true); break;
     case 'Home': seek(0, true); break;
     case 'End': seek(total(), true); break;
-    case 'ArrowUp': case 'ArrowDown': { if (!P.timeline.length) break; e.preventDefault(); const i = P.timeline.findIndex(x => x.id === sel); const n = clamp(i + (e.key === 'ArrowUp' ? -1 : 1), 0, P.timeline.length - 1); select(P.timeline[n].id); seek(P.timeline[n].placed.start, true); break; }
-    case '[': if (s) $('#segUp').click(); break;
-    case ']': if (s) $('#segDown').click(); break;
+    case 'ArrowUp': case 'ArrowDown': { if (!P.timeline.length) break; e.preventDefault(); const i = P.timeline.findIndex(x => x.id === sel); const n = clamp(i + (e.key === 'ArrowUp' ? -1 : 1), 0, P.timeline.length - 1); select(P.timeline[n].id, { range: e.shiftKey, toggle: e.shiftKey }); seek(P.timeline[n].placed.start, true); break; }
+    case '[': if (SELS.size > 1) moveSelection(-1); else if (s) $('#segUp').click(); break;
+    case ']': if (SELS.size > 1) moveSelection(1); else if (s) $('#segDown').click(); break;
   }
 });
 document.addEventListener('fullscreenchange', () => VP.fitCanvas());

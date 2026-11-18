@@ -380,18 +380,41 @@ def create_app(cfg: Config) -> FastAPI:
                 d["lens_source"] = "off" if s.lens == "off" else "clip" if isinstance(s.lens, tuple) else "camera" if k else None
                 hit = lens_for(s.cam, cfg.lenses)
                 d["lens_match"] = hit["match"] if hit else None     # the config entry this camera falls under
+                d["audio_unlinked"] = next((v.id for v in p.voiceovers if v.kind == "clip" and v.from_seg == s.id), None)
+            d["group"] = s.group
             segs.append(d)
         vos = []
         for v in p.voiceovers:
             f = p.resolve(v.file)
-            vd = v.to_dict() | {"id": v.id, "at": v.at, "volume": v.volume, "duck_clips": v.duck_clips,
-                                "polish": v.polish, "polished": render.polish_on(p, v.polish),
+            vd = v.to_dict() | {"id": v.id, "at": v.at, "volume": v.volume, "duck_clips": v.duck_clips, "kind": v.kind,
+                                "polish": v.polish, "polished": render.polish_on(p, v.polish, v.mic),
                                 "missing": not f.exists(), "url": media_url(p, v.file) if f.exists() else None}
             try:
-                vd["duration"] = probe(f, p.cache_dir).duration if f.exists() else 0
+                vinfo = probe(f, p.cache_dir) if f.exists() else None
             except Exception:
-                vd["duration"] = 0
-            vd["lufs"] = _cached_lufs(p, v.file)
+                vinfo = None
+            fdur = vinfo.duration if vinfo else 0
+            vd["file_duration"] = fdur
+            if v.kind == "clip":
+                # the sound of a clip, unlinked from its picture: which part of the file, its speed, where it plays from
+                a0 = max(0.0, min(v.src_in, fdur))
+                b0 = fdur if v.src_out is None else max(a0, min(v.src_out, fdur))
+                vd.update({"in": a0, "out": b0, "speed": v.speed, "channel": v.channel, "mic": v.mic, "from": v.from_seg,
+                           "duration": (b0 - a0) / max(0.05, v.speed), "file": v.file,
+                           "from_present": any(s.id == v.from_seg for s in p.timeline)})
+                st = media.media_status(p, v.file)
+                vd["url"] = media_url(p, f"cache/{Path(v.file).name}.proxy.mp4") if st["proxy"] else (media_url(p, v.file) if media.browser_playable(vinfo) else None)
+                vd["channel_effective"] = media.effective_channel(f, p.cache_dir, v.channel, compute=False) if vinfo else "stereo"
+                vd["lufs"] = media.cached_loudness(f, p.cache_dir, v.channel) if vinfo else None
+                vd["pregain"] = 0.0
+                if vd["polished"] and vinfo:
+                    vs = media.voice_state(f, p.cache_dir, v.channel, p.audio.denoise)
+                    vd["pregain"] = vs["pregain"]
+                    if vs["lufs"] is not None:
+                        vd["lufs"] = vs["lufs"]
+            else:
+                vd["duration"] = fdur
+                vd["lufs"] = _cached_lufs(p, v.file)
             vos.append(vd)
         stings = []
         for m in p.stings:
@@ -753,10 +776,8 @@ def create_app(cfg: Config) -> FastAPI:
         commit(p)
         return project_json(p) | {"new_ids": ids, "new_id": ids[-1]}
 
-    @app.patch("/api/projects/{name}/segments/{sid}")
-    def patch_segment(name: str, sid: str, body: dict):
-        p = load(name)
-        s = p.timeline[p.index_of(sid)]
+    def apply_patch(p: Project, s: Segment, body: dict) -> None:
+        """One segment's PATCH body: every key is a field or an edit on the segment (see the branches)."""
         for k, v in body.items():
             if k == "in":
                 edits.set_in(s, parse_time(v))
@@ -852,6 +873,24 @@ def create_app(cfg: Config) -> FastAPI:
                 s.layout = "lower" if v == "lower" else "center"
             elif k in ("caption", "subtitle", "transition", "note"):
                 setattr(s, k, v if v != "" else ("" if k in ("subtitle", "note") else None))
+            elif k == "group":
+                s.group = str(v or "")
+
+    @app.patch("/api/projects/{name}/segments/{sid}")
+    def patch_segment(name: str, sid: str, body: dict):
+        p = load(name)
+        apply_patch(p, p.timeline[p.index_of(sid)], body)
+        commit(p)
+        return project_json(p)
+
+    @app.post("/api/projects/{name}/segments/patch")
+    def patch_segments(name: str, body: dict):
+        """The same patch on several segments (a multi-selection), one undo step: {ids, patch}."""
+        p = load(name)
+        ids = set(body.get("ids") or [])
+        for s in p.timeline:
+            if s.id in ids:
+                apply_patch(p, s, dict(body.get("patch") or {}))
         commit(p)
         return project_json(p)
 
@@ -861,6 +900,55 @@ def create_app(cfg: Config) -> FastAPI:
         p.remove(sid)
         commit(p)
         return project_json(p)
+
+    @app.post("/api/projects/{name}/segments/remove")
+    def remove_segments(name: str, body: dict):
+        """Delete several segments and/or audio layers (sN / vN ids) in one undo step."""
+        p = load(name)
+        n = edits.remove_many(p, list(body.get("ids") or []))
+        commit(p)
+        return project_json(p) | {"removed": n}
+
+    @app.post("/api/projects/{name}/segments/group")
+    def group_segments(name: str, body: dict):
+        p = load(name)
+        try:
+            tag = edits.group(p, list(body.get("ids") or []))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        commit(p)
+        return project_json(p) | {"group": tag}
+
+    @app.post("/api/projects/{name}/segments/ungroup")
+    def ungroup_segments(name: str, body: dict):
+        p = load(name)
+        edits.ungroup(p, list(body.get("ids") or []))
+        commit(p)
+        return project_json(p)
+
+    @app.post("/api/projects/{name}/segments/{sid}/unlink")
+    def unlink_audio(name: str, sid: str):
+        """Unlink a clip's sound from its picture: it becomes an audio layer (kind clip) on the A2 track."""
+        p = load(name)
+        try:
+            v = edits.detach_audio(p, sid)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        commit(p)
+        return project_json(p) | {"new_id": v.id}
+
+    @app.post("/api/projects/{name}/voiceovers/{vid}/link")
+    def link_audio(name: str, vid: str):
+        """Link an unlinked clip sound back to its picture."""
+        p = load(name)
+        try:
+            s = edits.relink_audio(p, vid)
+        except (ValueError, KeyError) as e:
+            raise HTTPException(400, str(e))
+        if s is None:
+            raise HTTPException(400, "the clip this sound came from is gone; the layer stays as it is")
+        commit(p)
+        return project_json(p) | {"seg_id": s.id}
 
     @app.post("/api/projects/{name}/reorder")
     def reorder(name: str, body: dict):
@@ -1209,8 +1297,17 @@ def create_app(cfg: Config) -> FastAPI:
             v.duck_clips = bool(body["duck_clips"])
         if "polish" in body:
             v.polish = polish_value(body["polish"])
-            if render.polish_on(p, v.polish) and p.resolve(v.file).exists():
-                measure_voice_async(p, v.file, "stereo")
+            if render.polish_on(p, v.polish, v.mic) and p.resolve(v.file).exists():
+                measure_voice_async(p, v.file, v.channel if v.kind == "clip" else "stereo")
+        if v.kind == "clip":
+            if "in" in body:
+                v.src_in = max(0.0, parse_time(body["in"]))
+            if "out" in body:
+                v.src_out = None if body["out"] in (None, "", "end") else max(v.src_in, parse_time(body["out"]))
+            if "speed" in body:
+                v.speed = max(0.05, float(body["speed"]))
+            if "channel" in body:
+                v.channel = body["channel"] if body["channel"] in CHANNELS else "auto"
         if "note" in body:
             v.note = str(body["note"])
         p.voiceovers.sort(key=lambda x: x.at)

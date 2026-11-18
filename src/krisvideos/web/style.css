@@ -127,12 +127,15 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 .ablk img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .9; pointer-events: none; }
 .ablk.silent { background: repeating-linear-gradient(45deg, #dcdee3, #dcdee3 4px, #ebedf1 4px, #ebedf1 8px); }
 .ablk.selected { outline-width: 2px; z-index: 2; }
+.ablk.unlinked { background: repeating-linear-gradient(45deg, #cfd9e6, #cfd9e6 4px, #e3e9f1 4px, #e3e9f1 8px); }
+.ablk.unlinked::after { content: "⛓ on A2"; position: absolute; left: 4px; top: 0; font-size: 9px; line-height: 20px; color: #4a5a70; white-space: nowrap; }
 #tlEmpty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--muted); }
 .block { position: absolute; top: 0; height: 40px; border-radius: 3px; overflow: hidden; background: var(--clip-block); cursor: pointer; user-select: none; outline: 0 solid var(--accent); transition: outline-width .08s; }
 .block.title { background: linear-gradient(135deg, #7a66d4, #5a47b3); color: #fff; }
 .block.missing { background: repeating-linear-gradient(45deg, #f3d0cc, #f3d0cc 8px, #f9e3e0 8px, #f9e3e0 16px); }
 .block.selected { outline-width: 2px; z-index: 2; }
 .block.dragover { outline: 2px dashed var(--accent); }
+.block.grouped::after { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--gc, #888); z-index: 1; pointer-events: none; }
 .block .strip { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: left; pointer-events: none; }
 .block.pending { background: linear-gradient(90deg, #e6e8ee 25%, #f2f3f6 50%, #e6e8ee 75%); background-size: 200% 100%; animation: shimmer 1.4s infinite; }
 @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
@@ -158,9 +161,11 @@ input[type=color] { width: 30px; height: 30px; border: 0; padding: 0; background
 .block.selected .handle { display: block; }
 #lanes { display: flex; flex-direction: column; gap: 1px; margin-top: 1px; }
 .lane { position: relative; height: 16px; border-radius: 3px; background: var(--surface2); }
-.lane .vo, .lane .mu, .lane .st { position: absolute; top: 1px; height: 14px; border-radius: 3px; font-size: 9px; line-height: 14px; padding: 0 4px; color: #fff; white-space: nowrap; overflow: hidden; cursor: pointer; }
-.lane .vo { background: var(--vo); } .lane .st { background: #b8632a; } .lane .mu { background: var(--music); left: 0; right: 0; }
-.lane .vo.selected, .lane .mu.selected, .lane .st.selected { outline: 2px solid var(--accent); }
+.lane .vo, .lane .snd, .lane .mu, .lane .st { position: absolute; top: 1px; height: 14px; border-radius: 3px; font-size: 9px; line-height: 14px; padding: 0 4px; color: #fff; white-space: nowrap; overflow: hidden; cursor: pointer; user-select: none; touch-action: none; }
+.lane .vo { background: var(--vo); } .lane .snd { background: #3b8f72; } .lane .st { background: #b8632a; } .lane .mu { background: var(--music); left: 0; right: 0; }
+.lane .snd img { position: absolute; inset: 0; width: 100%; height: 100%; opacity: .7; pointer-events: none; } .lane .snd span { position: relative; }
+.lane .snd.missing, .lane .vo.missing { background: repeating-linear-gradient(45deg, #c9777a, #c9777a 4px, #d99093 4px, #d99093 8px); }
+.lane .vo.selected, .lane .snd.selected, .lane .mu.selected, .lane .st.selected { outline: 2px solid var(--accent); z-index: 2; }
 #playhead { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); pointer-events: none; z-index: 5; }
 #ghost { position: absolute; top: 0; bottom: 0; width: 2px; margin-left: -1px; background: var(--danger); opacity: .35; pointer-events: none; z-index: 4; }
 #playhead .head { position: absolute; top: 0; left: -5px; width: 12px; height: 15px; background: var(--danger); border-radius: 3px 3px 6px 6px; pointer-events: auto; cursor: grab; touch-action: none; }

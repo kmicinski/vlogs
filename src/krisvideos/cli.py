@@ -14,6 +14,8 @@
     vlog trim PROJECT SEG --in 0:03 --out 0:14
     vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade lens=-0.12,0.02|off (speed: any number, 60 = a minute per second)
     vlog rm PROJECT SEG                      remove a segment
+    vlog group PROJECT s3 s4 s5              select/move/delete these together in the GUI (vlog ungroup PROJECT s3)
+    vlog unlink PROJECT s3                   the clip's sound becomes its own audio layer (vlog link PROJECT v2 puts it back)
     vlog move PROJECT SEG INDEX              reorder
     vlog music PROJECT FILE [--volume 0.18]
     vlog voiceover PROJECT FILE --at 0:12          narration layer at a timeline time (GUI can record these)
@@ -415,6 +417,38 @@ def cmd_rm(cfg, a):
     print("ok")
 
 
+def cmd_group(cfg, a):
+    p = _project(cfg, a.project)
+    ids = [_seg(p, x).id for x in a.segs]
+    try:
+        tag = edits.ungroup(p, ids) if a.cmd == "ungroup" else edits.group(p, ids)
+    except ValueError as e:
+        sys.exit(str(e))
+    p.save()
+    print("ok" if a.cmd == "ungroup" else f"grouped as {tag}")
+
+
+def cmd_link(cfg, a):
+    p = _project(cfg, a.project)
+    if a.cmd == "unlink":
+        s = _seg(p, a.item)
+        try:
+            v = edits.detach_audio(p, s.id)
+        except ValueError as e:
+            sys.exit(str(e))
+        p.save()
+        print(f"{v.id}: the sound of {s.id} now plays on its own at {fmt_time(v.at)} (vlog link {p.name} {v.id} puts it back)")
+    else:
+        try:
+            s = edits.relink_audio(p, a.item)
+        except (ValueError, KeyError) as e:
+            sys.exit(str(e))
+        if s is None:
+            sys.exit(f"the clip {a.item} came from is gone; the layer stays as it is")
+        p.save()
+        print(f"{s.id} plays its own sound again")
+
+
 def cmd_move(cfg, a):
     p = _project(cfg, a.project)
     before = _snapshot(p)
@@ -639,6 +673,8 @@ def cmd_show(cfg, a):
                 desc += f"  voice={'polished' if s.polish == 'on' else 'as recorded'}"
             if getattr(s, "mic", ""):
                 desc += f"  mic={s.mic}"
+            if s.mute and any(v.kind == "clip" and v.from_seg == s.id for v in p.voiceovers):
+                desc += "  (sound unlinked)"
             if s.cam:
                 desc += f"  cam={s.cam!r}"
             lk = render.lens_params(s.lens, s.cam, cfg.lenses)
@@ -664,8 +700,14 @@ def cmd_show(cfg, a):
                     desc += f" x{s.pip.speed:g}"
                 if s.pip.volume:
                     desc += f" sound={s.pip.volume:g}"
+        if s.group:
+            desc += f"  group={s.group}"
         print(f"  {s.id:>4}  {fmt_time(pl.start):>7} - {fmt_time(pl.end):<7} {desc}{tr}")
     for v in p.voiceovers:
+        if v.kind == "clip":
+            spd = f" x{v.speed:g}" if v.speed != 1 else ""
+            print(f"  {v.id:>4}  {fmt_time(v.at):>7}          SOUND  {v.file} [{fmt_time(v.src_in)} - {fmt_time(v.src_out) if v.src_out is not None else 'end'}]{spd} vol={v.volume}  (unlinked from {v.from_seg})")
+            continue
         print(f"  {v.id:>4}  {fmt_time(v.at):>7}          VOICE  {v.file} vol={v.volume}{'' if v.duck_clips else ' no-duck'}{'' if v.polish == 'auto' else '  voice=' + ('polished' if v.polish == 'on' else 'as recorded')}")
     for m in p.images:
         where = "full screen" if not m.box else f"box x={m.box[0]:.2f} y={m.box[1]:.2f} w={m.box[2]:.2f}"
@@ -738,6 +780,10 @@ def main(argv=None):
     s = sub.add_parser("trim"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("--in", dest="in_"); s.add_argument("--out"); s.set_defaults(fn=cmd_trim)
     s = sub.add_parser("set"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("pairs", nargs="+"); s.add_argument("--force", action="store_true", help="polish=on even on a take from a good mic"); s.set_defaults(fn=cmd_set)
     s = sub.add_parser("rm"); s.add_argument("project"); s.add_argument("seg"); s.set_defaults(fn=cmd_rm)
+    for nm in ("group", "ungroup"):
+        s = sub.add_parser(nm, help="segments the GUI selects, moves and deletes together"); s.add_argument("project"); s.add_argument("segs", nargs="+"); s.set_defaults(fn=cmd_group)
+    s = sub.add_parser("unlink", help="a clip's sound becomes its own audio layer (the clip goes silent)"); s.add_argument("project"); s.add_argument("item", help="segment id"); s.set_defaults(fn=cmd_link)
+    s = sub.add_parser("link", help="put an unlinked sound back on its clip"); s.add_argument("project"); s.add_argument("item", help="audio layer id (v2)"); s.set_defaults(fn=cmd_link)
     s = sub.add_parser("pip", help="a second clip in a box over a clip (camera over a screen recording)"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("file", nargs="?", help="the inset's clip (omit to change an existing inset)"); s.add_argument("--layout", choices=list(edits.PIP_LAYOUTS), help="corner | corner-large | stacked | full (B-roll over the picture) | hidden"); s.add_argument("--pos", choices=list(edits.PIP_POSITIONS), help="corner for the corner layouts"); s.add_argument("--shape", choices=["round", "rect", "circle"]); s.add_argument("--box", help="x,y,w[,h] fractions of the frame (centre and size)"); s.add_argument("--offset", help="inset time = offset + speed × clip source time"); s.add_argument("--speed", type=float, help="the inset's own speed (4 = a 4x timelapse in the frame)"); s.add_argument("--sound", type=float, help="the inset's own sound, 0 (off, the default) to 1"); s.add_argument("--in", dest="in_", help="where in its file the inset is when the clip starts"); s.add_argument("--swap", action="store_true", help="exchange the clip and its inset"); s.add_argument("--rm", action="store_true", help="remove the inset"); s.set_defaults(fn=cmd_pip)
     s = sub.add_parser("move"); s.add_argument("project"); s.add_argument("seg"); s.add_argument("index", type=int); s.set_defaults(fn=cmd_move)
     s = sub.add_parser("music"); s.add_argument("project"); s.add_argument("file"); s.add_argument("--volume", type=float); s.set_defaults(fn=cmd_music)
