@@ -150,6 +150,16 @@ computer mic instead of the DJI Mic Mini, a Yeti or an audio interface), and swi
 mic automatically when one is plugged in. If the mic is unplugged mid-take, recording stops and
 the take so far is kept.
 
+Wide-angle webcams bend straight lines near the edges (barrel distortion). Every take remembers
+the camera it was shot with (like its mic), and the inspector's **Lens** section straightens it in
+the export: two sliders (k1 for the bulge, k2 for the fine edges; a little below zero is usually
+right), a corrected still of the current frame to judge by, and a choice of *For this camera*
+(saved in the app settings, so every clip from that camera — past and future — is corrected the
+same way), *This clip only*, or *No correction*. The live player shows clips uncorrected; the
+still, previews and the export apply it. In the YAML a clip may carry `cam:` (the camera's name)
+and `lens: off` or `lens: {k1: -0.12, k2: 0.02}`; the per-camera table is `lenses:` in
+`~/.config/krisvideos/config.yaml` (`match` is a substring or regex of the camera's name).
+
 Keyboard: `space` play · `I`/`O` mark in/out · `X` mark clip · `⌫` cut out marked part ·
 `K` keep only marked part · `M` marker · `,`/`.` previous/next marker · `Q`/`W` trim start/end to playhead · `T` title here · `S` split ·
 `R` record · `⌫` delete · `↑↓` select · `[` `]` reorder · `←→` frame step · `⌘Z` undo ·
@@ -231,6 +241,8 @@ vlog keep PROJ 0:12 0:15                   trim the clip(s) there so only that s
 vlog caption PROJ s3 "coffee first" [--at 2 --dur 3]
 vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true transition=fade   (speed: any number, e.g. 60)
 vlog set PROJ s3 channel=right             # one-channel mic: right (or left) to both ears; mix; stereo; auto
+vlog set PROJ s3 lens=-0.12,0.02           # straighten a wide-angle webcam (or lens=off / lens=auto = the camera's setting)
+vlog config lenses='[{match: Anker, k1: -0.12, k2: 0.02}]'   # the per-camera table (match = substring/regex of the camera name)
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
 vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos br] [--shape round|rect|circle] [--speed 4] [--in 0:05] [--swap] [--rm]
                                            a clip in a box over s3 (picture in picture); --swap makes the inset the big one

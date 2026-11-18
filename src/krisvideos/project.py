@@ -205,13 +205,15 @@ class Pip:
     hidden: bool = False                    # keep it but don't show it (the clip fills the frame)
     speed: float = 1.0                      # the inset's own speed, on top of the clip's (a 4x timelapse in a frame)
     volume: float = 0.0                     # the inset's own sound mixed in: 0 = silent (the clip's sound carries on), 1 = full
+    cam: str = ""                           # camera this picture was recorded with (device label), for lens correction
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pip":
         return cls(src=str(d.get("clip") or d.get("src")), offset=float(parse_time(d.get("offset", 0) or 0)),
                    box=box4(d.get("box")) or (0.82, 0.84, 0.3, None), fit=str(d.get("fit") or "cover"),
                    shape=str(d.get("shape") or "round"), hidden=bool(d.get("hidden", False)),
-                   speed=max(0.01, float(d.get("speed", 1.0) or 1.0)), volume=max(0.0, float(d.get("volume", 0.0) or 0.0)))
+                   speed=max(0.01, float(d.get("speed", 1.0) or 1.0)), volume=max(0.0, float(d.get("volume", 0.0) or 0.0)),
+                   cam=str(d.get("cam") or ""))
 
     def time(self, src_t: float) -> float:
         """The inset file's time at main-clip source time `src_t`."""
@@ -232,7 +234,28 @@ class Pip:
             d["hidden"] = True
         if self.volume:
             d["volume"] = self.volume
+        if self.cam:
+            d["cam"] = self.cam
         return d
+
+
+def lens_value(v) -> "tuple[float, float] | str | None":
+    """A clip's lens setting: None = the camera's configured correction, "off" = none, (k1, k2) = its own.
+    Accepts {k1, k2}, [k1, k2], "k1,k2", "off"/"none", ""/None/"auto"."""
+    if v is None or v == "" or v == "auto" or v is True:
+        return None
+    if v is False:                  # a hand-written `lens: off` is a YAML boolean
+        return "off"
+    if isinstance(v, str):
+        if v.strip().lower() in ("off", "none", "no", "false"):
+            return "off"
+        parts = [x for x in re.split(r"[,\s]+", v.strip()) if x]
+        return (float(parts[0]), float(parts[1]) if len(parts) > 1 else 0.0)
+    if isinstance(v, dict):
+        return (float(v.get("k1") or 0.0), float(v.get("k2") or 0.0))
+    if isinstance(v, (list, tuple)) and v:
+        return (float(v[0]), float(v[1]) if len(v) > 1 else 0.0)
+    raise ValueError(f"lens must be off, auto or k1,k2: {v!r}")
 
 
 CREDIT_POSITIONS = ("tl", "tr", "bl", "br")
@@ -321,6 +344,8 @@ class Segment:
     markers: list[float] = field(default_factory=list)   # moments to come back to (source-clip seconds)
     box: tuple | None = None        # where the picture goes on the frame (x, y, w, h fractions); None = the whole frame
     pip: Pip | None = None          # a second picture in a box over this one (camera over a screen recording)
+    cam: str = ""                   # the camera this take was recorded with (browser device label), like a mic name
+    lens: tuple | str | None = None # barrel-distortion fix: None = config `lenses` entry for `cam`, "off", or (k1, k2)
     # title fields
     text: str = ""
     subtitle: str = ""
@@ -356,6 +381,8 @@ class Segment:
             seg.markers = sorted(float(parse_time(x)) for x in d.get("markers") or [])
             seg.box = box4(d.get("box"))
             seg.pip = Pip.from_dict(d["pip"]) if isinstance(d.get("pip"), dict) and (d["pip"].get("clip") or d["pip"].get("src")) else None
+            seg.cam = str(d.get("cam") or "")
+            seg.lens = lens_value(d.get("lens"))
         elif "title" in d or "image" in d:
             seg = cls(kind="title", text=str(d.get("title") or ""))
             seg.subtitle = str(d.get("subtitle") or "")
@@ -408,6 +435,12 @@ class Segment:
                 d["box"] = box_dict(self.box)
             if self.pip:
                 d["pip"] = self.pip.to_dict()
+            if self.cam:
+                d["cam"] = self.cam
+            if self.lens == "off":
+                d["lens"] = "off"
+            elif isinstance(self.lens, tuple):
+                d["lens"] = {"k1": round(self.lens[0], 4), "k2": round(self.lens[1], 4)}
         else:
             if self.text or not self.image:
                 d["title"] = self.text

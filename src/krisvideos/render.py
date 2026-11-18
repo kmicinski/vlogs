@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import media, titles
+from .config import Config, lens_for
 from .probe import MediaInfo, probe
 from .project import Overlay, Pip, Project, Segment
 
@@ -206,6 +207,28 @@ def _hwdec(info: MediaInfo, hdr_mode: str, want_v: bool = True) -> list[str]:
     if want_v and hdr_mode == "vt" and info.hdr and (info.codec or "").lower() in ("hevc", "h265"):
         return ["-hwaccel", "videotoolbox"]
     return []
+def lens_params(override, cam: str, lenses: list) -> tuple[float, float] | None:
+    """The (k1, k2) barrel-distortion correction for a picture: the clip's own setting (a tuple), nothing
+    for "off", else the config `lenses` entry matching the camera label it was recorded with."""
+    if override == "off":
+        return None
+    if isinstance(override, tuple):
+        k1, k2 = override
+    else:
+        hit = lens_for(cam, lenses)
+        if not hit:
+            return None
+        k1, k2 = float(hit.get("k1") or 0.0), float(hit.get("k2") or 0.0)
+    if abs(k1) < 1e-6 and abs(k2) < 1e-6:
+        return None
+    return (k1, k2)
+
+
+def lens_filter(k: tuple[float, float] | None) -> str:
+    """ffmpeg `lenscorrection` for (k1, k2); negative k1 straightens a wide-angle webcam's barrel distortion."""
+    if not k:
+        return ""
+    return f"lenscorrection=k1={k[0]:.4f}:k2={k[1]:.4f}:i=bilinear"
 
 
 def _fit(iw: int, ih: int, W: int, H: int) -> tuple[int, int]:
@@ -346,11 +369,17 @@ def window_layout(layout: Layout, t0: float, t1: float) -> Layout:
 
 
 def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None, *, window: tuple[float, float] | None = None,
-               part: str = "both", output: Path | None = None) -> Plan:
+               part: str = "both", output: Path | None = None, lenses: list | None = None) -> Plan:
     """mode: 'final' or 'preview' (half-res, fast encode). `window` = (t0, t1) renders just that stretch of
     the output timeline (a shard of a parallel export, see render_parallel); `part` = both | video | audio
-    picks the streams built (a shard is video only, the whole sound is one audio pass)."""
+    picks the streams built (a shard is video only, the whole sound is one audio pass). `lenses`: the config's
+    camera lens corrections (default: read from the config file)."""
     infos = infos if infos is not None else probe_project(p)
+    if lenses is None:
+        try:
+            lenses = Config.load().lenses
+        except Exception:
+            lenses = []
     scale = 0.5 if mode == "preview" else 1.0
     full = compute_layout(p, infos, scale=scale)
     st = p.style
@@ -427,9 +456,16 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             # the picture fills the frame, or the box it was given (screen + camera layouts)
             bx, by, bw, bh = region(s.box, W, H)
             fw, fh = _fit(info.width, info.height, bw, bh)
+            # wide-angle webcam: straighten the barrel distortion at the source resolution, before scaling
+            # (an HDR source goes through the tone-map first: lenscorrection is 8-bit only)
+            lens = lens_filter(lens_params(s.lens, s.cam, lenses))
+            if lens and not (info.hdr and hdr_mode != "none"):
+                vchain.append(lens)
             if info.hdr and hdr_mode != "none":
                 any_hdr = True
                 vchain.append(_hdr_chain(hdr_mode, fw, fh).rstrip(","))
+                if lens:
+                    vchain.append(lens)
             if s.fit == "cover":
                 vchain.append(f"scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bicubic,crop={bw}:{bh}")
                 fw, fh = bw, bh
@@ -474,9 +510,14 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     pchain.append(f"setpts=PTS/{rate:.6g}")
                     if rate > 1.0:       # decimate first: the tone-map / scale below then see only the frames that are kept
                         pchain.append(f"fps={FPS}")
+                plens = lens_filter(lens_params(None, pip.cam, lenses))   # the camera as the inset of a screen take
+                if plens and not (pinfo.hdr and hdr_mode != "none"):
+                    pchain.append(plens)
                 if pinfo.hdr and hdr_mode != "none":
                     any_hdr = True
                     pchain.append(_hdr_chain(hdr_mode, *_fit(pinfo.width, pinfo.height, pw, ph)).rstrip(","))
+                    if plens:
+                        pchain.append(plens)
                 if pip.fit == "contain":
                     qw, qh = _fit(pinfo.width, pinfo.height, pw, ph)
                     pchain.append(f"scale={qw}:{qh}:flags=bicubic,pad={pw}:{ph}:(ow-iw)/2:(oh-ih)/2:color=black")

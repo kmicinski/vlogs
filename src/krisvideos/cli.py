@@ -12,7 +12,7 @@
     vlog keep PROJECT 0:12 0:15              trim the clip(s) there so only that stretch remains
     vlog caption PROJECT SEG "Text"          lower-third over a segment (SEG = id like s3, or index)
     vlog trim PROJECT SEG --in 0:03 --out 0:14
-    vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade (speed: any number, 60 = a minute per second)
+    vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade lens=-0.12,0.02|off (speed: any number, 60 = a minute per second)
     vlog rm PROJECT SEG                      remove a segment
     vlog move PROJECT SEG INDEX              reorder
     vlog music PROJECT FILE [--volume 0.18]
@@ -349,6 +349,12 @@ def cmd_set(cfg, a):
             from .project import CHANNELS
             if v not in CHANNELS:
                 sys.exit(f"channel must be one of {', '.join(CHANNELS)}")
+        elif k == "lens":           # lens=-0.12,0.02 (this clip's own correction) | off | auto (the camera's configured one)
+            from .project import lens_value
+            try:
+                v = lens_value(v)
+            except ValueError as e:
+                sys.exit(str(e))
         elif isinstance(cur, float):
             v = float(v)
         setattr(s, k, v)
@@ -633,6 +639,13 @@ def cmd_show(cfg, a):
                 desc += f"  voice={'polished' if s.polish == 'on' else 'as recorded'}"
             if getattr(s, "mic", ""):
                 desc += f"  mic={s.mic}"
+            if s.cam:
+                desc += f"  cam={s.cam!r}"
+            lk = render.lens_params(s.lens, s.cam, cfg.lenses)
+            if s.lens == "off":
+                desc += "  lens=off"
+            elif lk:
+                desc += f"  lens={lk[0]:+.3f},{lk[1]:+.3f}" + (" (this clip)" if isinstance(s.lens, tuple) else " (camera)")
             if s.caption:
                 desc += f"  caption={s.caption!r}"
             for ov in s.overlays:
@@ -697,7 +710,12 @@ def cmd_config(cfg, a):
             k, _, v = kv.partition("=")
             if not hasattr(cfg, k):
                 sys.exit(f"unknown setting {k}")
-            setattr(cfg, k, type(getattr(cfg, k))(v))
+            if k == "lenses":       # lenses='[{match: Anker, k1: -0.12, k2: 0.02}]' (YAML/JSON)
+                import yaml
+                from .config import clean_lenses
+                setattr(cfg, k, clean_lenses(yaml.safe_load(v) or []))
+            else:
+                setattr(cfg, k, type(getattr(cfg, k))(v))
         cfg.save()
     for k, v in cfg.public().items():
         print(f"{k}: {v}")

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -35,6 +36,10 @@ class Config:
     port: int = 8765
     good_mics: list = field(default_factory=list)   # mic labels Kris marked as good (besides media.GOOD_MIC_RE): takes stay as recorded
     render_workers: int = 0            # ffmpegs run at once by an export (0 = one per core; 1 = the old single pass)
+    # lens corrections for wide-angle cameras: [{match: "Anker", k1: -0.12, k2: 0.02}, ...]. `match` is a
+    # substring (case-insensitive) or a regex tested against the camera label a take was recorded with
+    # (Segment.cam); the first hit applies in the export unless the clip says otherwise (`lens: off` / own k1,k2).
+    lenses: list = field(default_factory=list)
 
     @property
     def vlogs_path(self) -> Path:
@@ -52,6 +57,7 @@ class Config:
             for k, v in data.items():
                 if hasattr(c, k) and v is not None:
                     setattr(c, k, v)
+        c.lenses = clean_lenses(c.lenses)
         # env overrides
         c.immich_url = os.environ.get("IMMICH_URL", c.immich_url)
         c.immich_api_key = os.environ.get("IMMICH_API_KEY", c.immich_api_key)
@@ -67,3 +73,35 @@ class Config:
         d["immich_configured"] = bool(self.immich_url and self.immich_api_key)
         d["config_file"] = str(CONFIG_FILE)
         return d
+
+
+def clean_lenses(items) -> list[dict]:
+    """Normalize a `lenses` list: dicts with a non-empty `match` and float k1/k2 (others dropped)."""
+    out: list[dict] = []
+    for it in items or []:
+        if not isinstance(it, dict) or not str(it.get("match") or "").strip():
+            continue
+        try:
+            k1, k2 = float(it.get("k1") or 0.0), float(it.get("k2") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        out.append({"match": str(it["match"]).strip(), "k1": round(k1, 4), "k2": round(k2, 4)})
+    return out
+
+
+def lens_for(cam: str, lenses: list) -> dict | None:
+    """The first `lenses` entry whose `match` is found in the camera label (substring, else regex)."""
+    if not cam:
+        return None
+    for it in lenses or []:
+        m = str(it.get("match") or "")
+        if not m:
+            continue
+        if m.lower() in cam.lower():
+            return it
+        try:
+            if re.search(m, cam, re.IGNORECASE):
+                return it
+        except re.error:
+            pass
+    return None

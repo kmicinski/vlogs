@@ -175,6 +175,24 @@ Jobs: `POST render` while an export runs returns the running job (the GUI joins 
 export); `openProject` re-attaches to a running job after a reload (`GET /api/jobs`).
 The final master (`render.MASTER_LUFS` -16) is a static gain + true-peak limiter when `match_levels` is on
 (single-pass `loudnorm` is an AGC that pumped room noise up between phrases); `loudnorm` only when it is off.
+Lens correction (the wide-angle webcam's barrel distortion, fixed in the export only): a take remembers its camera
+like its mic (`segment.cam`: the browser's device label, sent by the recorder as `record/start {cam}`, kept in the
+manifest; on a screen take it goes on whichever picture came from the camera, `Pip.cam` for the inset, and
+`edits.swap_pip` moves it along). Config `lenses: [{match, k1, k2}]` (`match` = substring or regex on the camera label,
+`config.lens_for`, `clean_lenses`; `PUT /api/settings {lenses}`, `vlog config lenses='[{match: Anker, k1: -0.12}]'`) says
+how to straighten each camera; a clip can say `lens: off` or carry its own `lens: {k1, k2}` (`Segment.lens`: None =
+the camera's entry, "off", or a tuple; `project.lens_value` parses all spellings; `PATCH segments/{id} {lens: null |
+"off" | {k1, k2}}`, `vlog set PROJ sN lens=-0.12,0.02|off|auto`). `render.lens_params(seg.lens, seg.cam, cfg.lenses)` →
+`render.lens_filter` puts `lenscorrection=k1=..:k2=..:i=bilinear` in the clip's `vchain` right after the speed `setpts`
+and before the scale (after the HDR tone-map for HDR sources: the filter is 8-bit); the inset's `pchain` gets it for
+`pip.cam`. `build_plan(..., lenses=)` defaults to `Config.load().lenses`. Segment JSON: `cam`, `lens` (own setting),
+`lens_effective` (what the export applies), `lens_source` (camera | clip | off), `lens_match` (the config entry hit).
+`vlog show` prints `cam='…'  lens=-0.120,+0.020 (camera|this clip)`. GUI inspector *Lens*: k1/k2 sliders
+(-0.5…0.5, step 0.005), mode *For this camera* (rewrites the matching `lenses` entry, or adds one named after the
+label) / *This clip only* / *No correction*, and a corrected still from `GET /api/projects/{name}/frame?src&t&k1&k2&w`
+(one ffmpeg JPEG, cached in `cache/<name>.frame.<t>.<k1>.<k2>.<w>.jpg`, debounced 250 ms); the live player can't
+apply the filter and shows the clip uncorrected. When Kris says "the webcam makes the walls bend / fix the fisheye"
+→ set the camera's entry (k1 ≈ -0.1 … -0.2 for a 110° webcam, k2 small); "leave this clip as shot" → `lens=off`.
 
 ## Development
 - `uv sync`; run with `.venv/bin/vlog ...`; GUI: `.venv/bin/vlog serve --port 8799`.

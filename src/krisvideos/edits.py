@@ -139,6 +139,8 @@ def swap_pip(seg: Segment) -> None:
     pip.speed = round(1 / r, 4)
     seg.speed = round((seg.speed or 1.0) * r, 4)
     seg.channel = "auto"                  # the audio now comes from the other file
+    seg.cam, pip.cam = pip.cam, seg.cam   # the lens correction follows the camera's picture
+    seg.lens = None
 
 
 def insert_pip(p: Project, t: float, src: str, in_: float = 0.0, out: float | None = None, speed: float = 1.0,
