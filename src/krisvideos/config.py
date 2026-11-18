@@ -34,6 +34,7 @@ class Config:
     title_accent: str = "#9aa0b4"
     port: int = 8765
     good_mics: list = field(default_factory=list)   # mic labels Kris marked as good (besides media.GOOD_MIC_RE): takes stay as recorded
+    render_workers: int = 0            # ffmpegs run at once by an export (0 = one per core; 1 = the old single pass)
 
     @property
     def vlogs_path(self) -> Path:

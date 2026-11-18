@@ -38,6 +38,8 @@ class Placed:
     info: MediaInfo | None = None
     src_in: float = 0.0
     src_out: float = 0.0
+    skip: float = 0.0       # output seconds of this segment cut off its head (a render window starting inside it)
+    cut_end: float = 0.0    # ... and off its tail (the window ends inside it)
 
     @property
     def end(self) -> float:
@@ -197,6 +199,15 @@ def _hdr_chain(mode: str, fit_w: int, fit_h: int) -> str:
     return ""
 
 
+def _hwdec(info: MediaInfo, hdr_mode: str, want_v: bool = True) -> list[str]:
+    """Decode an HDR HEVC file on the VideoToolbox hardware when its tone-map runs there too: the 10-bit
+    software decode was the biggest CPU cost of a B-roll shard (23% faster measured). The software HDR
+    fallback (hdr_mode "sw") decodes in software as well."""
+    if want_v and hdr_mode == "vt" and info.hdr and (info.codec or "").lower() in ("hevc", "h265"):
+        return ["-hwaccel", "videotoolbox"]
+    return []
+
+
 def _fit(iw: int, ih: int, W: int, H: int) -> tuple[int, int]:
     if iw <= 0 or ih <= 0:
         return W, H
@@ -252,38 +263,107 @@ def _hexcolor(s: str) -> str:
     return "0x" + s.strip().lstrip("#")[:6]
 
 
+def sound_chain(p: Project, src: Path, src_in: float, src_out: float, speed: float, volume: float, channel: str,
+                polish_setting: str, mic: str, add_input, raw: str) -> tuple[str, list[str]]:
+    """The filters that turn a file's sound (ffmpeg stream `raw`, e.g. "3:a", decoded from `src_in`) into the
+    conformed, level-matched, maybe polished stereo signal every clip and audio layer gets: returns
+    (stream to read from, chain). With the polish on, the cached polished sound (media.polished_audio)
+    is added as its own input and read instead, so the slow denoiser stays out of the graph."""
+    achain = ["asetpts=PTS-STARTPTS"]
+    ch = media.effective_channel(src, p.cache_dir, channel)
+    polished = polish_on(p, polish_setting, mic)
+    a_src, lift = raw, 1.0
+    if polished:                     # voice polish: denoise / de-ess / EQ / compress, before any speed change
+        chain, lufs = media.voice_filters(src, p.cache_dir, ch, p.audio.denoise)
+        vf = media.polished_audio(src, p.cache_dir, ch, p.audio.denoise, build=False)
+        if vf is not None:
+            kv = add_input(["-ss", f"{src_in:.3f}", "-t", f"{src_out - src_in + 0.1:.3f}", "-i", str(vf)])
+            a_src, lift = f"{kv}:a", 1.0 / media.VOICE_HEADROOM
+        else:
+            if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
+                achain.append(media.CHANNEL_PAN[ch])
+            achain.append(chain)
+    else:
+        if ch in media.CHANNEL_PAN:
+            achain.append(media.CHANNEL_PAN[ch])
+        lufs = media.measure_loudness(src, p.cache_dir, ch) if p.audio.match_levels else None
+    if speed != 1.0:
+        achain.append(_atempo(speed))
+    achain.append(AUDIO_FMT)
+    gain = media.level_gain_db(lufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
+    if volume != 1.0 or abs(gain) > 0.1 or lift != 1.0:
+        achain.append(f"volume={volume * lift:.4g}*{10 ** (gain / 20):.4f}")
+    if polished:
+        achain.append(media.VOICE_LIMITER)
+    return a_src, achain
+
+
 def voice_jobs(p: Project, infos=None) -> list[tuple[Path, Path, str, float]]:
-    """(file, cache dir, channel, denoise) for every clip whose sound gets the voice polish in a render."""
+    """(file, cache dir, channel, denoise) for every clip and audio layer whose sound gets the voice polish in a render."""
     out, seen = [], set()
-    for s in p.timeline:
-        if s.kind != "clip" or s.mute or s.volume <= 0 or s.speed > MUTE_ABOVE or not polish_on(p, s.polish, s.mic):
+    items = [(s.src, s.channel, s.polish, s.mic) for s in p.timeline
+             if s.kind == "clip" and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE]
+    items += [(v.file, v.channel if v.kind == "clip" else "stereo", v.polish, v.mic) for v in p.voiceovers if v.volume > 0]
+    for rel, channel, setting, mic in items:
+        if not polish_on(p, setting, mic):
             continue
-        src = p.resolve(s.src)
+        src = p.resolve(rel)
         if not src.exists():
             continue
         try:
-            info = (infos or {}).get(s.src) or probe(src, p.cache_dir)
+            info = (infos or {}).get(rel) or probe(src, p.cache_dir)
         except Exception:
             continue
         if not info.has_audio:
             continue
-        ch = media.effective_channel(src, p.cache_dir, s.channel)
+        ch = media.effective_channel(src, p.cache_dir, channel)
         if (src, ch) not in seen:
             seen.add((src, ch))
             out.append((src, p.cache_dir, ch, p.audio.denoise))
     return out
 
 
-def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None) -> Plan:
-    """mode: 'final' or 'preview' (half-res, fast encode)."""
+def window_layout(layout: Layout, t0: float, t1: float) -> Layout:
+    """The part of a layout between output times t0 and t1, re-based so t0 is 0: segments outside are
+    dropped, the ones across an edge are clipped (`skip` = head cut off, `src_in`/`src_out` follow at the
+    clip's speed). The window must not start inside a transition overlap or a title card
+    (see no_split_zones), so the first segment simply comes in with a cut."""
+    out: list[Placed] = []
+    for pl in layout.placed:
+        a, b = max(pl.start, t0), min(pl.end, t1)
+        if b - a <= 1e-6:
+            continue
+        skip = a - pl.start
+        spd = (pl.seg.speed or 1.0) if pl.seg.kind == "clip" else 1.0
+        keep_fade = skip <= 1e-6 and bool(out)      # its fade partner (the segment before) is in the window too
+        out.append(Placed(seg=pl.seg, index=pl.index, start=a - t0, duration=b - a,
+                          transition=pl.transition if keep_fade else "cut",
+                          transition_duration=pl.transition_duration if keep_fade else 0.0,
+                          info=pl.info, src_in=pl.src_in + skip * spd, src_out=pl.src_in + (skip + (b - a)) * spd,
+                          skip=pl.skip + skip, cut_end=pl.cut_end + (pl.end - b)))
+    return Layout(width=layout.width, height=layout.height, fps=layout.fps, placed=out, total=t1 - t0,
+                  orientation=layout.orientation)
+
+
+def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None, *, window: tuple[float, float] | None = None,
+               part: str = "both", output: Path | None = None) -> Plan:
+    """mode: 'final' or 'preview' (half-res, fast encode). `window` = (t0, t1) renders just that stretch of
+    the output timeline (a shard of a parallel export, see render_parallel); `part` = both | video | audio
+    picks the streams built (a shard is video only, the whole sound is one audio pass)."""
     infos = infos if infos is not None else probe_project(p)
     scale = 0.5 if mode == "preview" else 1.0
-    layout = compute_layout(p, infos, scale=scale)
-    W, H, FPS = layout.width, layout.height, layout.fps
+    full = compute_layout(p, infos, scale=scale)
     st = p.style
     warnings: list[str] = []
-    if not layout.placed:
+    if not full.placed:
         raise ValueError("timeline is empty")
+    want_v, want_a = part != "audio", part != "video"
+    t0, t1 = window if window else (0.0, full.total)
+    layout = window_layout(full, t0, t1) if window else full
+    if not layout.placed:
+        raise ValueError(f"nothing between {t0:.3f} and {t1:.3f}")
+    first, last = t0 <= 1e-6, t1 >= full.total - 1e-6     # the global fades belong to the first / last window
+    W, H, FPS = layout.width, layout.height, layout.fps
 
     inputs: list[str] = []
     filters: list[str] = []
@@ -295,6 +375,9 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         n_in += 1
         return n_in - 1
 
+    # a video-only run never decodes the sound and an audio-only run never decodes the pictures
+    only = ["-an"] if not want_a else (["-vn"] if not want_v else [])
+
     v_labels: list[str] = []
     a_labels: list[str] = []
     any_hdr = False
@@ -302,7 +385,14 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
     for pl in layout.placed:
         s, i = pl.seg, pl.index
         dur = pl.duration
-        if s.kind == "title":
+        # every segment yields exactly the frames between its rounded start and end on the output's frame
+        # grid (`exact`): the cut points then never drift from the audio, and a parallel render's shards
+        # line up frame for frame with a single pass (fps alone rounds each segment up on its own)
+        nf = max(1, int(round(pl.end * FPS)) - int(round(pl.start * FPS)))
+        exact = f"fps={FPS},tpad=stop=3:stop_mode=clone,trim=end_frame={nf},fps={FPS}"
+        if s.kind == "title" and not want_v:
+            filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
+        elif s.kind == "title":
             bg, fg = s.bg or st.title_bg, s.fg or st.title_fg
             image = None
             if s.image:
@@ -313,21 +403,22 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             png = titles.render_title_card(p.cache_dir, W, H, s.text, s.subtitle, font=st.font, bg=bg,
                                            fg=fg, accent=st.title_accent, layout=s.layout, kicker=s.kicker,
                                            image=image, fit=s.fit)
-            k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", str(png)])
+            k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur + 0.25:.3f}", "-i", str(png)])
             tf = min(st.title_fade, dur / 3)
             fade = ""
             if tf > 0 and image is None:   # text cards fade their text in/out; image cards are joined by transitions
                 c = _hexcolor(bg)
                 fade = f",fade=t=in:st=0:d={tf:.3f}:c={c},fade=t=out:st={dur - tf:.3f}:d={tf:.3f}:c={c}"
             # NB: `fps` must come after trim/setpts/fade, or the stream loses its constant frame rate and xfade refuses it
-            filters.append(f"[{k}:v]format=yuv420p,setsar=1,trim=duration={dur:.3f},setpts=PTS-STARTPTS{fade},fps={FPS},settb=AVTB[v{i}]")
-            filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
+            filters.append(f"[{k}:v]format=yuv420p,setsar=1,trim=duration={dur + 0.25:.3f},setpts=PTS-STARTPTS{fade},{exact},settb=AVTB[v{i}]")
+            if want_a:
+                filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
         else:
             info = pl.info
             assert info is not None
             src = p.resolve(s.src)
             seek = ["-ss", f"{pl.src_in:.3f}"] if pl.src_in > 0 else []
-            k = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in):.3f}", "-i", str(src)])
+            k = add_input(only + _hwdec(info, hdr_mode, want_v) + seek + ["-t", f"{(pl.src_out - pl.src_in) + 0.25 * s.speed:.3f}", "-i", str(src)])
             vchain = ["setpts=PTS-STARTPTS"]
             if s.speed != 1.0:
                 vchain.append(f"setpts=PTS/{s.speed:.6g}")
@@ -346,8 +437,9 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 vchain.append(f"scale={fw}:{fh}:flags=bicubic")
             if (fw, fh) != (W, H):
                 vchain.append(f"pad={W}:{H}:{bx + (bw - fw) // 2}:{by + (bh - fh) // 2}:color=black")
-            vchain.append(f"setsar=1,format=yuv420p,trim=duration={dur:.3f},setpts=PTS-STARTPTS,fps={FPS}")
-            filters.append(f"[{k}:v]{','.join(vchain)}[vb{i}]")
+            vchain.append(f"setsar=1,format=yuv420p,trim=duration={dur + 0.25:.3f},setpts=PTS-STARTPTS,{exact}")
+            if want_v:
+                filters.append(f"[{k}:v]{','.join(vchain)}[vb{i}]")
             cur = f"vb{i}"
             # picture in picture: a second clip in a box over this one, in sync (pip time = source time + offset)
             pip, pinfo, pip_audio = s.pip, None, None
@@ -364,7 +456,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 rate = s.speed * (pip.speed or 1.0)        # the inset runs at its own speed on top of the clip's
                 pin = pip.time(pl.src_in)
                 seek = ["-ss", f"{pin:.3f}"] if pin > 0 else []
-                kp = add_input(seek + ["-t", f"{(pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
+                kp = add_input(only + _hwdec(pinfo, hdr_mode, want_v) + seek + ["-t", f"{(pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
                 # where (in output seconds from the clip's start) the inset's footage runs out; past that
                 # it dissolves away over PIP_FADE and the clip shows again
                 pend = (pinfo.duration - pin) / rate if pinfo.duration and rate > 0 else dur
@@ -373,7 +465,8 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 pfade = f"fade=t=out:st={max(0.0, pdur - PIP_FADE):.3f}:d={min(PIP_FADE, pdur):.3f}:alpha=1"
                 if pip.volume > 0 and pinfo.has_audio and rate <= MUTE_ABOVE:
                     pip_audio = (kp, pin, rate, pip.volume, pdur if ends_early else None)   # mixed into the clip's sound below
-                full = px <= 0 and py <= 0 and px + pw >= W and py + ph >= H     # B-roll: covers the picture
+            if pinfo is not None and want_v:
+                covers = px <= 0 and py <= 0 and px + pw >= W and py + ph >= H     # B-roll: covers the picture
                 pchain = ["setpts=PTS-STARTPTS"]
                 if pin < 0:            # the inset's file starts after the clip's in point: hold its first frame until then
                     pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
@@ -394,7 +487,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 # when the footage runs out early the inset (and its shadow) dissolve out and the overlay
                 # ends (eof_action=pass: the clip shows again); otherwise the last frame stays up to the end
                 eof = "pass" if ends_early else "repeat"
-                if full:                       # no mask, no shadow: the inset simply replaces the picture
+                if covers:                     # no mask, no shadow: the inset simply replaces the picture
                     filters.append(f"[{kp}:v]{','.join(pchain)}" + (f",format=yuva420p,{pfade}" if ends_early else "") + f"[pa{i}]")
                     filters.append(f"[{cur}][pa{i}]overlay=0:0:eof_action={eof}[pp{i}]")
                     cur = f"pp{i}"
@@ -417,74 +510,59 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             ovs = list(s.overlays)
             if s.caption:
                 ovs.insert(0, Overlay(text=s.caption, at=0.0, duration=None))
-            for j, ov in enumerate(ovs):
-                a = max(0.0, min(ov.at, dur))
-                b = dur if ov.duration is None else min(dur, a + ov.duration)
+            for j, ov in enumerate(ovs if want_v else []):
+                # overlay times are output seconds into the whole clip piece; this may be a window into it
+                # (pl.skip cut off its head, pl.cut_end its tail), so a text that starts or ends outside the
+                # window shows from the edge without fading there
+                a0 = ov.at - pl.skip
+                b0 = (dur + pl.cut_end) if ov.duration is None else a0 + ov.duration
+                a, b = max(0.0, min(a0, dur)), max(0.0, min(b0, dur))
                 if b - a < 0.1:
                     continue
                 png = titles.render_caption(p.cache_dir, W, H, ov.text, font=st.font, bg=st.caption_bg,
                                             fg=st.caption_fg, position=ov.position, style=ov.style)
                 ko = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{dur:.3f}", "-i", str(png)])
                 f_in = min(0.3, (b - a) / 3)
-                filters.append(
-                    f"[{ko}:v]format=rgba,fade=t=in:st={a:.3f}:d={f_in:.3f}:alpha=1,"
-                    f"fade=t=out:st={b - f_in:.3f}:d={f_in:.3f}:alpha=1[ov{i}_{j}]")
+                fades = []
+                if a0 >= -1e-3:
+                    fades.append(f"fade=t=in:st={a:.3f}:d={f_in:.3f}:alpha=1")
+                if b0 <= dur + 1e-3:
+                    fades.append(f"fade=t=out:st={b - f_in:.3f}:d={f_in:.3f}:alpha=1")
+                filters.append(f"[{ko}:v]format=rgba{''.join(',' + x for x in fades)}[ov{i}_{j}]")
                 filters.append(
                     f"[{cur}][ov{i}_{j}]overlay=0:0:eof_action=pass:enable='between(t,{a:.3f},{b:.3f})'[vo{i}_{j}]")
                 cur = f"vo{i}_{j}"
-            filters.append(f"[{cur}]settb=AVTB[v{i}]")
-            # audio (the clip's own; an inset's sound, if it has any turned on, is mixed in after)
-            a_main = f"a{i}m" if pip_audio else f"a{i}"
-            if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
-                achain = ["asetpts=PTS-STARTPTS"]
-                ch = media.effective_channel(src, p.cache_dir, s.channel)
-                polished = polish_on(p, s.polish, s.mic)
-                a_src, lift = f"{k}:a", 1.0
-                if polished:                     # voice polish: denoise / de-ess / EQ / compress, before any speed change
-                    chain, lufs = media.voice_filters(src, p.cache_dir, ch, p.audio.denoise)
-                    vf = media.polished_audio(src, p.cache_dir, ch, p.audio.denoise, build=False)
-                    if vf is not None:           # the cached polished sound: the (slow, single-threaded) chain stays out of the graph
-                        kv = add_input(["-ss", f"{pl.src_in:.3f}", "-t", f"{pl.src_out - pl.src_in + 0.1:.3f}", "-i", str(vf)])
-                        a_src, lift = f"{kv}:a", 1.0 / media.VOICE_HEADROOM
-                    else:
-                        if ch in media.CHANNEL_PAN:      # one channel to both ears (a mic on one side only) / mono mix
-                            achain.append(media.CHANNEL_PAN[ch])
-                        achain.append(chain)
+            if want_v:
+                filters.append(f"[{cur}]settb=AVTB[v{i}]")
+            if want_a:
+                # audio (the clip's own; an inset's sound, if it has any turned on, is mixed in after)
+                a_main = f"a{i}m" if pip_audio else f"a{i}"
+                if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
+                    a_src, achain = sound_chain(p, src, pl.src_in, pl.src_out, s.speed, s.volume, s.channel, s.polish, s.mic,
+                                                add_input, f"{k}:a")
+                    achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
+                    filters.append(f"[{a_src}]{','.join(achain)}[{a_main}]")
                 else:
-                    if ch in media.CHANNEL_PAN:
-                        achain.append(media.CHANNEL_PAN[ch])
-                    lufs = media.measure_loudness(src, p.cache_dir, ch) if p.audio.match_levels else None
-                if s.speed != 1.0:
-                    achain.append(_atempo(s.speed))
-                achain.append(AUDIO_FMT)
-                gain = media.level_gain_db(lufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
-                if s.volume != 1.0 or abs(gain) > 0.1 or lift != 1.0:
-                    achain.append(f"volume={s.volume * lift:.4g}*{10 ** (gain / 20):.4f}")
-                if polished:
-                    achain.append(media.VOICE_LIMITER)
-                achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
-                filters.append(f"[{a_src}]{','.join(achain)}[{a_main}]")
-            else:
-                filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[{a_main}]")
-            if pip_audio:
-                kp, pin, rate, vol, pend_ = pip_audio
-                pch = ["asetpts=PTS-STARTPTS"]
-                if pin < 0:
-                    pch.append(f"adelay={int(-pin * 1000)}:all=1")
-                pch_ = media.effective_channel(ppath, p.cache_dir, "auto")
-                if pch_ in media.CHANNEL_PAN:
-                    pch.append(media.CHANNEL_PAN[pch_])
-                if rate != 1.0:
-                    pch.append(_atempo(rate))
-                # level-matched like a clip (ambient sound under the picture sits at `vol` of the target level)
-                plufs = media.measure_loudness(ppath, p.cache_dir, pch_) if p.audio.match_levels else None
-                pgain = media.level_gain_db(plufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
-                pch += [AUDIO_FMT, f"volume={vol:.3f}*{10 ** (pgain / 20):.4f}"]
-                if pend_ is not None:          # its sound fades with its picture
-                    pch.append(f"afade=t=out:st={max(0.0, pend_ - PIP_FADE):.3f}:d={min(PIP_FADE, pend_):.3f}")
-                pch.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
-                filters.append(f"[{kp}:a]{','.join(pch)}[ap{i}]")
-                filters.append(f"[{a_main}][ap{i}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a{i}]")
+                    filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[{a_main}]")
+                if pip_audio:
+                    kp, pin, rate, vol, pend_ = pip_audio
+                    pch = ["asetpts=PTS-STARTPTS"]
+                    if pin < 0:
+                        pch.append(f"adelay={int(-pin * 1000)}:all=1")
+                    pch_ = media.effective_channel(ppath, p.cache_dir, "auto")
+                    if pch_ in media.CHANNEL_PAN:
+                        pch.append(media.CHANNEL_PAN[pch_])
+                    if rate != 1.0:
+                        pch.append(_atempo(rate))
+                    # level-matched like a clip (ambient sound under the picture sits at `vol` of the target level)
+                    plufs = media.measure_loudness(ppath, p.cache_dir, pch_) if p.audio.match_levels else None
+                    pgain = media.level_gain_db(plufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
+                    pch += [AUDIO_FMT, f"volume={vol:.3f}*{10 ** (pgain / 20):.4f}"]
+                    if pend_ is not None:          # its sound fades with its picture
+                        pch.append(f"afade=t=out:st={max(0.0, pend_ - PIP_FADE):.3f}:d={min(PIP_FADE, pend_):.3f}")
+                    pch.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
+                    filters.append(f"[{kp}:a]{','.join(pch)}[ap{i}]")
+                    filters.append(f"[{a_main}][ap{i}]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[a{i}]")
         v_labels.append(f"v{i}")
         a_labels.append(f"a{i}")
 
@@ -501,8 +579,9 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
     def join_group(gi: int, idxs: list[int]) -> tuple[str, str]:
         if len(idxs) == 1:
             return v_labels[idxs[0]], a_labels[idxs[0]]
-        ins = "".join(f"[{v_labels[i]}][{a_labels[i]}]" for i in idxs)
-        filters.append(f"{ins}concat=n={len(idxs)}:v=1:a=1[gv{gi}][ga{gi}]")
+        ins = "".join((f"[{v_labels[i]}]" if want_v else "") + (f"[{a_labels[i]}]" if want_a else "") for i in idxs)
+        outs = (f"[gv{gi}]" if want_v else "") + (f"[ga{gi}]" if want_a else "")
+        filters.append(f"{ins}concat=n={len(idxs)}:v={int(want_v)}:a={int(want_a)}{outs}")
         return f"gv{gi}", f"ga{gi}"
 
     V, A = join_group(0, groups[0])
@@ -512,11 +591,34 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         pl = layout.placed[idxs[0]]
         d = pl.transition_duration
         kind = "fadeblack" if pl.transition == "dip" else "fade"
-        filters.append(f"[{V}][{gv}]xfade=transition={kind}:duration={d:.3f}:offset={acc - d:.3f}[V{gi}]")
-        filters.append(f"[{A}][{ga}]acrossfade=d={d:.3f}:c1=tri:c2=tri[A{gi}]")
+        if want_v:
+            filters.append(f"[{V}][{gv}]xfade=transition={kind}:duration={d:.3f}:offset={acc - d:.3f}[V{gi}]")
+        if want_a:
+            filters.append(f"[{A}][{ga}]acrossfade=d={d:.3f}:c1=tri:c2=tri[A{gi}]")
         acc += sum(layout.placed[i].duration for i in idxs) - d
         V, A = f"V{gi}", f"A{gi}"
     total = layout.total
+
+    def timed_overlay(tag: str, n: int, png: Path, at_abs: float, hold: float, fd: float) -> None:
+        """A PNG over the picture from output time `at_abs` for `hold` seconds, fading in and out over
+        `fd` — clipped to this window (no fade at an edge the overlay runs across)."""
+        nonlocal V
+        a0 = at_abs - t0
+        b0 = a0 + hold
+        a, b = max(0.0, a0), min(total, b0)
+        d = b - a
+        if d < 0.05:
+            return
+        k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", str(png)])
+        fd = min(fd, hold / 3)
+        fades = []
+        if fd > 0 and a0 >= -1e-3:
+            fades.append(f"fade=t=in:st=0:d={fd:.3f}:alpha=1")
+        if fd > 0 and b0 <= total + 1e-3:
+            fades.append(f"fade=t=out:st={d - fd:.3f}:d={fd:.3f}:alpha=1")
+        filters.append(f"[{k}:v]format=rgba{''.join(',' + x for x in fades)},setpts=PTS-STARTPTS+{a:.3f}/TB[{tag}{n}]")
+        filters.append(f"[{V}][{tag}{n}]overlay=0:0:eof_action=pass:enable='between(t,{a:.3f},{b:.3f})'[V{tag}{n}]")
+        V = f"V{tag}{n}"
 
     # pictures over the video (the images track), stacked in list order, each fading in and out
     for n, im in enumerate(p.images):
@@ -524,150 +626,152 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         if not src.exists():
             warnings.append(f"image not found: {im.file}")
             continue
-        a = max(0.0, im.at)
-        d = min(im.duration, total - a)
-        if d < 0.05:
-            continue
-        png = titles.render_layer(p.cache_dir, W, H, src, im.box, im.fit)
-        k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", str(png)])
-        fd = min(im.fade, d / 3)
-        fades = f",fade=t=in:st=0:d={fd:.3f}:alpha=1,fade=t=out:st={d - fd:.3f}:d={fd:.3f}:alpha=1" if fd > 0 else ""
-        filters.append(f"[{k}:v]format=rgba{fades},setpts=PTS-STARTPTS+{a:.3f}/TB[im{n}]")
-        filters.append(f"[{V}][im{n}]overlay=0:0:eof_action=pass:enable='between(t,{a:.3f},{a + d:.3f})'[VI{n}]")
-        V = f"VI{n}"
+        if want_v and im.at < full.total:
+            timed_overlay("im", n, titles.render_layer(p.cache_dir, W, H, src, im.box, im.fit),
+                          max(0.0, im.at), min(im.duration, full.total - max(0.0, im.at)), im.fade)
 
     # music credits: small attribution text in a corner when a song first comes in
-    for n, (text, at, hold, pos) in enumerate(credit_spans(p, layout)):
-        d = min(hold, total - at)
-        if d < 0.3:
+    for n, (text, at, hold, pos) in enumerate(credit_spans(p, full) if want_v else []):
+        if min(hold, full.total - at) < 0.3:
             continue
-        png = titles.render_credit(p.cache_dir, W, H, text, font=st.font, position=pos)
-        k = add_input(["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", str(png)])
-        fd = min(0.4, d / 3)
-        filters.append(f"[{k}:v]format=rgba,fade=t=in:st=0:d={fd:.3f}:alpha=1,fade=t=out:st={d - fd:.3f}:d={fd:.3f}:alpha=1,"
-                       f"setpts=PTS-STARTPTS+{at:.3f}/TB[cr{n}]")
-        filters.append(f"[{V}][cr{n}]overlay=0:0:eof_action=pass:enable='between(t,{at:.3f},{at + d:.3f})'[VC{n}]")
-        V = f"VC{n}"
+        timed_overlay("cr", n, titles.render_credit(p.cache_dir, W, H, text, font=st.font, position=pos),
+                      at, min(hold, full.total - at), 0.4)
 
-    # global video fades
+    # global video fades (the first / last window of a parallel render carry them)
     vf = []
-    if st.fade_in > 0:
-        vf.append(f"fade=t=in:st=0:d={min(st.fade_in, total / 2):.3f}")
-    if st.fade_out > 0:
-        fo = min(st.fade_out, total / 2)
+    if st.fade_in > 0 and first:
+        vf.append(f"fade=t=in:st=0:d={min(st.fade_in, full.total / 2):.3f}")
+    if st.fade_out > 0 and last:
+        fo = min(st.fade_out, full.total / 2)
         vf.append(f"fade=t=out:st={total - fo:.3f}:d={fo:.3f}")
     vf.append("setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709")
-    filters.append(f"[{V}]{','.join(vf)}[vout]")
+    if want_v:
+        filters.append(f"[{V}]{','.join(vf)}[vout]")
 
-    # voiceovers (narration layers), mixed over the segment audio with optional ducking
-    vos = [v for v in p.voiceovers if p.resolve(v.file).exists() and v.at < total]
-    for v in p.voiceovers:
-        if not p.resolve(v.file).exists():
-            warnings.append(f"voiceover file not found: {v.file}")
-    if vos:
-        labels = []
-        for n, v in enumerate(vos):
-            kv = add_input(["-i", str(p.resolve(v.file))])
-            vf = p.resolve(v.file)
-            if polish_on(p, v.polish):
-                chain, lufs = media.voice_filters(vf, p.cache_dir, "stereo", p.audio.denoise)
-                chain += ","
+    if want_a:
+        # voiceovers (narration layers), mixed over the segment audio with optional ducking
+        vos = [v for v in p.voiceovers if p.resolve(v.file).exists() and v.at < total]
+        for v in p.voiceovers:
+            if not p.resolve(v.file).exists():
+                warnings.append(f"voiceover file not found: {v.file}")
+        if vos:
+            labels = []
+            for n, v in enumerate(vos):
+                vf = p.resolve(v.file)
+                try:
+                    vinfo = probe(vf, p.cache_dir)
+                except Exception:
+                    warnings.append(f"audio layer {v.id}: cannot read {v.file}")
+                    continue
+                if not vinfo.has_audio or v.volume <= 0:
+                    continue
+                if v.kind == "clip":        # a clip's sound unlinked from its picture: that part of the file, at its speed
+                    a0 = max(0.0, min(v.src_in, vinfo.duration))
+                    b0 = vinfo.duration if v.src_out is None else max(a0, min(v.src_out, vinfo.duration))
+                    if b0 - a0 < 0.05 or v.speed > MUTE_ABOVE:
+                        continue
+                    kv = add_input(["-vn"] + (["-ss", f"{a0:.3f}"] if a0 > 0 else []) + ["-t", f"{b0 - a0:.3f}", "-i", str(vf)])
+                    a_src, chain = sound_chain(p, vf, a0, b0, v.speed, v.volume, v.channel, v.polish, v.mic, add_input, f"{kv}:a")
+                else:
+                    kv = add_input(["-vn", "-i", str(vf)])
+                    a_src, chain = sound_chain(p, vf, 0.0, vinfo.duration, 1.0, v.volume, "stereo", v.polish, "", add_input, f"{kv}:a")
+                chain += [f"adelay={int(v.at * 1000)}:all=1", f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
+                filters.append(f"[{a_src}]{','.join(chain)}[vo{n}]")
+                labels.append(f"vo{n}")
+            if not labels:
+                pass
+            elif len(labels) == 1:
+                filters.append(f"[{labels[0]}]anull[vobus]")
             else:
-                chain, lufs = "", media.measure_loudness(vf, p.cache_dir)
-            gain = media.level_gain_db(lufs, p.audio.target_lufs) if p.audio.match_levels else 0.0
-            filters.append(f"[{kv}:a]{chain}{AUDIO_FMT},volume={v.volume}*{10 ** (gain / 20):.4f},"
-                           + (media.VOICE_LIMITER + "," if chain else "") +
-                           f"adelay={int(v.at * 1000)}:all=1,atrim=duration={total:.3f},apad=whole_dur={total:.3f}[vo{n}]")
-            labels.append(f"vo{n}")
-        if len(labels) == 1:
-            filters.append(f"[{labels[0]}]anull[vobus]")
-        else:
-            filters.append("".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[vobus]")
-        if any(v.duck_clips for v in vos):
-            filters.append("[vobus]asplit[vomix][vokey]")
-            filters.append(f"[{A}][vokey]sidechaincompress=threshold=0.03:ratio=6:attack=80:release=700:makeup=1[Aducked]")
-            filters.append("[Aducked][vomix]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
-        else:
-            filters.append(f"[{A}][vobus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
-        A = "Avo"
-
-    # stings: short music cues anchored to segments, mixed at full level (music ducks under them)
-    stings = []
-    for m in p.stings:
-        span = sting_span(layout, m)
-        if span is None:
-            warnings.append(f"sting {m.id}: its segments are gone")
-        elif not p.resolve(m.file).exists():
-            warnings.append(f"sting file not found: {m.file}")
-        elif span[1] - span[0] > 0.1:
-            stings.append((m, span))
-    if stings:
-        labels = []
-        for n, (m, (t0, t1)) in enumerate(stings):
-            length = t1 - t0
-            seek = ["-ss", f"{m.start:.3f}"] if m.start > 0 else []
-            loop = ["-stream_loop", "-1"] if m.loop else []
-            km = add_input(loop + seek + ["-t", f"{length:.3f}", "-i", str(p.resolve(m.file))])
-            fi, fo = min(m.fade_in, length / 2), min(m.fade_out, length / 2)
-            chain = [AUDIO_FMT, "asetpts=PTS-STARTPTS", f"atrim=duration={length:.3f}", f"apad=whole_dur={length:.3f}",
-                     f"volume={m.volume}"]
-            if fi > 0:
-                chain.append(f"afade=t=in:st=0:d={fi:.3f}")
-            if fo > 0:
-                chain.append(f"afade=t=out:st={length - fo:.3f}:d={fo:.3f}")
-            chain += [f"adelay={int(t0 * 1000)}:all=1", f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
-            filters.append(f"[{km}:a]{','.join(chain)}[st{n}]")
-            labels.append(f"st{n}")
-        if len(labels) == 1:
-            filters.append(f"[{labels[0]}]anull[stbus]")
-        else:
-            filters.append("".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[stbus]")
-        if any(m.duck for m, _ in stings):
-            # duck the cue bus under speech in the clips (same sidechain as the background music)
-            filters.append(f"[{A}]asplit[Akeep][Askey]")
-            filters.append("[stbus][Askey]sidechaincompress=threshold=0.04:ratio=5:attack=150:release=900:makeup=1[stducked]")
-            filters.append("[Akeep][stducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Ast]")
-        else:
-            filters.append(f"[{A}][stbus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Ast]")
-        A = "Ast"
-
-    # music
-    if p.music.file:
-        mpath = p.resolve(p.music.file)
-        if mpath.exists():
-            seek = ["-ss", f"{p.music.start:.3f}"] if p.music.start else []
-            km = add_input(["-stream_loop", "-1"] + seek + ["-i", str(mpath)])
-            mfo = min(p.music.fade_out, total / 2)
-            filters.append(
-                f"[{km}:a]{AUDIO_FMT},atrim=duration={total:.3f},asetpts=PTS-STARTPTS,volume={p.music.volume},"
-                f"afade=t=out:st={total - mfo:.3f}:d={mfo:.3f}[music]")
-            if p.music.duck:
-                filters.append(f"[{A}]asplit[Aspeech][Akey]")
-                filters.append("[music][Akey]sidechaincompress=threshold=0.04:ratio=5:attack=150:release=900:makeup=1[ducked]")
-                filters.append("[Aspeech][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Amix]")
+                filters.append("".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[vobus]")
+            if not labels:
+                pass
+            elif any(v.duck_clips for v in vos):
+                filters.append("[vobus]asplit[vomix][vokey]")
+                filters.append(f"[{A}][vokey]sidechaincompress=threshold=0.03:ratio=6:attack=80:release=700:makeup=1[Aducked]")
+                filters.append("[Aducked][vomix]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
             else:
-                filters.append(f"[{A}][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Amix]")
-            A = "Amix"
-        else:
-            warnings.append(f"music file not found: {p.music.file}")
+                filters.append(f"[{A}][vobus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Avo]")
+            if labels:
+                A = "Avo"
 
-    af = []
-    if st.fade_in > 0:
-        af.append(f"afade=t=in:st=0:d={min(st.fade_in, total / 2):.3f}")
-    if st.fade_out > 0:
-        fo = min(st.fade_out, total / 2)
-        af.append(f"afade=t=out:st={total - fo:.3f}:d={fo:.3f}")
-    if p.audio.normalize and mode == "final":
-        if p.audio.match_levels:
-            # every clip and voiceover is already gained to target_lufs, so the master is a plain gain to
-            # MASTER_LUFS and a true-peak limiter: single-pass loudnorm is an AGC that pumps the room noise
-            # back up between phrases (6 dB measured), undoing the voice polish
-            af.append(f"volume={MASTER_LUFS - p.audio.target_lufs:.2f}dB,alimiter=limit=0.841:attack=5:release=100:level=0,aresample=48000")
-        else:
-            af.append(f"loudnorm=I={MASTER_LUFS:g}:TP=-1.5:LRA=11,aresample=48000")
-    if p.audio.master_volume != 1.0:
-        af.append(f"volume={p.audio.master_volume}")
-    filters.append(f"[{A}]{','.join(af) if af else 'anull'}[aout]")
+        # stings: short music cues anchored to segments, mixed at full level (music ducks under them)
+        stings = []
+        for m in p.stings:
+            span = sting_span(full, m)
+            if span is None:
+                warnings.append(f"sting {m.id}: its segments are gone")
+            elif not p.resolve(m.file).exists():
+                warnings.append(f"sting file not found: {m.file}")
+            elif span[1] - span[0] > 0.1:
+                stings.append((m, span))
+        if stings:
+            labels = []
+            for n, (m, (ta, tb)) in enumerate(stings):
+                length = tb - ta
+                seek = ["-ss", f"{m.start:.3f}"] if m.start > 0 else []
+                loop = ["-stream_loop", "-1"] if m.loop else []
+                km = add_input(loop + seek + ["-t", f"{length:.3f}", "-i", str(p.resolve(m.file))])
+                fi, fo = min(m.fade_in, length / 2), min(m.fade_out, length / 2)
+                chain = [AUDIO_FMT, "asetpts=PTS-STARTPTS", f"atrim=duration={length:.3f}", f"apad=whole_dur={length:.3f}",
+                         f"volume={m.volume}"]
+                if fi > 0:
+                    chain.append(f"afade=t=in:st=0:d={fi:.3f}")
+                if fo > 0:
+                    chain.append(f"afade=t=out:st={length - fo:.3f}:d={fo:.3f}")
+                chain += [f"adelay={int(ta * 1000)}:all=1", f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
+                filters.append(f"[{km}:a]{','.join(chain)}[st{n}]")
+                labels.append(f"st{n}")
+            if len(labels) == 1:
+                filters.append(f"[{labels[0]}]anull[stbus]")
+            else:
+                filters.append("".join(f"[{l}]" for l in labels) + f"amix=inputs={len(labels)}:duration=longest:normalize=0[stbus]")
+            if any(m.duck for m, _ in stings):
+                # duck the cue bus under speech in the clips (same sidechain as the background music)
+                filters.append(f"[{A}]asplit[Akeep][Askey]")
+                filters.append("[stbus][Askey]sidechaincompress=threshold=0.04:ratio=5:attack=150:release=900:makeup=1[stducked]")
+                filters.append("[Akeep][stducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Ast]")
+            else:
+                filters.append(f"[{A}][stbus]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Ast]")
+            A = "Ast"
+
+        # music
+        if p.music.file:
+            mpath = p.resolve(p.music.file)
+            if mpath.exists():
+                seek = ["-ss", f"{p.music.start:.3f}"] if p.music.start else []
+                km = add_input(["-stream_loop", "-1"] + seek + ["-i", str(mpath)])
+                mfo = min(p.music.fade_out, total / 2)
+                filters.append(
+                    f"[{km}:a]{AUDIO_FMT},atrim=duration={total:.3f},asetpts=PTS-STARTPTS,volume={p.music.volume},"
+                    f"afade=t=out:st={total - mfo:.3f}:d={mfo:.3f}[music]")
+                if p.music.duck:
+                    filters.append(f"[{A}]asplit[Aspeech][Akey]")
+                    filters.append("[music][Akey]sidechaincompress=threshold=0.04:ratio=5:attack=150:release=900:makeup=1[ducked]")
+                    filters.append("[Aspeech][ducked]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Amix]")
+                else:
+                    filters.append(f"[{A}][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[Amix]")
+                A = "Amix"
+            else:
+                warnings.append(f"music file not found: {p.music.file}")
+
+        af = []
+        if st.fade_in > 0:
+            af.append(f"afade=t=in:st=0:d={min(st.fade_in, total / 2):.3f}")
+        if st.fade_out > 0:
+            fo = min(st.fade_out, total / 2)
+            af.append(f"afade=t=out:st={total - fo:.3f}:d={fo:.3f}")
+        if p.audio.normalize and mode == "final":
+            if p.audio.match_levels:
+                # every clip and voiceover is already gained to target_lufs, so the master is a plain gain to
+                # MASTER_LUFS and a true-peak limiter: single-pass loudnorm is an AGC that pumps the room noise
+                # back up between phrases (6 dB measured), undoing the voice polish
+                af.append(f"volume={MASTER_LUFS - p.audio.target_lufs:.2f}dB,alimiter=limit=0.841:attack=5:release=100:level=0,aresample=48000")
+            else:
+                af.append(f"loudnorm=I={MASTER_LUFS:g}:TP=-1.5:LRA=11,aresample=48000")
+        if p.audio.master_volume != 1.0:
+            af.append(f"volume={p.audio.master_volume}")
+        filters.append(f"[{A}]{','.join(af) if af else 'anull'}[aout]")
 
     # encoder
     p.ensure_dirs()
@@ -686,15 +790,23 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             venc = ["-c:v", "h264_videotoolbox", "-b:v", str(br), "-profile:v", "high", "-tag:v", "avc1"]
         aenc = ["-c:a", "aac", "-b:a", "192k"]
 
+    if output is not None:
+        out = output
     cmd = ["ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
-    if any_hdr and hdr_mode == "vt":
+    if any_hdr and hdr_mode == "vt" and want_v:
         cmd += ["-init_hw_device", "videotoolbox=vt", "-filter_hw_device", "vt"]
     cmd += inputs
-    cmd += ["-filter_complex", ";\n".join(filters), "-map", "[vout]", "-map", "[aout]"]
-    cmd += venc + aenc
-    cmd += ["-r", str(FPS), "-pix_fmt", "yuv420p", "-color_primaries:v", "bt709", "-color_trc:v", "bt709",
-            "-colorspace:v", "bt709", "-movflags", "+faststart", "-t", f"{total:.3f}",
-            "-metadata", f"title={p.title}", str(out)]
+    cmd += ["-filter_complex", ";\n".join(filters)]
+    if want_v:
+        cmd += ["-map", "[vout]"] + venc + ["-r", str(FPS), "-pix_fmt", "yuv420p", "-color_primaries:v", "bt709",
+                                            "-color_trc:v", "bt709", "-colorspace:v", "bt709"]
+    if want_a:
+        cmd += ["-map", "[aout]"] + aenc
+    if part == "both":
+        cmd += ["-movflags", "+faststart", "-metadata", f"title={p.title}"]
+    if part == "video":          # a shard: its frames, exactly (the stitched picture is then on the grid everywhere)
+        total = (int(round(t1 * FPS)) - int(round(t0 * FPS))) / FPS
+    cmd += ["-t", f"{total:.3f}", str(out)]
     return Plan(cmd=cmd, output=out, layout=layout, hdr_mode=hdr_mode, warnings=warnings)
 
 
@@ -736,27 +848,240 @@ def run_plan(plan: Plan, progress: Callable[[float, float], None] | None = None,
     return plan.output
 
 
-def render(p: Project, mode: str = "final", progress=None, cancel=None, hdr_mode: str = "vt", status=None) -> Plan:
-    """Build + run, retrying with software HDR conversion if VideoToolbox path fails. `status(text)` gets
-    what is going on before the ffmpeg run (polishing voices ahead of it, in parallel, cached)."""
-    infos = probe_project(p)
-    if p.audio.polish:
-        media.polish_many(voice_jobs(p, infos), cancel=cancel, status=status)
-    if status:
-        status("")
-    plan = build_plan(p, mode=mode, hdr_mode=hdr_mode, infos=infos)
+def _run_with_hdr_fallback(p: Project, plan: Plan, infos, progress, cancel, build) -> Plan:
+    """Run a plan; if the VideoToolbox HDR path fails, rebuild it with the software conversion (`build(hdr_mode)`)."""
     try:
         run_plan(plan, progress, cancel)
     except RenderError as e:
         if "cancelled" in str(e):
             raise
-        if hdr_mode == "vt" and any(i.hdr for i in infos.values()):
-            plan = build_plan(p, mode=mode, hdr_mode="sw", infos=infos)
+        if plan.hdr_mode == "vt" and any(i.hdr for i in infos.values()):
+            plan = build("sw")
             plan.warnings.append("VideoToolbox HDR conversion failed; used software path")
             run_plan(plan, progress, cancel)
         else:
             raise
     return plan
+
+
+# --------------------------------------------------------------------------- parallel render
+#
+# One ffmpeg runs its whole filter graph on one thread, so a 15-minute export used to crawl along at about
+# realtime whatever the machine. Instead the output is cut into windows ("shards") along the timeline at
+# points nothing runs across (no transition, title card, caption or picture fade, inset dissolve or global
+# fade there), every shard is rendered as its own video-only ffmpeg (so N shards use N cores, and the
+# hardware encoder and the GPU tone-map are shared), the whole soundtrack is mixed by one audio-only
+# ffmpeg alongside (sound is cheap and its compressors/limiters must see the whole mix), and the pieces
+# are stitched with the concat demuxer without re-encoding. Shard edges sit on the frame grid, so the
+# stitched picture is frame for frame the single-pass result.
+
+MIN_SHARD = 4.0          # seconds: a shorter shard spends more on seeking and start-up than it saves
+SHARDS_PER_WORKER = 3    # shards outnumber workers so a slow (HDR, inset) shard doesn't leave cores idle at the end
+EDGE_GUARD = 0.6         # seconds kept clear on each side of anything a shard edge must not cut through
+
+
+def render_workers(setting: int | None = None) -> int:
+    """How many ffmpegs run at once: the setting, or every core (0 / None)."""
+    if setting and setting > 0:
+        return int(setting)
+    return max(1, os.cpu_count() or 4)
+
+
+def no_split_zones(p: Project, layout: Layout) -> list[tuple[float, float]]:
+    """Output-time stretches a shard edge must stay out of: anything whose look depends on frames on both
+    sides of the edge (a transition, a title card and its text fades, a caption's or picture's fade, an inset
+    dissolving out, the opening / closing fade)."""
+    g = EDGE_GUARD
+    zones: list[tuple[float, float]] = []
+    st = p.style
+    if st.fade_in > 0:
+        zones.append((0.0, st.fade_in + g))
+    if st.fade_out > 0:
+        zones.append((layout.total - st.fade_out - g, layout.total))
+    for pl in layout.placed:
+        s = pl.seg
+        if s.kind == "title":
+            zones.append((pl.start - g, pl.end + g))
+            continue
+        if pl.transition != "cut":
+            zones.append((pl.start - g, pl.start + pl.transition_duration + g))
+        ovs = list(s.overlays) + ([Overlay(text=s.caption, at=0.0, duration=None)] if s.caption else [])
+        for ov in ovs:
+            a = pl.start + ov.at
+            b = pl.end if ov.duration is None else min(pl.end, a + ov.duration)
+            zones += [(a - g, a + 0.3 + g), (b - 0.3 - g, b + g)]
+        if s.pip and not s.pip.hidden:
+            ppath = p.resolve(s.pip.src)
+            try:
+                pinfo = probe(ppath, p.cache_dir) if ppath.exists() else None
+            except Exception:
+                pinfo = None
+            rate = (s.speed or 1.0) * (s.pip.speed or 1.0)
+            if pinfo is not None and pinfo.duration and rate > 0:
+                pend = pl.start + (pinfo.duration - s.pip.time(pl.src_in)) / rate
+                if pend < pl.end - 0.05:          # the inset dissolves out there
+                    zones.append((pend - PIP_FADE - g, pend + g))
+    for im in p.images:
+        a, b = im.at, im.at + im.duration
+        zones += [(a - g, a + im.fade + g), (b - im.fade - g, b + g)]
+    for _, at, hold, _ in credit_spans(p, layout):
+        zones += [(at - g, at + 0.4 + g), (at + hold - 0.4 - g, at + hold + g)]
+    zones.sort()
+    merged: list[tuple[float, float]] = []
+    for a, b in zones:
+        if merged and a <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+        else:
+            merged.append((a, b))
+    return merged
+
+
+def shard_bounds(p: Project, layout: Layout, n: int) -> list[float]:
+    """Output times that cut the timeline into about `n` shards of similar length, each edge on the frame
+    grid and outside every no-split zone. Always starts with 0 and ends with the total."""
+    total, fps = layout.total, layout.fps
+    n = max(1, min(int(n), int(total / MIN_SHARD)))
+    if n <= 1:
+        return [0.0, total]
+    zones = no_split_zones(p, layout)
+
+    def allowed(t: float) -> bool:
+        return all(not (a < t < b) for a, b in zones)
+
+    step = max(1, int(round(fps / 2)))           # candidate edges every half second, on whole frames
+    cands = [k / fps for k in range(step, int(total * fps), step)]
+    cands = [t for t in cands if MIN_SHARD <= t <= total - MIN_SHARD and allowed(t)]
+    bounds = [0.0]
+    target = total / n
+    want = target
+    j = 0
+    while want < total - MIN_SHARD / 2 and j < len(cands):
+        # the allowed edge nearest to where this shard should end, but never a tiny shard
+        best = None
+        for t in cands[j:]:
+            if t <= bounds[-1] + MIN_SHARD:
+                continue
+            if best is None or abs(t - want) < abs(best - want):
+                best = t
+            if t > want:
+                break
+        if best is None:
+            break
+        bounds.append(best)
+        j = cands.index(best) + 1
+        want = best + target
+    bounds.append(total)
+    return bounds
+
+
+class _Stop:
+    """A cancel flag for the shards: the job's own flag, or one shard having failed."""
+    def __init__(self, outer):
+        self.outer, self.local = outer, threading.Event()
+
+    def is_set(self) -> bool:
+        return self.local.is_set() or (self.outer is not None and self.outer.is_set())
+
+
+def render_parallel(p: Project, mode: str, infos: dict, hdr_mode: str, progress, cancel, workers: int,
+                    status=None) -> Plan | None:
+    """Render the project as video shards + one audio pass on `workers` ffmpegs at once, then stitch.
+    Returns None when the timeline is too short to be worth sharding (the caller renders in one go)."""
+    import shutil
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    full = compute_layout(p, infos, scale=0.5 if mode == "preview" else 1.0)
+    bounds = shard_bounds(p, full, workers * SHARDS_PER_WORKER)
+    if len(bounds) < 3:
+        return None
+    work = p.cache_dir / "render" / mode
+    if work.exists():
+        shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    windows = list(zip(bounds[:-1], bounds[1:]))
+    if status:
+        status(f"rendering {len(windows)} parts on {workers} cores…")
+
+    done: dict[str, float] = {}
+    lock = threading.Lock()
+    stop = _Stop(cancel)
+    warnings: list[str] = []
+    plans: dict[str, Plan] = {}
+
+    def report(key: str, length: float):
+        def cb(frac: float, secs: float):
+            with lock:
+                done[key] = min(secs, length)
+                tot = sum(done.values())
+            if progress:
+                progress(min(1.0, tot / max(full.total, 0.001)), tot)
+        return cb
+
+    def shard(i: int, a: float, b: float) -> None:
+        out = work / f"v{i:03d}.mp4"
+        build = lambda hm: build_plan(p, mode=mode, hdr_mode=hm, infos=infos, window=(a, b), part="video", output=out)
+        plan = _run_with_hdr_fallback(p, build(hdr_mode), infos, report(f"v{i}", b - a), stop, build)
+        with lock:
+            plans[f"v{i}"] = plan
+            warnings.extend(w for w in plan.warnings if w not in warnings)
+
+    def audio() -> None:
+        out = work / "audio.m4a"
+        plan = build_plan(p, mode=mode, hdr_mode="none", infos=infos, part="audio", output=out)
+        run_plan(plan, None, stop)
+        with lock:
+            plans["audio"] = plan
+            warnings.extend(w for w in plan.warnings if w not in warnings)
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(audio)] + [ex.submit(shard, i, a, b) for i, (a, b) in enumerate(windows)]
+        try:
+            for f in as_completed(futs):
+                f.result()
+        except BaseException:
+            stop.local.set()
+            for f in futs:
+                f.cancel()
+            raise
+    if cancel is not None and cancel.is_set():
+        raise RenderError("cancelled")
+
+    # stitch: the shards' video copied back to back, the one soundtrack beside it
+    if status:
+        status("joining the parts…")
+    listing = work / "shards.txt"
+    listing.write_text("".join(f"file '{(work / f'v{i:03d}.mp4').name}'\n" for i in range(len(windows))))
+    p.ensure_dirs()
+    out = p.out_dir / ("preview.mp4" if mode == "preview" else p.output_filename())
+    cmd = ["ffmpeg", "-hide_banner", "-y", "-loglevel", "error", "-nostats", "-f", "concat", "-safe", "0", "-i", str(listing),
+           "-i", str(work / "audio.m4a"), "-map", "0:v", "-map", "1:a", "-c", "copy", "-movflags", "+faststart",
+           "-metadata", f"title={p.title}", "-t", f"{full.total:.3f}", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RenderError(r.stderr.strip()[-2000:] or f"ffmpeg exited {r.returncode}")
+    shutil.rmtree(work, ignore_errors=True)
+    if progress:
+        progress(1.0, full.total)
+    return Plan(cmd=cmd, output=out, layout=full, hdr_mode=hdr_mode, warnings=warnings)
+
+
+def render(p: Project, mode: str = "final", progress=None, cancel=None, hdr_mode: str = "vt", status=None,
+           workers: int | None = None) -> Plan:
+    """Build + run. `status(text)` gets what is going on around the ffmpeg runs (polishing voices ahead of
+    it, how many parts are rendering, joining). `workers` ffmpegs run at once (default: every core); 1
+    renders the whole thing in one pass, retrying with software HDR conversion if the VideoToolbox path fails."""
+    infos = probe_project(p)
+    if p.audio.polish:
+        media.polish_many(voice_jobs(p, infos), cancel=cancel, status=status)
+    if status:
+        status("")
+    n = render_workers(workers)
+    if n > 1:
+        plan = render_parallel(p, mode, infos, hdr_mode, progress, cancel, n, status=status)
+        if plan is not None:
+            return plan
+    build = lambda hm: build_plan(p, mode=mode, hdr_mode=hm, infos=infos)
+    return _run_with_hdr_fallback(p, build(hdr_mode), infos, progress, cancel, build)
 
 
 def cmd_string(plan: Plan) -> str:

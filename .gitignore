@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 dist/KrisVideos.app/Contents/Resources/*.iconset
 .DS_Store
+.claude/worktrees/

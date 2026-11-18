@@ -75,27 +75,55 @@ class Overlay:
 
 @dataclass
 class Voiceover:
-    """An audio layer (narration) laid over the output timeline."""
-    file: str                       # project-relative (audio/VO_....m4a)
+    """An audio layer laid over the output timeline: narration (`kind: voice`, the whole file), or a clip's
+    own sound unlinked from its picture (`kind: clip`: the file is the clip, `in`/`out`/`speed`/`channel`
+    say which part and how, `from` is the clip segment it came from, so it can be linked back)."""
+    file: str                       # project-relative (audio/VO_....m4a, or clips/... for unlinked sound)
     at: float = 0.0                 # output-timeline seconds
     volume: float = 1.0
     duck_clips: bool = True         # lower clip audio while this plays
     polish: str = "auto"            # voice polish (media.voice_chain): auto = audio.polish | on | off
+    kind: str = "voice"             # voice | clip
+    src_in: float = 0.0             # clip kind: the part of the file (source seconds) and its speed
+    src_out: float | None = None
+    speed: float = 1.0
+    channel: str = "auto"
+    mic: str = ""
+    from_seg: str = ""              # clip kind: the segment whose sound this is
     id: str = ""
     note: str = ""
 
     @classmethod
     def from_dict(cls, d: dict, idx: int) -> "Voiceover":
+        kind = "clip" if str(d.get("kind") or "voice") == "clip" else "voice"
+        ch = str(d.get("channel") or "auto")
         return cls(file=str(d["file"]), at=parse_time(d.get("at", 0)), volume=float(d.get("volume", 1.0)),
-                   duck_clips=bool(d.get("duck_clips", True)), polish=polish_value(d.get("polish")),
+                   duck_clips=bool(d.get("duck_clips", kind == "voice")), polish=polish_value(d.get("polish")),
+                   kind=kind, src_in=parse_time(d.get("in", 0)), src_out=parse_time(d["out"]) if d.get("out") is not None else None,
+                   speed=max(0.05, float(d.get("speed", 1.0) or 1.0)), channel=ch if ch in CHANNELS else "auto",
+                   mic=str(d.get("mic") or ""), from_seg=str(d.get("from") or ""),
                    id=str(d.get("id") or f"v{idx+1}"), note=str(d.get("note") or ""))
 
     def to_dict(self) -> dict:
         d: dict[str, Any] = {"file": self.file, "at": round(self.at, 3)}
+        if self.kind == "clip":
+            d["kind"] = "clip"
+            if self.src_in:
+                d["in"] = round(self.src_in, 3)
+            if self.src_out is not None:
+                d["out"] = round(self.src_out, 3)
+            if self.speed != 1.0:
+                d["speed"] = self.speed
+            if self.channel != "auto":
+                d["channel"] = self.channel
+            if self.mic:
+                d["mic"] = self.mic
+            if self.from_seg:
+                d["from"] = self.from_seg
         if self.volume != 1.0:
             d["volume"] = self.volume
-        if not self.duck_clips:
-            d["duck_clips"] = False
+        if self.duck_clips != (self.kind == "voice"):
+            d["duck_clips"] = self.duck_clips
         if self.polish != "auto":
             d["polish"] = self.polish
         if self.note:
@@ -286,6 +314,7 @@ class Segment:
                                     # channel copied to both ears, for a mic plugged into one side; auto = detect)
     polish: str = "auto"            # voice polish (media.voice_chain): auto = the project's audio.polish | on | off
     mic: str = ""                   # the microphone a take was recorded with (its browser label); auto polish skips good ones
+    group: str = ""                 # segments sharing a tag are selected (and moved, deleted...) together in the GUI
     caption: str | None = None      # convenience: a lower-third shown for the whole clip
     fit: str = "contain"            # contain (letterbox) | cover (crop to fill the canvas)
     overlays: list[Overlay] = field(default_factory=list)
@@ -340,6 +369,7 @@ class Segment:
         else:
             raise ValueError(f"timeline entry #{idx} must have `clip:`, `title:` or `image:`: {d}")
         seg.id = str(d.get("id") or f"s{idx+1}")
+        seg.group = str(d.get("group") or "")
         seg.transition = d.get("transition")
         if d.get("transition_duration") is not None:
             seg.transition_duration = float(d["transition_duration"])
@@ -396,6 +426,8 @@ class Segment:
                 d["fg"] = self.fg
             if self.layout != "center":
                 d["layout"] = self.layout
+        if self.group:
+            d["group"] = self.group
         if self.transition:
             d["transition"] = self.transition
         if self.transition_duration is not None:
@@ -623,6 +655,13 @@ class Project:
             if v.id == vid:
                 return v
         raise KeyError(vid)
+
+    def next_group(self) -> str:
+        tags = {s.group for s in self.timeline if s.group}
+        n = 1
+        while f"g{n}" in tags:
+            n += 1
+        return f"g{n}"
 
     def index_of(self, seg_id: str) -> int:
         for i, s in enumerate(self.timeline):

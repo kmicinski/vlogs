@@ -8,7 +8,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 from . import render
-from .project import Pip, Project, Segment, Sting
+from .project import Pip, Project, Segment, Sting, Voiceover
 
 MIN_PIECE = 0.1     # leftovers shorter than this (seconds) are dropped instead of kept as slivers
 MIN_TITLE = 0.3     # a title card shortened below this is removed
@@ -490,3 +490,75 @@ def keep_range(p: Project, a: float, b: float) -> tuple[float, float]:
         return 0.0, a
     _remap_voiceovers(p, spans)
     return sum(y - x for x, y in spans), a - head
+
+
+# --------------------------------------------------------------------------- groups and unlinked sound
+
+def group(p: Project, ids: list[str]) -> str:
+    """Tag the segments so the GUI selects (moves, deletes, mutes...) them together. Joining a selection
+    that already holds a grouped segment widens that group. Returns the tag."""
+    segs = [s for s in p.timeline if s.id in set(ids)]
+    if len(segs) < 2:
+        raise ValueError("a group needs at least two segments")
+    tag = next((s.group for s in segs if s.group), "") or p.next_group()
+    for s in segs:
+        s.group = tag
+    return tag
+
+
+def ungroup(p: Project, ids: list[str]) -> None:
+    """Take the segments out of their groups (whole groups go when a member is named)."""
+    tags = {s.group for s in p.timeline if s.id in set(ids) and s.group}
+    for s in p.timeline:
+        if s.id in set(ids) or s.group in tags:
+            s.group = ""
+
+
+def detach_audio(p: Project, seg_id: str, layout: render.Layout | None = None) -> Voiceover:
+    """Unlink a clip's sound from its picture: it becomes an audio layer (`kind: clip`) at the same place
+    on the timeline, with the clip's trim, speed, channel, polish and mic, and the clip itself goes
+    silent. The layer can then be moved, trimmed or deleted on its own, and linked back."""
+    layout = layout or render.compute_layout(p)
+    pl = next((x for x in layout.placed if x.seg.id == seg_id), None)
+    if pl is None or pl.seg.kind != "clip":
+        raise ValueError(f"{seg_id} is not a clip")
+    s = pl.seg
+    if any(v.from_seg == s.id for v in p.voiceovers):
+        raise ValueError(f"the sound of {seg_id} is already unlinked")
+    ids = {v.id for v in p.voiceovers}
+    n = len(p.voiceovers) + 1
+    while f"v{n}" in ids:
+        n += 1
+    v = Voiceover(file=s.src, at=round(pl.start, 3), volume=s.volume, duck_clips=False, polish=s.polish, kind="clip",
+                  src_in=round(pl.src_in, 3), src_out=round(pl.src_out, 3), speed=s.speed, channel=s.channel, mic=s.mic,
+                  from_seg=s.id, id=f"v{n}")
+    p.voiceovers.append(v)
+    p.voiceovers.sort(key=lambda x: x.at)
+    s.mute = True
+    return v
+
+
+def relink_audio(p: Project, vid: str) -> Segment | None:
+    """Link an unlinked clip sound back to its picture: the clip plays its own sound again (with the
+    layer's volume and polish) and the layer goes. Returns the clip, or None when it is gone (then the
+    layer simply stays as it is)."""
+    v = p.voiceover(vid)
+    if v.kind != "clip":
+        raise ValueError(f"{vid} is narration, not a clip's sound")
+    s = next((x for x in p.timeline if x.id == v.from_seg), None)
+    if s is None:
+        return None
+    s.mute = False
+    s.volume = v.volume
+    s.polish = v.polish
+    p.voiceovers = [x for x in p.voiceovers if x.id != vid]
+    return s
+
+
+def remove_many(p: Project, ids: list[str]) -> int:
+    """Delete segments (sN) and audio layers (vN) in one go. Returns how many went."""
+    want = set(ids)
+    n0 = len(p.timeline) + len(p.voiceovers)
+    p.timeline = [s for s in p.timeline if s.id not in want]
+    p.voiceovers = [v for v in p.voiceovers if v.id not in want]
+    return n0 - len(p.timeline) - len(p.voiceovers)

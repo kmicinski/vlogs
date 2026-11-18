@@ -677,7 +677,7 @@ def cmd_render(cfg, a, mode):
         print(render.cmd_string(plan))
         return
     print(f"{mode}: {plan.layout.width}x{plan.layout.height}, {fmt_time(plan.layout.total)} -> {plan.output}")
-    plan = render.render(p, mode=mode, progress=_progress)
+    plan = render.render(p, mode=mode, progress=_progress, workers=a.workers if a.workers is not None else cfg.render_workers)
     print()
     for w in plan.warnings:
         print("warning:", w)
@@ -731,7 +731,7 @@ def main(argv=None):
     s = sub.add_parser("redo"); s.add_argument("project", nargs="?"); s.set_defaults(fn=lambda c, a: cmd_undo(c, a, True))
     s = sub.add_parser("show"); s.add_argument("project", nargs="?"); s.set_defaults(fn=cmd_show)
     for name, mode in (("preview", "preview"), ("render", "final")):
-        s = sub.add_parser(name); s.add_argument("project", nargs="?"); s.add_argument("--open", action="store_true"); s.add_argument("--dry-run", action="store_true")
+        s = sub.add_parser(name); s.add_argument("project", nargs="?"); s.add_argument("--open", action="store_true"); s.add_argument("--dry-run", action="store_true"); s.add_argument("--workers", type=int, default=None, help="ffmpegs at once (default: one per core; 1 = single pass)")
         s.set_defaults(fn=lambda cfg, a, m=mode: cmd_render(cfg, a, m))
     s = sub.add_parser("serve"); s.add_argument("--port", type=int); s.add_argument("--open", action="store_true"); s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("config"); s.add_argument("pairs", nargs="*"); s.set_defaults(fn=cmd_config)

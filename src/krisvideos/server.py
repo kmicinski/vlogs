@@ -72,6 +72,7 @@ def _run_job(job: Job, fn):
 class SettingsIn(BaseModel):
     vlogs_dir: str | None = None
     good_mics: list[str] | None = None
+    render_workers: int | None = None
     immich_url: str | None = None
     immich_api_key: str | None = None
     default_orientation: str | None = None
@@ -1512,7 +1513,7 @@ def create_app(cfg: Config) -> FastAPI:
                 job.progress, job.secs = frac, secs
             def status(text):
                 job.message = text
-            plan = render.render(p, mode=mode, progress=prog, cancel=job.cancel, status=status)
+            plan = render.render(p, mode=mode, progress=prog, cancel=job.cancel, status=status, workers=cfg.render_workers)
             job.warnings = plan.warnings
             job.output = str(plan.output)
 
