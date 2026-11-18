@@ -1626,6 +1626,13 @@ def create_app(cfg: Config) -> FastAPI:
         near = any(float(((x.corners.reshape(-1, 2).mean(axis=0) - cen) ** 2).sum()) ** 0.5 < 0.03 * b.width for x in c["boards"])
         if not near and len(c["boards"]) < 40:
             c["boards"].append(b)
+            if len(c["boards"]) >= 3:
+                # the running estimate: refined from the last one (a full search the first time), so the sheet
+                # can show the straightened picture while the board is still being moved around
+                prev = c["fit"]
+                est = calib.fit(c["boards"], start=(prev["k1"], prev["k2"]) if prev else None).to_dict()
+                est["provisional"] = not all(est["coverage"])
+                c["fit"] = est
         return _cal_status(c, found=True, accepted=not near, corners=b.corners.reshape(-1, 2).round(1).tolist(), width=b.width, height=b.height)
 
     @app.post("/api/calibration/{cid}/solve")
@@ -1633,7 +1640,7 @@ def create_app(cfg: Config) -> FastAPI:
         c = _cal(cid)
         if len(c["boards"]) < 3:
             raise HTTPException(400, "show the board in at least three places first")
-        c["fit"] = calib.fit(c["boards"]).to_dict()
+        c["fit"] = calib.fit(c["boards"]).to_dict() | {"provisional": False}
         return _cal_status(c)
 
     @app.get("/api/calibration/{cid}/preview.jpg")

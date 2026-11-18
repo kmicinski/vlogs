@@ -163,10 +163,11 @@ class Fit:
                 "improvement": round(1 - self.rms_after / self.rms_before, 3) if self.rms_before > 1e-9 else 0.0}
 
 
-def fit(boards: list[Board], k2_free: bool = True) -> Fit:
+def fit(boards: list[Board], k2_free: bool = True, start: tuple[float, float] | None = None) -> Fit:
     """The k1/k2 that make every board's rows and columns straightest after undistortion. A coarse grid over
-    k1 ∈ [-0.6, 0.3] (and k2 ∈ [-0.3, 0.3]) finds the basin, then two finer grids close in (the cost is smooth
-    and this stays well under a second for a dozen boards)."""
+    k1 ∈ [-0.6, 0.3] (and k2 ∈ [-0.3, 0.3]) finds the basin, then finer grids close in (the cost is smooth
+    and this stays well under a second for a dozen boards). With `start` (a previous estimate) the coarse
+    grid is skipped and the search just refines around it: the live estimate after each new view."""
     if not boards:
         raise ValueError("no boards")
     w, h = boards[0].width, boards[0].height
@@ -181,15 +182,19 @@ def fit(boards: list[Board], k2_free: bool = True) -> Fit:
         u = undistort_points(pts, w, h, k1, k2)
         return straightness([u[idx[i]:idx[i + 1]] for i in range(len(lines))])
 
-    best = (cost(0.0, 0.0), 0.0, 0.0)
-    k1s = np.linspace(-0.6, 0.3, 46)
-    k2s = np.linspace(-0.3, 0.3, 13) if k2_free else np.array([0.0])
-    for k1 in k1s:
-        for k2 in k2s:
-            c = cost(k1, k2)
-            if c < best[0]:
-                best = (c, float(k1), float(k2))
-    span1, span2 = 0.04, 0.1
+    if start is not None:
+        best = (cost(start[0], start[1]), float(start[0]), float(start[1]))
+        span1, span2 = 0.08, 0.15
+    else:
+        best = (cost(0.0, 0.0), 0.0, 0.0)
+        k1s = np.linspace(-0.6, 0.3, 46)
+        k2s = np.linspace(-0.3, 0.3, 13) if k2_free else np.array([0.0])
+        for k1 in k1s:
+            for k2 in k2s:
+                c = cost(k1, k2)
+                if c < best[0]:
+                    best = (c, float(k1), float(k2))
+        span1, span2 = 0.04, 0.1
     for _ in range(3):
         _, b1, b2 = best
         for k1 in np.linspace(b1 - span1, b1 + span1, 17):

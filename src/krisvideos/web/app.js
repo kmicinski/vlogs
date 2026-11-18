@@ -230,7 +230,7 @@ const VP = (() => {
   function lensTwin(video) {
     let st = twins.get(video); if (st) return st;
     const cv = document.createElement('canvas'); cv.className = 'lensgl hidden'; video.insertAdjacentElement('afterend', cv);
-    const gl = cv.getContext('webgl', { premultipliedAlpha: false, alpha: true, antialias: false });
+    const gl = cv.getContext('webgl', { premultipliedAlpha: false, alpha: true, antialias: false, preserveDrawingBuffer: true });
     if (!gl) { st = { cv, gl: null, k: null }; twins.set(video, st); return st; }
     const sh = (type, src) => { const h = gl.createShader(type); gl.shaderSource(h, src); gl.compileShader(h); if (!gl.getShaderParameter(h, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(h)); return h; };
     const prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, LENS_VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, LENS_FS)); gl.linkProgram(prog); gl.useProgram(prog);
@@ -251,9 +251,16 @@ const VP = (() => {
     cv.classList.toggle('hidden', hidden);
     if (hidden) return;
     const cs = getComputedStyle(video);
-    cv.style.left = video.style.left; cv.style.top = video.style.top; cv.style.width = video.style.width; cv.style.height = video.style.height;
-    cv.style.right = video.style.right; cv.style.bottom = video.style.bottom; cv.style.transform = video.style.transform.replace(/\s*scaleX\(-1\)/, '');
+    if (cs.position === 'absolute') {
+      cv.style.left = video.style.left; cv.style.top = video.style.top; cv.style.width = video.style.width; cv.style.height = video.style.height;
+      cv.style.right = video.style.right; cv.style.bottom = video.style.bottom; cv.style.transform = video.style.transform.replace(/\s*scaleX\(-1\)/, '');
+    } else {   // a video in normal flow (the recorder's preview): the twin covers its box inside the same parent
+      const par = video.parentElement; if (par && getComputedStyle(par).position === 'static') par.style.position = 'relative';
+      cv.style.position = 'absolute'; cv.style.left = `${video.offsetLeft}px`; cv.style.top = `${video.offsetTop}px`; cv.style.width = `${video.offsetWidth}px`; cv.style.height = `${video.offsetHeight}px`;
+      cv.style.right = cv.style.bottom = 'auto'; cv.style.transform = ''; cv.style.borderRadius = cs.borderRadius;
+    }
     cv.style.opacity = cs.opacity; cv.style.zIndex = cs.zIndex === 'auto' ? '' : cs.zIndex;
+    const mt = cs.transform, mirrored = mt && mt !== 'none' && parseFloat(mt.slice(mt.indexOf('(') + 1)) < 0;
     if (video.readyState < 2 || !video.videoWidth) return;
     const moving = !video.paused && !video.ended;
     if (!moving && !st.dirty && video.currentTime === st.lastT) return;
@@ -265,13 +272,16 @@ const VP = (() => {
     const vw = video.videoWidth, vh = video.videoHeight, sc = (st.fit === 'cover' ? Math.max : Math.min)(r.width / vw, r.height / vh);
     const cw = vw * sc, ch = vh * sc;
     gl.uniform2f(st.u.box, r.width, r.height); gl.uniform4f(st.u.content, (r.width - cw) / 2, (r.height - ch) / 2, cw, ch); gl.uniform2f(st.u.vsize, vw, vh);
-    gl.uniform1f(st.u.k1, st.k.k1 || 0); gl.uniform1f(st.u.k2, st.k.k2 || 0); gl.uniform1f(st.u.mirror, /scaleX\(-1\)/.test(video.style.transform) ? 1 : 0);
+    gl.uniform1f(st.u.k1, st.k.k1 || 0); gl.uniform1f(st.u.k2, st.k.k2 || 0); gl.uniform1f(st.u.mirror, mirrored ? 1 : 0);
     try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video); } catch { return; }
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
   function lensLoop() {
     lensRaf = 0; let any = false;
-    for (const [video, st] of twins) { if (!st.gl) continue; if (st.k) any = true; lensDraw(video, st); }
+    for (const [video, st] of twins) {
+      if (!video.isConnected) { st.cv.remove(); twins.delete(video); continue; }   // a sheet's video that went away with it
+      if (!st.gl) continue; if (st.k) any = true; lensDraw(video, st);
+    }
     if (any) lensRaf = requestAnimationFrame(lensLoop);
   }
   // show `video` corrected with k ({k1, k2}) or plainly (null); `fit` is its object-fit
@@ -961,6 +971,19 @@ async function moveSelection(d) {
   await guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/reorder`, { ids: rest })); const ns = seg(); if (ns && ns.placed) seek(ns.placed.start, true); });
 }
 
+// the recorder's preview shows a calibrated camera straightened (the config `lenses` entry its label falls under)
+async function recPreviewLens() {
+  const v = $('#recPreview'); if (!v) return;
+  const cam = selectedCamLabel(); let k = null;
+  if (cam) {
+    try {
+      const cfg = await api('GET', '/api/settings');
+      const hit = (cfg.lenses || []).find(l => { const m = String(l.match || ''); if (!m) return false; if (cam.toLowerCase().includes(m.toLowerCase())) return true; try { return new RegExp(m, 'i').test(cam); } catch { return false; } });
+      if (hit) k = { k1: hit.k1, k2: hit.k2 };
+    } catch { }
+  }
+  if ($('#recPreview') === v) VP.lensApply(v, k, 'contain');
+}
 // ================================================================== lens calibration
 // The printed checkerboard (/calibration) is held in front of the camera; every frame goes to the server, each
 // distinct view of the board adds its rows and columns as lines that should be straight, and once the 3×3 grid is
@@ -1038,9 +1061,11 @@ async function calTick() {
     $('#calStatus').textContent = `${st.boards} view${st.boards === 1 ? '' : 's'} of the board · ${done ? 'the whole frame is covered' : st.hint}`;
     $('#calSolve').disabled = !st.ready;
     $('#calSolve').textContent = CAL.fit ? 'Measure again' : 'Measure now';
-    // enough views spread over the frame: measure (and refine as more views come in)
+    // the running estimate (refined after every new view) goes onto the live picture straight away
+    if (st.fit && st.accepted) calShowFit(st.fit);
+    // enough views spread over the frame: the full measurement (and again as more views come in)
     const want = done ? 6 : 14;
-    if (st.boards >= want && st.accepted && (!CAL.fit || st.boards >= CAL.fit.boards + 3)) await calSolve();
+    if (st.boards >= want && st.accepted && (!CAL.fit || CAL.fit.provisional || st.boards >= CAL.fit.boards + 3)) await calSolve();
   } catch (e) { console.error(e); $('#calBadge').textContent = e.message; }
   finally { CAL.busy = false; }
 }
@@ -1048,11 +1073,15 @@ async function calSolve() {
   if (!CAL.id) return;
   const r = await api('POST', `/api/calibration/${CAL.id}/solve`).catch(e => { toast(e.message, true); return null; });
   if (!r || !r.fit || CAL.dead) return;
-  CAL.fit = r.fit; const f = r.fit;
+  calShowFit(r.fit);
+}
+// a fit (the running estimate, or the full measurement): numbers in the panel, the live picture straightened
+function calShowFit(f) {
+  CAL.fit = f;
   const box = $('#calResult'); box.classList.remove('hidden');
-  const weak = f.improvement < 0.5 || f.rms_before < 0.25;
-  box.innerHTML = `<div class="calib-k"><b>k1 ${f.k1 >= 0 ? '+' : ''}${f.k1.toFixed(3)}</b> · <b>k2 ${f.k2 >= 0 ? '+' : ''}${f.k2.toFixed(3)}</b></div>
-    <div class="muted">Lines were ${f.rms_before.toFixed(2)} px off straight, now ${f.rms_after.toFixed(2)} px (${Math.round(f.improvement * 100)}% straighter, ${f.boards} views).${weak ? ' That is a small change — this lens is nearly straight already, or the board was not near the edges.' : ''}${f.coverage.every(Boolean) ? '' : ' Cover the rest of the grid for a better fit.'}</div>`;
+  const weak = f.improvement < 0.5 || f.rms_before < 0.25, covered = f.coverage.every(Boolean);
+  box.innerHTML = `<div class="calib-k"><b>k1 ${f.k1 >= 0 ? '+' : ''}${f.k1.toFixed(3)}</b> · <b>k2 ${f.k2 >= 0 ? '+' : ''}${f.k2.toFixed(3)}</b>${f.provisional ? ' <span class="muted">estimate so far — keep moving the board</span>' : ''}</div>
+    <div class="muted">Lines were ${f.rms_before.toFixed(2)} px off straight, now ${f.rms_after.toFixed(2)} px (${Math.round(f.improvement * 100)}% straighter, ${f.boards} view${f.boards === 1 ? '' : 's'}). The picture shows the result.${weak && covered ? ' That is a small change — this lens is nearly straight already, or the board was not near the edges.' : ''}${covered ? '' : ' Cover the rest of the grid for a better fit.'}</div>`;
   $('#calSave').disabled = false; $('#calLiveWrap').style.display = ''; $('#calSolve').textContent = 'Measure again';
   calShowLive();
 }
@@ -2476,6 +2505,7 @@ async function startPreview() {
   if (!$('#recPreview')) { stopStream(); return; }
   updateMicWarn();
   $('#recPreview').srcObject = REC.stream;
+  recPreviewLens();
   if (recIsScreen()) applyRecLayout();
   const vt = REC.stream.getVideoTracks()[0];
   $('#recStatus').textContent = vt ? `${vt.getSettings().width}×${vt.getSettings().height}` : recIsScreen() ? '' : 'audio only';
