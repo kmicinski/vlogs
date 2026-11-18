@@ -12,6 +12,7 @@
     vlog keep PROJECT 0:12 0:15              trim the clip(s) there so only that stretch remains
     vlog caption PROJECT SEG "Text"          lower-third over a segment (SEG = id like s3, or index)
     vlog trim PROJECT SEG --in 0:03 --out 0:14
+    vlog calibrate "Anker PowerConf" photo1.jpg photo2.jpg ...   find the lens correction for a camera from photos of the printed checkerboard (vlog calibrate --pattern board.png prints it)
     vlog set PROJECT SEG key=value ...       e.g. mute=true speed=1.5 transition=fade lens=-0.12,0.02|off (speed: any number, 60 = a minute per second)
     vlog rm PROJECT SEG                      remove a segment
     vlog group PROJECT s3 s4 s5              select/move/delete these together in the GUI (vlog ungroup PROJECT s3)
@@ -746,6 +747,35 @@ def cmd_serve(cfg, a):
     serve(cfg, port=a.port or cfg.port, open_browser=a.open)
 
 
+def cmd_calibrate(cfg, a):
+    """Lens correction for a camera from photos/frames of the printed checkerboard (see calib.py)."""
+    from . import calib
+    if a.pattern:
+        Path(a.pattern).write_bytes(calib.pattern_png(paper=a.paper))
+        print(f"wrote {a.pattern}: print it landscape at 100 % and tape it to something flat")
+        if not a.images:
+            return
+    if not a.cam or not a.images:
+        sys.exit("usage: vlog calibrate CAMERA_LABEL image.jpg ...   (frames or photos of the checkerboard, held in different parts of the picture)")
+    boards = []
+    for im in a.images:
+        b = calib.find_board(Path(im).read_bytes())
+        print(f"  {im}: {'board found' if b else 'no complete board'}" + (f", {sum(b.coverage())}/9 areas" if b else ""))
+        if b:
+            boards.append(b)
+    if len(boards) < 3:
+        sys.exit("need the board in at least three images")
+    f = calib.fit(boards)
+    d = f.to_dict()
+    print(f"k1={d['k1']:+.4f} k2={d['k2']:+.4f}: lines were {d['rms_before']:.2f} px off straight, now {d['rms_after']:.2f} px ({d['improvement']*100:.0f}% straighter, {d['boards']} boards)")
+    if not all(d["coverage"]):
+        print("  note: " + calib.coverage_hint(d["coverage"]) + " — the edges decide the fit")
+    if a.dry_run:
+        return
+    e = calib.save_lens(cfg, a.cam, f.k1, f.k2)
+    print(f"saved for cameras matching {e['match']!r} (vlog config shows it; the export and the player apply it to their takes)")
+
+
 def cmd_config(cfg, a):
     if a.pairs:
         for kv in a.pairs:
@@ -799,6 +829,8 @@ def main(argv=None):
         s.set_defaults(fn=lambda cfg, a, m=mode: cmd_render(cfg, a, m))
     s = sub.add_parser("serve"); s.add_argument("--port", type=int); s.add_argument("--open", action="store_true"); s.set_defaults(fn=cmd_serve)
     s = sub.add_parser("config"); s.add_argument("pairs", nargs="*"); s.set_defaults(fn=cmd_config)
+    s = sub.add_parser("calibrate", help="lens correction for a camera from photos of the checkerboard"); s.add_argument("cam", nargs="?", help="camera label (as the recorder shows it)"); s.add_argument("images", nargs="*")
+    s.add_argument("--pattern", help="write the printable checkerboard PNG here"); s.add_argument("--paper", default="letter", choices=["letter", "a4"]); s.add_argument("--dry-run", action="store_true"); s.set_defaults(fn=cmd_calibrate)
 
     a = ap.parse_args(argv)
     cfg = Config.load()

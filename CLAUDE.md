@@ -175,7 +175,7 @@ Jobs: `POST render` while an export runs returns the running job (the GUI joins 
 export); `openProject` re-attaches to a running job after a reload (`GET /api/jobs`).
 The final master (`render.MASTER_LUFS` -16) is a static gain + true-peak limiter when `match_levels` is on
 (single-pass `loudnorm` is an AGC that pumped room noise up between phrases); `loudnorm` only when it is off.
-Lens correction (the wide-angle webcam's barrel distortion, fixed in the export only): a take remembers its camera
+Lens correction (the wide-angle webcam's barrel distortion): a take remembers its camera
 like its mic (`segment.cam`: the browser's device label, sent by the recorder as `record/start {cam}`, kept in the
 manifest; on a screen take it goes on whichever picture came from the camera, `Pip.cam` for the inset, and
 `edits.swap_pip` moves it along). Config `lenses: [{match, k1, k2}]` (`match` = substring or regex on the camera label,
@@ -190,9 +190,61 @@ and before the scale (after the HDR tone-map for HDR sources: the filter is 8-bi
 `vlog show` prints `cam='…'  lens=-0.120,+0.020 (camera|this clip)`. GUI inspector *Lens*: k1/k2 sliders
 (-0.5…0.5, step 0.005), mode *For this camera* (rewrites the matching `lenses` entry, or adds one named after the
 label) / *This clip only* / *No correction*, and a corrected still from `GET /api/projects/{name}/frame?src&t&k1&k2&w`
-(one ffmpeg JPEG, cached in `cache/<name>.frame.<t>.<k1>.<k2>.<w>.jpg`, debounced 250 ms); the live player can't
-apply the filter and shows the clip uncorrected. When Kris says "the webcam makes the walls bend / fix the fisheye"
-→ set the camera's entry (k1 ≈ -0.1 … -0.2 for a 110° webcam, k2 small); "leave this clip as shot" → `lens=off`.
+(one ffmpeg JPEG, cached in `cache/<name>.frame.<t>.<k1>.<k2>.<w>.jpg`, debounced 250 ms). The live player applies it
+too: `VP.lensApply(video, k, fit)` lays a WebGL canvas twin (`canvas.lensgl`, shader = the lenscorrection formula,
+r² = 4(dx²+dy²)/(w²+h²)) over the `<video>` (which keeps playing with `visibility: hidden`; the twin copies its
+opacity/geometry each frame, so fades and boxes still work); `present` uses `segment.lens_effective`, `syncPip` the
+inset's `pip.lens_effective` (pip JSON), the inspector sliders preview through `VP.lensOverride(segId, k)`.
+Automatic calibration (`calib.py`): `GET /calibration` is a printable 10×7 checkerboard (24 mm squares,
+`calib.pattern_png`); the GUI sheet `openCalibration(camLabel)` (inspector "Measure it automatically…", settings
+"Straighten a camera lens…") opens the camera, POSTs a JPEG every 650 ms to `POST /api/calibration/{id}/frame`
+(`/start {cam}` first); `calib.find_board` (OpenCV `findChessboardCornersSB`) returns the inner corners, each
+distinct view (centroid moved ≥3 % of the width) is kept, `coverage` is a 3×3 grid; `/solve` runs `calib.fit`
+(plumb-line: `undistort_points` inverts ffmpeg's dst→src model by Newton, `straightness` = RMS distance of each
+board row/column from its best-fit line, coarse grid over k1 ∈ [-0.6, 0.3] × k2 ∈ [-0.3, 0.3] then three refinements)
+→ `{k1, k2, rms_before, rms_after, improvement, boards, coverage}`; the sheet auto-solves once the grid is covered
+(≥6 views, or 14 anywhere), shows the live picture corrected through the same WebGL twin, and `/save` writes the
+entry via `calib.save_lens` (updates the `lenses` entry the label already falls under, else adds `{match: label}`).
+`/preview.jpg?k1&k2` remaps the last frame with `cv2.remap` (same model). CLI `vlog calibrate CAM img...`
+(`--pattern out.png`, `--dry-run`). Synthetic check: a board distorted with `lenscorrection=k1=0.22:k2=0.05` fits to
+k1 ≈ -0.206, lines 0.56 → 0.035 px; ffmpeg with the fit → 0.02 px. When Kris says "the webcam makes the walls bend /
+fix the fisheye" → calibrate (or set the camera's entry, k1 ≈ -0.1 … -0.2 for a 110° webcam, k2 small); "leave this
+clip as shot" → `lens=off`.
+
+Selection, groups, unlinked sound (GUI `SELS` set + primary `sel`/`selVo`; `select(id, {toggle, range})`,
+`selectVo`, `selectAll`, `paintSelection`): click = the clip and its group, ⌘-click toggles, ⇧-click = the range of
+timeline indices from the last clicked (`selAnchor`); `renderMultiInspector` for >1 selected (Group ⌘G / Ungroup ⇧⌘G
+→ `POST segments/group|ungroup {ids}`, Mute, Unlink/Link ⌘L, Delete ⌫ → `POST segments/remove {ids}` (segments and
+vN layers, one undo step, `edits.remove_many`), speed/voice/transition for all → `POST segments/patch {ids, patch}`
+(`apply_patch` = the PATCH body applied per segment), Move ←/→ = `moveSelection`); drag-and-drop moves the whole
+selection; `Segment.group` is a tag (`edits.group` → `p.next_group()`, `ungroup`); `.block.grouped` draws a coloured
+bar (`--gc`). Unlinking: `edits.detach_audio(p, sid)` turns the clip's sound into a `Voiceover` of `kind: clip`
+(`file`=the clip, `in`/`out`/`speed`/`channel`/`mic`/`from` = the segment id, `at` = its timeline start; the clip
+gets `mute: true`), `relink_audio(p, vid)` reverses it; `POST segments/{sid}/unlink` → `new_id`, `POST
+voiceovers/{vid}/link` → `seg_id`; `PATCH voiceovers/{vid}` also takes `in`/`out`/`speed`/`channel` for that kind;
+segment JSON `audio_unlinked` (layer id), `group`; layer JSON `kind, from, from_present, in, out, speed, channel,
+mic, duration, url (proxy/src), lufs, channel_effective, polished, pregain`. GUI: A1 block of an unlinked clip is
+hatched "⛓ on A2"; kind-clip layers draw on an **A2** lane (`.snd`, waveform from `/wave?start&end`, rows packed when
+they overlap, `voDrag` moves them in time → `PATCH {at}`), narration stays on VO; `AUD` plays them from the clip's
+proxy/src at `in + (t-at)·speed`, `playbackRate = speed`, routed like a clip. `render.py` already mixes kind-clip
+layers through `sound_chain` (`-ss in -t len` input). `edits.follow_content` keeps them on their frames through clip
+edits. CLI `vlog group|ungroup PROJ s3 s4`, `vlog unlink PROJ s3`, `vlog link PROJ v2`; `vlog show` prints
+`group=g1` and `SOUND … (unlinked from s3)`. When Kris says "move these three together" → group them; "I want the
+sound of this clip under the next one" → unlink, drag the A2 block (or `PATCH at`).
+
+Parallel export (`render.render(p, mode, workers=)`, config `render_workers` 0 = one per core, `--workers` on
+preview/render, settings `render_workers`): `render_parallel` cuts the timeline into shards at safe points
+(`shard_bounds`: candidates every half second on whole frames outside `no_split_zones` — transitions, title cards,
+caption/picture/credit fades, inset dissolves, global fades, `EDGE_GUARD` 0.6 s; never < `MIN_SHARD` 4 s, about
+`SHARDS_PER_WORKER` 3 per worker), runs one video-only ffmpeg per shard (`build_plan(..., window=(t0, t1),
+part="video")` → `<project>/cache/render/<mode>/vNNN.mp4`) on a thread pool plus one audio-only pass
+(`part="audio"` → `audio.m4a`), then stitches with the concat demuxer `-c copy`. Exactness: every segment is cut to
+`nf = round(end·FPS) − round(start·FPS)` frames (`fps=N,tpad=stop=3:stop_mode=clone,trim=end_frame=nf`, inputs read
++0.25 s spare), so shards match a single pass frame for frame (PSNR ≥ 43 dB vs serial in tests) and never drift from
+the audio; `window_layout` clips the layout to a window (`Placed.skip`/`cut_end`, captions and `timed_overlay` images
+/credits clipped, global fade-in only in the first window / fade-out in the last); inputs get `-an`/`-vn` so a video
+shard never decodes sound; `_hwdec` adds `-hwaccel videotoolbox` for HDR HEVC. A 15-min real vlog: ~8 min single
+pass → 185 s (≈4.9× realtime) on 14 cores. `workers=1` is the old single pass (tests that inspect the graph use it).
 
 ## Development
 - `uv sync`; run with `.venv/bin/vlog ...`; GUI: `.venv/bin/vlog serve --port 8799`.

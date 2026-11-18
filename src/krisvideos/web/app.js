@@ -40,7 +40,8 @@ function sheet(html, { wide = false, xl = false } = {}) {
   $('#sheetBody').onkeydown = e => { if (e.key === 'Enter' && e.target.tagName === 'INPUT' && e.target.type !== 'checkbox' && $('#s_ok')) { e.preventDefault(); $('#s_ok').click(); } };
 }
 const sheetOpen = () => $('#sheetBody').children.length > 0;
-function closeSheet() { $('#sheet').classList.add('hidden'); $('#sheetBody').innerHTML = ''; }
+let sheetOnClose = null;
+function closeSheet() { const f = sheetOnClose; sheetOnClose = null; if (f) { try { f(); } catch { } } $('#sheet').classList.add('hidden'); $('#sheetBody').innerHTML = ''; }
 $('#sheet').onclick = e => { if (e.target.id === 'sheet' && !$('#recBox') && !$('#trimBox')) closeSheet(); };
 function popover(anchor, items) {
   const el = $('#popover');
@@ -207,6 +208,85 @@ const VP = (() => {
   // the render, and the level comes from the loudness measured after the real chain (s.lufs).
   const EQ = [['highpass', 90, 0.7, 0], ['peaking', 250, 1.2, -2.5], ['peaking', 3000, 1.4, 2], ['highshelf', 9000, 0.7, 1.5]];
   let actx = null; const routes = new Map();
+  // ---- live lens correction. A clip whose camera has a `lenses` entry (segment.lens_effective) is drawn
+  // through a WebGL twin of its <video>: a canvas laid over the element that samples each frame with ffmpeg's
+  // lenscorrection model (same k1/k2, r² = 4(dx²+dy²)/(w²+h²) from the centre), so the player shows what the
+  // export will. The <video> keeps playing underneath with visibility: hidden; fades still work because the
+  // canvas copies the element's opacity every frame. `lensOverride` lets the inspector's sliders preview live.
+  const LENS_VS = 'attribute vec2 p; varying vec2 uv; void main(){ uv = p * 0.5 + 0.5; gl_Position = vec4(p, 0.0, 1.0); }';
+  const LENS_FS = `precision highp float; varying vec2 uv; uniform sampler2D tex; uniform vec2 box; uniform vec4 content; uniform vec2 vsize; uniform float k1; uniform float k2; uniform float mirror;
+    void main(){
+      vec2 bp = vec2(mirror > 0.5 ? 1.0 - uv.x : uv.x, 1.0 - uv.y) * box;
+      vec2 vp = (bp - content.xy) / content.zw * vsize;
+      if (vp.x < 0.0 || vp.y < 0.0 || vp.x > vsize.x || vp.y > vsize.y) { gl_FragColor = vec4(0.0); return; }
+      vec2 c = vsize * 0.5; vec2 off = vp - c;
+      float r2 = 4.0 * dot(off, off) / dot(vsize, vsize);
+      float m = 1.0 + k1 * r2 + k2 * r2 * r2;
+      vec2 sp = c + off * m;
+      if (sp.x < 0.0 || sp.y < 0.0 || sp.x > vsize.x || sp.y > vsize.y) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+      gl_FragColor = texture2D(tex, sp / vsize);
+    }`;
+  const twins = new Map(); let lensRaf = 0; const lensOverrides = new Map();
+  function lensTwin(video) {
+    let st = twins.get(video); if (st) return st;
+    const cv = document.createElement('canvas'); cv.className = 'lensgl hidden'; video.insertAdjacentElement('afterend', cv);
+    const gl = cv.getContext('webgl', { premultipliedAlpha: false, alpha: true, antialias: false });
+    if (!gl) { st = { cv, gl: null, k: null }; twins.set(video, st); return st; }
+    const sh = (type, src) => { const h = gl.createShader(type); gl.shaderSource(h, src); gl.compileShader(h); if (!gl.getShaderParameter(h, gl.COMPILE_STATUS)) console.error(gl.getShaderInfoLog(h)); return h; };
+    const prog = gl.createProgram(); gl.attachShader(prog, sh(gl.VERTEX_SHADER, LENS_VS)); gl.attachShader(prog, sh(gl.FRAGMENT_SHADER, LENS_FS)); gl.linkProgram(prog); gl.useProgram(prog);
+    const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const loc = gl.getAttribLocation(prog, 'p'); gl.enableVertexAttribArray(loc); gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+    const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    const u = {}; for (const n of ['box', 'content', 'vsize', 'k1', 'k2', 'mirror']) u[n] = gl.getUniformLocation(prog, n);
+    st = { cv, gl, u, k: null, fit: 'contain', dirty: true, lastT: -1 };
+    for (const ev of ['seeked', 'loadeddata', 'resize']) video.addEventListener(ev, () => { st.dirty = true; });
+    twins.set(video, st);
+    return st;
+  }
+  function lensDraw(video, st) {
+    const { cv, gl } = st;
+    const hidden = video.classList.contains('hidden') || !st.k;
+    cv.classList.toggle('hidden', hidden);
+    if (hidden) return;
+    const cs = getComputedStyle(video);
+    cv.style.left = video.style.left; cv.style.top = video.style.top; cv.style.width = video.style.width; cv.style.height = video.style.height;
+    cv.style.right = video.style.right; cv.style.bottom = video.style.bottom; cv.style.transform = video.style.transform.replace(/\s*scaleX\(-1\)/, '');
+    cv.style.opacity = cs.opacity; cv.style.zIndex = cs.zIndex === 'auto' ? '' : cs.zIndex;
+    if (video.readyState < 2 || !video.videoWidth) return;
+    const moving = !video.paused && !video.ended;
+    if (!moving && !st.dirty && video.currentTime === st.lastT) return;
+    st.dirty = false; st.lastT = video.currentTime;
+    const r = cv.getBoundingClientRect(); if (!r.width || !r.height) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1), W = Math.min(1920, Math.round(r.width * dpr)), H = Math.round(W * r.height / r.width);
+    if (cv.width !== W || cv.height !== H) { cv.width = W; cv.height = H; }
+    gl.viewport(0, 0, W, H);
+    const vw = video.videoWidth, vh = video.videoHeight, sc = (st.fit === 'cover' ? Math.max : Math.min)(r.width / vw, r.height / vh);
+    const cw = vw * sc, ch = vh * sc;
+    gl.uniform2f(st.u.box, r.width, r.height); gl.uniform4f(st.u.content, (r.width - cw) / 2, (r.height - ch) / 2, cw, ch); gl.uniform2f(st.u.vsize, vw, vh);
+    gl.uniform1f(st.u.k1, st.k.k1 || 0); gl.uniform1f(st.u.k2, st.k.k2 || 0); gl.uniform1f(st.u.mirror, /scaleX\(-1\)/.test(video.style.transform) ? 1 : 0);
+    try { gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video); } catch { return; }
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  }
+  function lensLoop() {
+    lensRaf = 0; let any = false;
+    for (const [video, st] of twins) { if (!st.gl) continue; if (st.k) any = true; lensDraw(video, st); }
+    if (any) lensRaf = requestAnimationFrame(lensLoop);
+  }
+  // show `video` corrected with k ({k1, k2}) or plainly (null); `fit` is its object-fit
+  function lensApply(video, k, fit = 'contain') {
+    const on = !!(k && (Math.abs(k.k1 || 0) > 1e-6 || Math.abs(k.k2 || 0) > 1e-6));
+    if (!on && !twins.has(video)) return;
+    const st = lensTwin(video);
+    if (!st.gl) return;
+    st.k = on ? k : null; st.fit = fit; st.dirty = true;
+    video.style.visibility = on ? 'hidden' : '';
+    if (!on) st.cv.classList.add('hidden');
+    else if (!lensRaf) lensRaf = requestAnimationFrame(lensLoop);
+  }
+  const lensFor = s => lensOverrides.has(s.id) ? lensOverrides.get(s.id) : s.lens_effective;
+  function lensOverride(segId, k) { if (k) lensOverrides.set(segId, k); else lensOverrides.delete(segId); for (const st of twins.values()) st.dirty = true; sync(T, true); }
   function route(el, mode, fx) {
     mode = MIX[mode] ? mode : 'stereo';
     const pre = fx ? Math.pow(10, (fx.pregain || 0) / 20) : 1;
@@ -284,6 +364,7 @@ const VP = (() => {
     box.style.borderRadius = pip.shape === 'circle' ? '50%' : pip.shape === 'rect' ? '0' : `${Math.round(Math.min(cr.width, cr.height) * 0.02)}px`;
     boxStyle(box, pip.box, W, H, pipAspect(pip.media), pip.shape);
     v.style.objectFit = pip.fit === 'contain' ? 'contain' : 'cover';
+    lensApply(v, pip.lens_effective, pip.fit === 'contain' ? 'contain' : 'cover');
     box.style.opacity = opacity; box.style.zIndex = z; box.dataset.seg = s.id;
   }
   // music credits: small attribution text in a corner while a song comes in (like render.py's credit overlay)
@@ -384,6 +465,7 @@ const VP = (() => {
     mainBoxStyle(el, s.box);
     el.muted = !!s.mute || !playing || (s.speed || 1) > MUTE_ABOVE;
     el.volume = clamp((s.volume ?? 1) * gainFactor(s) * weight * duck, 0, 1);
+    lensApply(el, lensFor(s), s.fit === 'cover' ? 'cover' : 'contain');
     route(el, s.channel_effective, s.polished ? { pregain: s.pregain } : null);
     drive(el, s.speed || 1, want, s.id);
     return el;
@@ -395,6 +477,7 @@ const VP = (() => {
       cards.forEach(c => c.classList.add('hidden')); captions(null); videos[1].classList.add('hidden');
       syncPip(null);
       const v = videos[0]; setSrc(v, P.preview.url); v.classList.remove('hidden'); v.style.opacity = 1; v.style.objectFit = 'contain'; mainBoxStyle(v, null); v.muted = false; v.volume = 1; v.playbackRate = 1; route(v, 'stereo', null);
+      videos.forEach(x => lensApply(x, null));
       if (hard || Math.abs(v.currentTime - t) > 0.25) { try { v.currentTime = t; } catch { } }
       return;
     }
@@ -431,7 +514,7 @@ const VP = (() => {
   }
   function pauseAll() { videos.forEach(v => v.pause()); $('#vP').pause(); AUD.pause(); }
   const mainVideo = () => videos[0];
-  return { sync, showSource, pauseAll, reset, projectChanged, fitCanvas, route, isRendered: () => rendered, mainVideo, channelRoutes: () => [...routes].map(([el, r]) => el.id + ":" + (r.gains ? r.mode : "unavailable")) };
+  return { sync, showSource, pauseAll, reset, projectChanged, fitCanvas, route, lensApply, lensOverride, isRendered: () => rendered, mainVideo, channelRoutes: () => [...routes].map(([el, r]) => el.id + ":" + (r.gains ? r.mode : "unavailable")) };
 })();
 
 function play() {
@@ -878,6 +961,103 @@ async function moveSelection(d) {
   await guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/reorder`, { ids: rest })); const ns = seg(); if (ns && ns.placed) seek(ns.placed.start, true); });
 }
 
+// ================================================================== lens calibration
+// The printed checkerboard (/calibration) is held in front of the camera; every frame goes to the server, each
+// distinct view of the board adds its rows and columns as lines that should be straight, and once the 3×3 grid is
+// covered the k1/k2 that straighten them is fitted (calib.py) and shown live through the player's lens shader.
+// "Save" keeps it in config `lenses` under the camera's label: every take from it is corrected from then on.
+const CAL = { id: null, stream: null, timer: 0, busy: false, fit: null, cam: '', devices: [], dead: false };
+async function openCalibration(camLabel) {
+  let devices = [];
+  try { devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch { }
+  if (!devices.length || !devices[0].label) {   // labels only come after a permission grant: ask once, then list again
+    try { const tmp = await navigator.mediaDevices.getUserMedia({ video: true }); tmp.getTracks().forEach(t => t.stop()); devices = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput'); } catch (e) { return toast('No camera: ' + e.message, true); }
+  }
+  CAL.devices = devices;
+  const pick = devices.find(d => d.label === camLabel) || devices.find(d => camLabel && d.label.toLowerCase().includes(camLabel.toLowerCase().split(' ')[0])) || devices.find(d => d.deviceId === lsGet('kv.cam', '')) || devices[0];
+  const cells = Array.from({ length: 9 }, (_, i) => `<i data-i="${i}"></i>`).join('');
+  sheet(`<h2>Straighten a camera</h2>
+    <div class="calib">
+      <div class="calib-cam"><video id="calVid" autoplay playsinline muted></video><div class="calib-grid" id="calGrid">${cells}</div><svg id="calPts" viewBox="0 0 100 100" preserveAspectRatio="none"></svg><div id="calBadge" class="calib-badge">starting the camera…</div></div>
+      <div class="calib-side">
+        ${field('Camera', `<select id="calCam">${devices.map(d => `<option value="${esc(d.deviceId)}" ${d === pick ? 'selected' : ''}>${esc(d.label || 'camera')}</option>`).join('')}</select>`)}
+        <ol class="calib-steps">
+          <li><a href="/calibration" target="_blank" rel="noopener">Print the checkerboard</a> (landscape, 100 %) and tape it to something flat — or open that page on a phone or tablet and hold the screen up.</li>
+          <li>Hold it so it fills about a quarter of the picture, tilted a little, and move it around until every square of the grid is green. The edges and corners decide the fit.</li>
+          <li>The correction appears on its own and the picture switches to the straightened view. <b>Save</b> keeps it for this camera.</li>
+        </ol>
+        <div id="calStatus" class="muted calib-status">Looking for the board…</div>
+        <div id="calResult" class="calib-result hidden"></div>
+      </div>
+    </div>
+    <div class="foot"><label class="check" id="calLiveWrap" style="margin:0;display:none"><input type="checkbox" id="calLive" checked><span>Show corrected</span></label><button class="link" id="calSolve" disabled>Measure now</button><span class="spacer"></span><button class="link" data-close>Cancel</button><button class="primary" id="calSave" disabled>Save for this camera</button></div>`, { xl: true });
+  sheetOnClose = calStop;
+  $('#calCam').onchange = () => calStart($('#calCam').value);
+  $('#calSolve').onclick = () => calSolve();
+  $('#calSave').onclick = () => guard(async () => {
+    const r = await api('POST', `/api/calibration/${CAL.id}/save`, { cam: CAL.cam });
+    toast(`Saved: takes from “${CAL.cam}” are straightened (k1 ${r.saved.k1}, k2 ${r.saved.k2})`);
+    closeSheet(); await refresh();
+  });
+  $('#calLive').onchange = () => calShowLive();
+  await calStart(pick ? pick.deviceId : '');
+}
+async function calStart(deviceId) {
+  calStopStream();
+  CAL.fit = null; CAL.dead = false; $('#calResult').classList.add('hidden'); $('#calSave').disabled = true; $('#calLiveWrap').style.display = 'none';
+  $$('#calGrid i').forEach(i => i.className = ''); $('#calPts').innerHTML = '';
+  try {
+    CAL.stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: deviceId ? { exact: deviceId } : undefined, width: { ideal: 1280 }, height: { ideal: 720 } } });
+  } catch (e) { $('#calBadge').textContent = 'cannot open the camera: ' + e.message; return; }
+  const tr = CAL.stream.getVideoTracks()[0];
+  CAL.cam = tr.label || ($('#calCam').selectedOptions[0] || {}).textContent || '';
+  const v = $('#calVid'); v.srcObject = CAL.stream; VP.lensApply(v, null);
+  const r = await api('POST', '/api/calibration/start', { cam: CAL.cam }); CAL.id = r.id;
+  $('#calBadge').textContent = 'show the whole checkerboard to the camera';
+  CAL.timer = setInterval(calTick, 650);
+}
+function calStopStream() { clearInterval(CAL.timer); CAL.timer = 0; if (CAL.stream) { CAL.stream.getTracks().forEach(t => t.stop()); CAL.stream = null; } }
+function calStop() { calStopStream(); const v = $('#calVid'); if (v) VP.lensApply(v, null); CAL.id = null; CAL.dead = true; }
+async function calTick() {
+  const v = $('#calVid'); if (!v || CAL.busy || CAL.dead || !CAL.id || v.readyState < 2 || !v.videoWidth) return;
+  CAL.busy = true;
+  try {
+    const W = Math.min(1280, v.videoWidth), H = Math.round(W * v.videoHeight / v.videoWidth);
+    const c = CAL.canvas || (CAL.canvas = document.createElement('canvas')); c.width = W; c.height = H;
+    c.getContext('2d').drawImage(v, 0, 0, W, H);
+    const blob = await new Promise(res => c.toBlob(res, 'image/jpeg', 0.85));
+    const r = await fetch(`/api/calibration/${CAL.id}/frame`, { method: 'POST', body: blob, headers: { 'Content-Type': 'image/jpeg' } });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    const st = await r.json();
+    if (CAL.dead) return;
+    $$('#calGrid i').forEach((el, i) => el.className = st.coverage[i] ? 'on' : '');
+    $('#calBadge').textContent = st.found ? (st.accepted ? `board ${st.boards} ✓` : 'board found — move it somewhere new') : 'no complete board in view';
+    $('#calBadge').classList.toggle('ok', st.found);
+    const svg = $('#calPts'); svg.innerHTML = st.found ? st.corners.map(([x, y]) => `<circle cx="${(x / st.width * 100).toFixed(2)}" cy="${(y / st.height * 100).toFixed(2)}" r="0.6"/>`).join('') : '';
+    const done = st.coverage.every(Boolean);
+    $('#calStatus').textContent = `${st.boards} view${st.boards === 1 ? '' : 's'} of the board · ${done ? 'the whole frame is covered' : st.hint}`;
+    $('#calSolve').disabled = !st.ready;
+    $('#calSolve').textContent = CAL.fit ? 'Measure again' : 'Measure now';
+    // enough views spread over the frame: measure (and refine as more views come in)
+    const want = done ? 6 : 14;
+    if (st.boards >= want && st.accepted && (!CAL.fit || st.boards >= CAL.fit.boards + 3)) await calSolve();
+  } catch (e) { console.error(e); $('#calBadge').textContent = e.message; }
+  finally { CAL.busy = false; }
+}
+async function calSolve() {
+  if (!CAL.id) return;
+  const r = await api('POST', `/api/calibration/${CAL.id}/solve`).catch(e => { toast(e.message, true); return null; });
+  if (!r || !r.fit || CAL.dead) return;
+  CAL.fit = r.fit; const f = r.fit;
+  const box = $('#calResult'); box.classList.remove('hidden');
+  const weak = f.improvement < 0.5 || f.rms_before < 0.25;
+  box.innerHTML = `<div class="calib-k"><b>k1 ${f.k1 >= 0 ? '+' : ''}${f.k1.toFixed(3)}</b> · <b>k2 ${f.k2 >= 0 ? '+' : ''}${f.k2.toFixed(3)}</b></div>
+    <div class="muted">Lines were ${f.rms_before.toFixed(2)} px off straight, now ${f.rms_after.toFixed(2)} px (${Math.round(f.improvement * 100)}% straighter, ${f.boards} views).${weak ? ' That is a small change — this lens is nearly straight already, or the board was not near the edges.' : ''}${f.coverage.every(Boolean) ? '' : ' Cover the rest of the grid for a better fit.'}</div>`;
+  $('#calSave').disabled = false; $('#calLiveWrap').style.display = ''; $('#calSolve').textContent = 'Measure again';
+  calShowLive();
+}
+function calShowLive() { const v = $('#calVid'); if (!v || !CAL.fit) return; VP.lensApply(v, $('#calLive').checked ? { k1: CAL.fit.k1, k2: CAL.fit.k2 } : null, 'contain'); }
+
 // ================================================================== edits
 async function patchSeg(id, body) { return guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}/segments/${id}`, body)); }); }
 async function patchProject(body) { return guard(async () => { setProject(await api('PATCH', `/api/projects/${P.name}`, body)); }); }
@@ -1011,8 +1191,9 @@ function lensInspectorHtml(s) {
     <select id="lensMode"><option value="camera" ${mode === 'camera' ? 'selected' : ''} ${cam ? '' : 'disabled'}>For this camera (every clip from it)</option><option value="clip" ${mode === 'clip' ? 'selected' : ''}>This clip only</option><option value="off" ${mode === 'off' ? 'selected' : ''}>No correction</option></select>
     <div id="lensK" class="${mode === 'off' ? 'hidden' : ''}">${slider('lensK1', 'k1', k.k1)}${slider('lensK2', 'k2', k.k2)}
       <div class="lens-prev"><img alt="corrected still"></div>
-      <div class="muted lens-note">k1 below 0 straightens barrel distortion (a 0.1-step is a lot). The live player shows the clip uncorrected; this still, previews and the export apply it.</div>
+      <div class="muted lens-note">k1 below 0 straightens barrel distortion (a 0.1-step is a lot). The player, this still, previews and the export all apply it.</div>
     </div>
+    <div class="actions" style="margin-top:6px"><button class="link" id="lensCalib" title="Hold the printed checkerboard in front of the camera: the right k1/k2 are measured and saved for every take from it">⌖ Measure it automatically…</button></div>
   </div>`;
 }
 function bindLensInspector(s) {
@@ -1022,7 +1203,8 @@ function bindLensInspector(s) {
   const srcT = () => { const L = locate(T); return L && L.seg.id === s.id ? L.seg.placed.src_in + L.off * (L.seg.speed || 1) : (s.in || 0); };
   const preview = () => { const v = vals(); img.src = `/api/projects/${P.name}/frame?src=${encodeURIComponent(s.clip)}&t=${srcT().toFixed(2)}&k1=${v.k1}&k2=${v.k2}&w=640`; };
   let timer = 0;
-  const onInput = () => { $('#lensK1Lbl').textContent = (+k1.value).toFixed(3); $('#lensK2Lbl').textContent = (+k2.value).toFixed(3); clearTimeout(timer); timer = setTimeout(preview, 250); };
+  const onInput = () => { $('#lensK1Lbl').textContent = (+k1.value).toFixed(3); $('#lensK2Lbl').textContent = (+k2.value).toFixed(3); VP.lensOverride(s.id, modeEl.value === 'off' ? null : vals()); clearTimeout(timer); timer = setTimeout(preview, 250); };
+  $('#lensCalib').onclick = () => openCalibration(s.cam || '');
   const saveCamera = async v => {   // the config entry this camera matches (or a new one named after it)
     const cfg = await api('GET', '/api/settings'), lenses = (cfg.lenses || []).slice();
     const i = lenses.findIndex(l => l.match === s.lens_match);
@@ -1034,6 +1216,7 @@ function bindLensInspector(s) {
     const v = vals();
     if (modeEl.value === 'camera' && s.cam) await saveCamera(v);
     else if (modeEl.value !== 'off') await patchSeg(s.id, { lens: v });
+    VP.lensOverride(s.id, null);
   });
   k1.oninput = k2.oninput = onInput; k1.onchange = k2.onchange = commit;
   modeEl.onchange = () => {
@@ -1989,6 +2172,7 @@ async function openSettings(tab) {
       <div class="check"><input type="checkbox" id="v_match" ${a.match_levels ? 'checked' : ''}><label for="v_match">Match clip & voice levels</label></div>
       <div class="check"><input type="checkbox" id="v_polish" ${a.polish !== false ? 'checked' : ''}><label for="v_polish">Polish voices (denoise, de-ess, EQ, compress every clip and narration; the inspector's <i>Voice</i> overrides it per clip)</label></div>
       ${field('Noise reduction (dB)', `<input type="number" id="v_denoise" step="1" min="0" max="30" value="${a.denoise ?? 10}" style="width:80px">`)}
+      ${field('Cameras', `<button class="link" id="v_calib" title="Measure a webcam's barrel distortion with the printed checkerboard; saved per camera, applied to every take from it">⌖ Straighten a camera lens…</button>`)}
       <div class="actions"><button class="link" id="openFolder">Open project folder</button><span class="spacer"></span><button class="link danger" id="delProj">Delete this vlog…</button></div>
     </div>
     <div id="setApp" class="${tab === 'app' ? '' : 'hidden'}">
@@ -2008,6 +2192,7 @@ async function openSettings(tab) {
   $$('.tabs .tab').forEach(b => b.onclick = () => { $$('.tabs .tab').forEach(x => x.classList.toggle('active', x === b)); $('#setVlog').classList.toggle('hidden', b.dataset.t !== 'vlog'); $('#setApp').classList.toggle('hidden', b.dataset.t !== 'app'); });
   $('#s_mastPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'image' }); if (r.paths[0]) $('#s_mast').value = r.paths[0]; });
   $('#s_stingPick').onclick = () => guard(async () => { const r = await api('POST', '/api/pick', { kind: 'music' }); if (r.paths[0]) $('#s_sting').value = r.paths[0]; });
+  if ($('#v_calib')) $('#v_calib').onclick = () => openCalibration('');
   if (P) { $('#v_rename').onclick = () => { closeSheet(); renameSheet(); }; $('#openFolder').onclick = () => api('POST', '/api/open', { path: P.folder }); $('#delProj').onclick = () => { if (!confirm(`Move “${P.name}” to the Trash?`)) return; guard(async () => { await api('DELETE', `/api/projects/${P.name}`); closeSheet(); localStorage.removeItem('kv.project'); P = null; await loadProjects(); }); }; }
   $('#s_ok').onclick = () => guard(async () => {
     await api('PUT', '/api/settings', { immich_url: $('#s_url').value, immich_api_key: $('#s_key').value, vlogs_dir: $('#s_dir').value, default_title_subtitle: $('#s_sub').value, default_title_kicker: $('#s_kick').value, masthead_image: $('#s_mast').value, intro_black_hold: +$('#s_hold').value || 0, intro_masthead_seconds: +$('#s_ms').value || 2.5, intro_title_seconds: +$('#s_ts').value || 2, intro_sting: $('#s_sting').value, intro_sting_start: parseTime($('#s_stingStart').value), intro_sting_volume: +$('#s_stingVol').value || 0, default_music: $('#s_music').value, default_orientation: $('#s_or').value, default_transition: $('#s_tr').value });

@@ -14,11 +14,11 @@ from pathlib import Path
 
 import yaml
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile, File
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from . import edits, media, render, titles
+from . import calib, edits, media, render, titles
 from .cli import new_project as make_project, masthead_rel, move_project, sting_rel
 from .edits import title_at
 from .config import Config, clean_lenses, lens_for
@@ -310,6 +310,7 @@ def create_app(cfg: Config) -> FastAPI:
         st = media.media_status(p, pip.src)
         return {"src": pip.src, "offset": pip.offset, "speed": pip.speed, "volume": pip.volume, "box": list(pip.box), "fit": pip.fit, "shape": pip.shape,
                 "hidden": pip.hidden, "cam": pip.cam, "media": info.to_dict() if info else None, "missing": info is None,
+                "lens_effective": (lambda k: {"k1": k[0], "k2": k[1]} if k else None)(render.lens_params(None, pip.cam, cfg.lenses)),
                 "proxy_url": media_url(p, f"cache/{Path(pip.src).name}.proxy.mp4") if st["proxy"] else (media_url(p, pip.src) if media.browser_playable(info) else None),
                 "thumb_url": media_url(p, f"cache/{Path(pip.src).name}.thumb.jpg") if st["thumb"] else None,
                 "src_url": media_url(p, pip.src) if f.exists() else None}
@@ -1565,6 +1566,99 @@ def create_app(cfg: Config) -> FastAPI:
         return project_json(p)
 
     # ------------------------------------------------------------------ still frames (lens preview)
+    # ---- automatic lens calibration (calib.py): the GUI streams webcam frames of the printed checkerboard,
+    # every detected board adds straight lines, `solve` fits k1/k2 for ffmpeg's lenscorrection, `save`
+    # writes them into config `lenses` for that camera label. Sessions live in memory.
+    CALIB: dict[str, dict] = {}
+
+    @app.get("/calibration", response_class=HTMLResponse)
+    def calibration_page():
+        return """<!doctype html><html><head><meta charset="utf-8"><title>Lens calibration pattern</title>
+<style>@page{size:landscape;margin:0}html,body{margin:0;height:100%;background:#fff}img{display:block;width:100vw;height:100vh;object-fit:contain}
+@media screen{body{background:#111}p{position:fixed;left:0;right:0;bottom:12px;text-align:center;color:#ccc;font:14px -apple-system,sans-serif}}@media print{p{display:none}}</style></head>
+<body><img src="/api/calibration/pattern.png" alt="checkerboard"><p>Print this page (⌘P, landscape, 100 %) and tape it to something flat — or hold this screen in front of the camera.</p></body></html>"""
+
+    @app.get("/api/calibration/pattern.png")
+    def calibration_pattern(paper: str = "letter"):
+        return Response(calib.pattern_png(paper="a4" if paper.lower() == "a4" else "letter"), media_type="image/png",
+                        headers={"Cache-Control": "max-age=86400"})
+
+    @app.post("/api/calibration/start")
+    def calibration_start(body: dict):
+        cid = uuid.uuid4().hex[:10]
+        for k in [k for k, v in CALIB.items() if time.time() - v["t"] > 3600]:
+            CALIB.pop(k, None)
+        CALIB[cid] = {"cam": str(body.get("cam") or ""), "boards": [], "frames": 0, "last": b"", "t": time.time(), "fit": None}
+        return {"id": cid, "board": list(calib.BOARD)}
+
+    def _cal(cid: str) -> dict:
+        c = CALIB.get(cid)
+        if c is None:
+            raise HTTPException(404, "no such calibration session")
+        c["t"] = time.time()
+        return c
+
+    def _cal_status(c: dict, **extra) -> dict:
+        cov = [any(x) for x in zip(*[b.coverage() for b in c["boards"]])] if c["boards"] else [False] * 9
+        return {"boards": len(c["boards"]), "frames": c["frames"], "coverage": cov, "hint": calib.coverage_hint(cov) if c["boards"] else "show the whole checkerboard to the camera",
+                "ready": len(c["boards"]) >= 3, "fit": c["fit"]} | extra
+
+    @app.post("/api/calibration/{cid}/frame")
+    async def calibration_frame(cid: str, request: Request):
+        """One JPEG of the camera. A board is kept when it is fully visible and has moved since the last one
+        (holding still adds nothing), so 'boards' counts distinct views."""
+        c = _cal(cid)
+        data = await request.body()
+        if not data:
+            raise HTTPException(400, "empty frame")
+        c["frames"] += 1
+        try:
+            if calib.decodable(data):
+                c["last"] = data
+            b = calib.find_board(data)
+        except RuntimeError as e:
+            raise HTTPException(500, str(e))
+        if b is None:
+            return _cal_status(c, found=False, accepted=False)
+        if c["boards"] and (c["boards"][0].width, c["boards"][0].height) != (b.width, b.height):
+            c["boards"] = []     # the camera changed resolution: start over
+        cen = b.corners.reshape(-1, 2).mean(axis=0)
+        near = any(float(((x.corners.reshape(-1, 2).mean(axis=0) - cen) ** 2).sum()) ** 0.5 < 0.03 * b.width for x in c["boards"])
+        if not near and len(c["boards"]) < 40:
+            c["boards"].append(b)
+        return _cal_status(c, found=True, accepted=not near, corners=b.corners.reshape(-1, 2).round(1).tolist(), width=b.width, height=b.height)
+
+    @app.post("/api/calibration/{cid}/solve")
+    def calibration_solve(cid: str):
+        c = _cal(cid)
+        if len(c["boards"]) < 3:
+            raise HTTPException(400, "show the board in at least three places first")
+        c["fit"] = calib.fit(c["boards"]).to_dict()
+        return _cal_status(c)
+
+    @app.get("/api/calibration/{cid}/preview.jpg")
+    def calibration_preview(cid: str, k1: float = 0.0, k2: float = 0.0):
+        c = _cal(cid)
+        if not c["last"]:
+            raise HTTPException(404, "no frame yet")
+        return Response(calib.corrected_jpeg(c["last"], k1, k2), media_type="image/jpeg")
+
+    @app.post("/api/calibration/{cid}/save")
+    def calibration_save(cid: str, body: dict):
+        """Keep the fit (or the k1/k2 in the body) for this session's camera label in config `lenses`."""
+        c = _cal(cid)
+        cam = str(body.get("cam") or c["cam"]).strip()
+        if not cam:
+            raise HTTPException(400, "no camera label to save under")
+        fitd = c["fit"] or {}
+        try:
+            k1 = float(body["k1"]) if "k1" in body else float(fitd["k1"])
+            k2 = float(body["k2"]) if "k2" in body else float(fitd["k2"])
+        except (KeyError, TypeError, ValueError):
+            raise HTTPException(400, "solve first, or send k1 and k2")
+        entry = calib.save_lens(cfg, cam, k1, k2)
+        return {"saved": entry, "lenses": cfg.lenses}
+
     @app.get("/api/projects/{name}/frame")
     def frame(name: str, src: str, t: float = 0.0, k1: float = 0.0, k2: float = 0.0, w: int = 480):
         """One JPEG frame of a clip at source time `t`, run through `lenscorrection=k1:k2` (none when both are 0),

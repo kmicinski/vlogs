@@ -155,14 +155,34 @@ the camera it was shot with (like its mic), and the inspector's **Lens** section
 the export: two sliders (k1 for the bulge, k2 for the fine edges; a little below zero is usually
 right), a corrected still of the current frame to judge by, and a choice of *For this camera*
 (saved in the app settings, so every clip from that camera — past and future — is corrected the
-same way), *This clip only*, or *No correction*. The live player shows clips uncorrected; the
-still, previews and the export apply it. In the YAML a clip may carry `cam:` (the camera's name)
-and `lens: off` or `lens: {k1: -0.12, k2: 0.02}`; the per-camera table is `lenses:` in
+same way), *This clip only*, or *No correction*. The player, the still, previews and the export
+all apply it (the player draws such clips through a WebGL twin of the video with the same
+formula). In the YAML a clip may carry `cam:` (the camera's name) and `lens: off` or
+`lens: {k1: -0.12, k2: 0.02}`; the per-camera table is `lenses:` in
 `~/.config/krisvideos/config.yaml` (`match` is a substring or regex of the camera's name).
+
+You don't have to guess the numbers: **Measure it automatically…** (in the Lens section, or
+*Straighten a camera lens…* in the vlog settings) opens the camera, and you hold up the printed
+checkerboard (`/calibration` prints it; a phone or tablet showing that page works too). Every
+distinct view of the board adds rows and columns that ought to be straight; once the 3 × 3 grid
+over the picture is green the correction is measured, the live picture switches to the
+straightened view, and *Save* keeps it for that camera. `vlog calibrate "Anker PowerConf"
+photo1.jpg photo2.jpg …` does the same from photos (`vlog calibrate --pattern board.png` writes
+the pattern).
+
+**Selecting several things.** Click selects a clip, ⇧-click selects everything between it and the
+last one you clicked, ⌘-click adds one or takes it out again (⌘A selects all). The inspector then
+acts on all of them: mute, speed, voice, transition, move, delete. ⌘G **groups** the selection so
+those clips select, drag and delete together from then on (a coloured bar marks them; ⇧⌘G
+ungroups). ⌘L **unlinks** a clip's sound from its picture: the clip goes quiet and its sound
+becomes a block on the **A2** track that you can drag in time, trim, speed up or delete on its own
+(⌘L on that block, or *Link back* in its inspector, puts it back on the clip). Overlapping sounds
+stack in rows.
 
 Keyboard: `space` play · `I`/`O` mark in/out · `X` mark clip · `⌫` cut out marked part ·
 `K` keep only marked part · `M` marker · `,`/`.` previous/next marker · `Q`/`W` trim start/end to playhead · `T` title here · `S` split ·
-`R` record · `⌫` delete · `↑↓` select · `[` `]` reorder · `←→` frame step · `⌘Z` undo ·
+`R` record · `⌫` delete · `↑↓` select (⇧ extends) · ⇧/⌘-click select a range / toggle · `⌘A` all · `⌘G`/`⇧⌘G` group/ungroup ·
+`⌘L` unlink/link a clip's sound · `[` `]` reorder · `←→` frame step · `⌘Z` undo ·
 `⌘+/−/0` zoom · `F` fullscreen · `?` help · `⌘⏎` render preview · `⇧⌘⏎` export.
 
 ## The script (`project.yaml`)
@@ -243,6 +263,9 @@ vlog trim PROJ s3 --in 0:03 --out 0:14     vlog set PROJ s3 speed=1.5 mute=true 
 vlog set PROJ s3 channel=right             # one-channel mic: right (or left) to both ears; mix; stereo; auto
 vlog set PROJ s3 lens=-0.12,0.02           # straighten a wide-angle webcam (or lens=off / lens=auto = the camera's setting)
 vlog config lenses='[{match: Anker, k1: -0.12, k2: 0.02}]'   # the per-camera table (match = substring/regex of the camera name)
+vlog calibrate "Anker PowerConf" board1.jpg board2.jpg ...   # measure k1/k2 from photos of the checkerboard and save them for that camera
+vlog group PROJ s3 s4 s5 · vlog ungroup PROJ s3   # clips that select, move and delete together in the GUI
+vlog unlink PROJ s3 · vlog link PROJ v2       # a clip's sound as its own A2 block (and back)
 vlog rm PROJ s3 · vlog move PROJ s3 0 · vlog music PROJ file.mp3 [--volume 0.2]
 vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos br] [--shape round|rect|circle] [--speed 4] [--in 0:05] [--swap] [--rm]
                                            a clip in a box over s3 (picture in picture); --swap makes the inset the big one
@@ -253,7 +276,7 @@ vlog sting PROJ song.mp3 --from s1 --to s3 [--start 0:06.5] [--volume 0.7] [--lo
 vlog sting PROJ song.mp3 --range 0:32 1:10 | --whole   music over that stretch (clips split at both ends) / the whole vlog
 vlog sting PROJ song.mp3 --continue --from s5   pick the song up where its last cue stopped  (`intro` = the configured song)
 vlog sting PROJ split --id m1 --at 0:45     split a cue at 0:45 into two that play on (the clip is split there too); rm --id m1 removes
-vlog preview PROJ [--open] · vlog render PROJ [--open] · vlog serve [--open]
+vlog preview PROJ [--open] · vlog render PROJ [--open] [--workers N] · vlog serve [--open]
 vlog undo PROJ · vlog redo PROJ
 ```
 `PROJ` is a folder name under `~/Vlogs` (or a path). Segments are addressed by id (`s3`) or index.
