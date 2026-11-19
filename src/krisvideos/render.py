@@ -7,6 +7,7 @@ mixed under with optional ducking, then global fades and loudness normalization.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import subprocess
@@ -24,6 +25,9 @@ AUDIO_FMT = "aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo"
 MASTER_LUFS = -16.0      # loudness of the final mix (clips are matched to audio.target_lufs, then gained to this)
 MUTE_ABOVE = 20.0     # a clip faster than this plays silent (a timelapse): sped-up speech is just noise
 PIP_FADE = 0.5        # seconds a video over a clip dissolves out when its footage runs out before the clip does
+SEEK_BACK = 3.0       # seconds a clip is read from before its in point: a screen take only stores a frame when the screen
+                      # changes (a second or more apart when it is still), and a seek that lands between two such
+                      # frames must still show the earlier one until the next arrives, not start at the next
 CANVAS = {"portrait": (1080, 1920), "landscape": (1920, 1080), "square": (1080, 1080)}
 
 
@@ -346,6 +350,38 @@ def voice_jobs(p: Project, infos=None) -> list[tuple[Path, Path, str, float]]:
     return out
 
 
+def _delay(seconds: float) -> str:
+    """Silence of `seconds` in front of a sound layer. ffmpeg 7.1's adelay stamps the silence it inserts with garbage
+    timestamps when the input was seeked (-ss) — an AAC take's unlinked sound, a polished cache read from its in point —
+    and everything downstream then drops the silence, so the layer plays at 0 instead of at its time (a saw over the
+    intro, 2026-11-19). Re-stamping from the sample count right after it puts the layer where it belongs."""
+    return f"adelay={int(round(seconds * 1000))}:all=1,asetpts=N/SR/TB"
+
+
+def _lead_in(src_in: float, info) -> tuple[float, float]:
+    """Where to start reading a clip for a piece that begins at `src_in`, and how much lead-in that is: SEEK_BACK
+    before the in point, and never past the last frame (the sound of a take can outlast its picture), so that the
+    frame to show *at* the in point is always decoded even when the file has no frame right there."""
+    at = src_in - SEEK_BACK
+    if info is not None and getattr(info, "video_end", 0) and at > info.video_end - 1.0:
+        at = info.video_end - 1.0
+    at = max(0.0, at)
+    return at, src_in - at
+
+
+def _grid_chain(fps: float, speed: float, back: float, src_len: float) -> list[str]:
+    """The head of a clip's video chain: the frame grid first (a faster clip is decimated *before* the costly
+    conversions, a slower one gets the frames its slow motion needs, and a gap between a take's frames is filled by
+    cloning), the last frame cloned on for as long as the piece needs if the footage stops short, then the lead-in
+    cut off again. fps leaves a coarse 1/rate timebase behind: settb restores a fine one before the speed change
+    divides the stamps."""
+    rate = fps / speed
+    pad = int(math.ceil((back + src_len + 1.0) * rate)) + 2
+    chain = [f"fps={rate:.6g}", f"tpad=stop={pad}:stop_mode=clone"]
+    chain.append(f"trim=start={back:.3f}:end={back + src_len:.3f}" if back > 0 else f"trim=end={src_len:.3f}")
+    return chain + ["settb=AVTB", "setpts=PTS-STARTPTS"]
+
+
 def window_layout(layout: Layout, t0: float, t1: float) -> Layout:
     """The part of a layout between output times t0 and t1, re-based so t0 is 0: segments outside are
     dropped, the ones across an edge are clipped (`skip` = head cut off, `src_in`/`src_out` follow at the
@@ -354,7 +390,7 @@ def window_layout(layout: Layout, t0: float, t1: float) -> Layout:
     out: list[Placed] = []
     for pl in layout.placed:
         a, b = max(pl.start, t0), min(pl.end, t1)
-        if b - a <= 1e-6:
+        if round((b - t0) * layout.fps) - round((a - t0) * layout.fps) < 1:     # nothing of it on this window's frame grid
             continue
         skip = a - pl.start
         spd = (pl.seg.speed or 1.0) if pl.seg.kind == "clip" else 1.0
@@ -418,7 +454,10 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
         # grid (`exact`): the cut points then never drift from the audio, and a parallel render's shards
         # line up frame for frame with a single pass (fps alone rounds each segment up on its own)
         nf = max(1, int(round(pl.end * FPS)) - int(round(pl.start * FPS)))
-        exact = f"fps={FPS},tpad=stop=3:stop_mode=clone,trim=end_frame={nf},fps={FPS}"
+        # (tpad clones the last frame for as long as the footage falls short of the piece: a take whose picture
+        # ends before its sound, or a seek inside a frame gap, would otherwise leave the piece short and every
+        # later picture early against the sound)
+        exact = f"fps={FPS},tpad=stop={nf}:stop_mode=clone,trim=end_frame={nf},fps={FPS}"
         if s.kind == "title" and not want_v:
             filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[a{i}]")
         elif s.kind == "title":
@@ -446,13 +485,16 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             info = pl.info
             assert info is not None
             src = p.resolve(s.src)
-            seek = ["-ss", f"{pl.src_in:.3f}"] if pl.src_in > 0 else []
-            k = add_input(only + _hwdec(info, hdr_mode, want_v) + seek + ["-t", f"{(pl.src_out - pl.src_in) + 0.25 * s.speed:.3f}", "-i", str(src)])
-            vchain = ["setpts=PTS-STARTPTS"]
+            # read from SEEK_BACK before the in point so the frame shown *at* the in point is there even when the file
+            # has no frame between (fps clones it across the gap); trim takes the lead-in off again on the frame grid
+            seek_at, back = _lead_in(pl.src_in, info) if want_v else (pl.src_in, 0.0)
+            seek = ["-ss", f"{seek_at:.3f}"] if seek_at > 0 else []
+            src_len = (pl.src_out - pl.src_in) + 0.25 * s.speed
+            k = add_input(only + _hwdec(info, hdr_mode, want_v) + seek + ["-t", f"{src_len + back:.3f}", "-i", str(src)])
+            vchain = _grid_chain(FPS, s.speed, back, src_len)
             if s.speed != 1.0:
                 vchain.append(f"setpts=PTS/{s.speed:.6g}")
-                if s.speed > 1.0:        # drop the frames a faster clip won't show *before* the costly conversions (a 4x HDR clip: 4x fewer tone-maps)
-                    vchain.append(f"fps={FPS}")
+                vchain.append(f"fps={FPS}")
             # the picture fills the frame, or the box it was given (screen + camera layouts)
             bx, by, bw, bh = region(s.box, W, H)
             fw, fh = _fit(info.width, info.height, bw, bh)
@@ -491,8 +533,10 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 px, py, pw, ph = pip_rect(pip, pinfo, W, H)
                 rate = s.speed * (pip.speed or 1.0)        # the inset runs at its own speed on top of the clip's
                 pin = pip.time(pl.src_in)
-                seek = ["-ss", f"{pin:.3f}"] if pin > 0 else []
-                kp = add_input(only + _hwdec(pinfo, hdr_mode, want_v) + seek + ["-t", f"{(pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5:.3f}", "-i", str(ppath)])
+                pseek, pback = _lead_in(max(0.0, pin), pinfo) if want_v else (max(0.0, pin), 0.0)     # lead-in, as for the clip above
+                seek = ["-ss", f"{pseek:.3f}"] if pseek > 0 else []
+                psrc_len = (pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5
+                kp = add_input(only + _hwdec(pinfo, hdr_mode, want_v) + seek + ["-t", f"{psrc_len + pback:.3f}", "-i", str(ppath)])
                 # where (in output seconds from the clip's start) the inset's footage runs out; past that
                 # it dissolves away over PIP_FADE and the clip shows again
                 pend = (pinfo.duration - pin) / rate if pinfo.duration and rate > 0 else dur
@@ -500,16 +544,15 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 pdur = min(dur, max(0.1, pend)) if ends_early else dur
                 pfade = f"fade=t=out:st={max(0.0, pdur - PIP_FADE):.3f}:d={min(PIP_FADE, pdur):.3f}:alpha=1"
                 if pip.volume > 0 and pinfo.has_audio and rate <= MUTE_ABOVE:
-                    pip_audio = (kp, pin, rate, pip.volume, pdur if ends_early else None)   # mixed into the clip's sound below
+                    pip_audio = (kp, pin, rate, pip.volume, pdur if ends_early else None, pback)   # mixed into the clip's sound below
             if pinfo is not None and want_v:
                 covers = px <= 0 and py <= 0 and px + pw >= W and py + ph >= H     # B-roll: covers the picture
-                pchain = ["setpts=PTS-STARTPTS"]
+                pchain = _grid_chain(FPS, rate, pback, psrc_len)
                 if pin < 0:            # the inset's file starts after the clip's in point: hold its first frame until then
                     pchain.append(f"tpad=start_duration={-pin:.3f}:start_mode=clone")
-                if rate != 1.0:
+                if rate != 1.0:        # (decimated above, before the tone-map / scale below see the frames)
                     pchain.append(f"setpts=PTS/{rate:.6g}")
-                    if rate > 1.0:       # decimate first: the tone-map / scale below then see only the frames that are kept
-                        pchain.append(f"fps={FPS}")
+                    pchain.append(f"fps={FPS}")
                 plens = lens_filter(lens_params(None, pip.cam, lenses))   # the camera as the inset of a screen take
                 if plens and not (pinfo.hdr and hdr_mode != "none"):
                     pchain.append(plens)
@@ -581,15 +624,17 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 if info.has_audio and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE:
                     a_src, achain = sound_chain(p, src, pl.src_in, pl.src_out, s.speed, s.volume, s.channel, s.polish, s.mic,
                                                 add_input, f"{k}:a")
+                    if back > 0 and a_src == f"{k}:a":       # the sound read along with the picture carries the lead-in too
+                        achain.insert(0, f"atrim=start={back:.3f}")
                     achain.append(f"atrim=duration={dur:.3f},asetpts=PTS-STARTPTS,apad=whole_dur={dur:.3f}")
                     filters.append(f"[{a_src}]{','.join(achain)}[{a_main}]")
                 else:
                     filters.append(f"anullsrc=r=48000:cl=stereo:d={dur:.3f}[{a_main}]")
                 if pip_audio:
-                    kp, pin, rate, vol, pend_ = pip_audio
-                    pch = ["asetpts=PTS-STARTPTS"]
+                    kp, pin, rate, vol, pend_, pback = pip_audio
+                    pch = ([f"atrim=start={pback:.3f}"] if pback > 0 else []) + ["asetpts=PTS-STARTPTS"]
                     if pin < 0:
-                        pch.append(f"adelay={int(-pin * 1000)}:all=1")
+                        pch.append(_delay(-pin))
                     pch_ = media.effective_channel(ppath, p.cache_dir, "auto")
                     if pch_ in media.CHANNEL_PAN:
                         pch.append(media.CHANNEL_PAN[pch_])
@@ -716,7 +761,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 else:
                     kv = add_input(["-vn", "-i", str(vf)])
                     a_src, chain = sound_chain(p, vf, 0.0, vinfo.duration, 1.0, v.volume, "stereo", v.polish, "", add_input, f"{kv}:a")
-                chain += [f"adelay={int(v.at * 1000)}:all=1", f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
+                chain += [_delay(v.at), f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
                 filters.append(f"[{a_src}]{','.join(chain)}[vo{n}]")
                 labels.append(f"vo{n}")
             if not labels:
@@ -760,7 +805,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     chain.append(f"afade=t=in:st=0:d={fi:.3f}")
                 if fo > 0:
                     chain.append(f"afade=t=out:st={length - fo:.3f}:d={fo:.3f}")
-                chain += [f"adelay={int(ta * 1000)}:all=1", f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
+                chain += [_delay(ta), f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
                 filters.append(f"[{km}:a]{','.join(chain)}[st{n}]")
                 labels.append(f"st{n}")
             if len(labels) == 1:

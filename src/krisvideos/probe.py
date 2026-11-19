@@ -28,6 +28,7 @@ class MediaInfo:
     size: int
     mtime: float
     created: str = ""     # creation_time tag if present
+    video_end: float = 0.0   # where the picture stops (the sound of a browser take runs a little longer); 0 = unknown
 
     @property
     def portrait(self) -> bool:
@@ -97,10 +98,11 @@ def probe(path: Path, cache_dir: Path | None = None) -> MediaInfo:
         codec = v.get("codec_name", "")
     hdr = transfer in ("smpte2084", "arib-std-b67")
     created = (fmt.get("tags", {}) or {}).get("creation_time", "") or ((v or {}).get("tags", {}) or {}).get("creation_time", "")
+    video_end = float((v or {}).get("duration") or 0) if v else 0.0
     info = MediaInfo(
         path=str(path), duration=duration, width=width, height=height, fps=fps,
         has_audio=a is not None, has_video=v is not None, rotation=rotation, hdr=hdr,
-        color_transfer=transfer, codec=codec, size=st.st_size, mtime=st.st_mtime, created=created,
+        color_transfer=transfer, codec=codec, size=st.st_size, mtime=st.st_mtime, created=created, video_end=video_end,
     )
     if cache_file is not None:
         cache_file.write_text(json.dumps(asdict(info)))
