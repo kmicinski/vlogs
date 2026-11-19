@@ -758,6 +758,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                         continue
                     kv = add_input(["-vn"] + (["-ss", f"{a0:.3f}"] if a0 > 0 else []) + ["-t", f"{b0 - a0:.3f}", "-i", str(vf)])
                     a_src, chain = sound_chain(p, vf, a0, b0, v.speed, v.volume, v.channel, v.polish, v.mic, add_input, f"{kv}:a")
+                    chain.append(f"atrim=duration={(b0 - a0) / v.speed:.3f}")      # ends at its out point (the inputs read a little spare)
                 else:
                     kv = add_input(["-vn", "-i", str(vf)])
                     a_src, chain = sound_chain(p, vf, 0.0, vinfo.duration, 1.0, v.volume, "stereo", v.polish, "", add_input, f"{kv}:a")

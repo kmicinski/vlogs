@@ -155,9 +155,15 @@ the camera it was shot with (like its mic), and the inspector's **Lens** section
 the export: two sliders (k1 for the bulge, k2 for the fine edges; a little below zero is usually
 right), a corrected still of the current frame to judge by, and a choice of *For this camera*
 (saved in the app settings, so every clip from that camera — past and future — is corrected the
-same way), *This clip only*, or *No correction*. The player, the still, previews and the export
-all apply it (the player draws such clips through a WebGL twin of the video with the same
-formula). In the YAML a clip may carry `cam:` (the camera's name) and `lens: off` or
+same way), *Every clip in this vlog* (the same numbers written onto all of them — for a vlog
+whose clips don't say which camera shot them), *This clip only*, or *No correction*. A clip
+without a camera name (an imported file, or a take from before the app kept camera names) has a
+*shot with…* picker that tells it its camera, so the camera's saved correction applies to it
+too; with several clips selected the inspector's *Lens (every clip)* row sets them all at once;
+the recorder says under the camera whether that camera is straightened yet and offers to measure
+it. The player, the still, previews and the export all apply it (the player draws such clips
+through a WebGL twin of the video with the same formula). In the YAML a clip may carry `cam:`
+(the camera's name) and `lens: off` or
 `lens: {k1: -0.12, k2: 0.02}`; the per-camera table is `lenses:` in
 `~/.config/krisvideos/config.yaml` (`match` is a substring or regex of the camera's name).
 

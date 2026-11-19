@@ -189,7 +189,12 @@ and before the scale (after the HDR tone-map for HDR sources: the filter is 8-bi
 `lens_effective` (what the export applies), `lens_source` (camera | clip | off), `lens_match` (the config entry hit).
 `vlog show` prints `cam='…'  lens=-0.120,+0.020 (camera|this clip)`. GUI inspector *Lens*: k1/k2 sliders
 (-0.5…0.5, step 0.005), mode *For this camera* (rewrites the matching `lenses` entry, or adds one named after the
-label) / *This clip only* / *No correction*, and a corrected still from `GET /api/projects/{name}/frame?src&t&k1&k2&w`
+label) / *Every clip in this vlog* (`POST segments/patch {ids: all clips, patch: {lens}}`; `lensModeOf` reads it back
+as `all` when every clip carries the same own setting) / *This clip only* / *No correction*; a clip with no `cam` gets a
+*shot with…* select (`knownCameras()`: the vlog's takes, the config entries, the browser's cameras → `PATCH {cam}`),
+the multi-selection inspector has a *Lens (every clip)* row (same as the first / each camera's own / off), the recorder
+shows `#recLens` under the camera (straightened, or "straighten it…" → `openCalibration`), and a corrected still from
+`GET /api/projects/{name}/frame?src&t&k1&k2&w`
 (one ffmpeg JPEG, cached in `cache/<name>.frame.<t>.<k1>.<k2>.<w>.jpg`, debounced 250 ms). The live player applies it
 too: `VP.lensApply(video, k, fit)` lays a WebGL canvas twin (`canvas.lensgl`, shader = the lenscorrection formula,
 r² = 4(dx²+dy²)/(w²+h²)) over the `<video>` (which keeps playing with `visibility: hidden`; the twin copies its
@@ -245,6 +250,21 @@ the audio; `window_layout` clips the layout to a window (`Placed.skip`/`cut_end`
 /credits clipped, global fade-in only in the first window / fade-out in the last); inputs get `-an`/`-vn` so a video
 shard never decodes sound; `_hwdec` adds `-hwaccel videotoolbox` for HDR HEVC. A 15-min real vlog: ~8 min single
 pass → 185 s (≈4.9× realtime) on 14 cores. `workers=1` is the old single pass (tests that inspect the graph use it).
+Two export bugs found on 2026-11-19 (the picture ran 1.7 s ahead of the sound by the end, and an unlinked take's sound
+played over the intro): (1) a screen take stores a frame only when the screen changes (a still screen: one a second,
+`REC_*-screen.mp4` is VFR), and a browser take's sound outlasts its picture by up to a second, so a piece whose seek
+landed in such a gap, or ran past the last frame, came out short (`tpad=stop=3` padded 3 frames) and every later
+picture was early. Every clip (and inset) is now read from `SEEK_BACK` (3 s) before its in point and never past
+`probe.video_end - 1` (`_lead_in`), and `_grid_chain` heads the video chain with `fps=FPS/speed` (the grid first: gaps
+are filled by cloning, a faster clip is decimated before the tone-map/scale), `tpad=stop=N:stop_mode=clone` (the last
+frame cloned on for as long as the piece needs), `trim=start=back:end=…` (the lead-in off again), `settb=AVTB` (fps
+leaves a 1/rate timebase that would wreck the later `setpts=PTS/speed`), `setpts=PTS-STARTPTS`; the `exact` tail pads
+with `tpad=stop=nf`; the sound read along with the picture gets `atrim=start=back`; `window_layout` drops a piece that
+rounds to no frame. (2) ffmpeg 7.1's `adelay` stamps the silence it inserts with garbage pts when its input was seeked
+(`-ss`: an unlinked AAC take, a polished cache read from its in point), so the layer played at 0: every delay goes
+through `_delay(seconds)` = `adelay=…:all=1,asetpts=N/SR/TB`. Kind-clip layers also end at their out point
+(`atrim=duration`). Scratchpad tests: `test_vfr.py` (frame gaps / short footage, serial = parallel), `test_layers.py`
+(layer placement, raw and polished).
 
 ## Development
 - `uv sync`; run with `.venv/bin/vlog ...`; GUI: `.venv/bin/vlog serve --port 8799`.

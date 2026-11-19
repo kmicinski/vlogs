@@ -983,6 +983,11 @@ async function recPreviewLens() {
     } catch { }
   }
   if ($('#recPreview') === v) VP.lensApply(v, k, 'contain');
+  const line = $('#recLens');
+  if (line && cam) {
+    line.innerHTML = k ? `Lens straightened (k1 ${k.k1}, k2 ${k.k2})` : `Lens not measured yet · <a href="#" id="recLensCal">straighten it…</a>`;
+    const a = $('#recLensCal'); if (a) a.onclick = e => { e.preventDefault(); closeSheet(); openCalibration(cam); };
+  } else if (line) line.textContent = '';
 }
 // ================================================================== lens calibration
 // The printed checkerboard (/calibration) is held in front of the camera; every frame goes to the server, each
@@ -1209,15 +1214,31 @@ function renderInspector() {
 }
 // lens: straighten a wide-angle webcam's barrel distortion in the export (ffmpeg lenscorrection k1/k2).
 // "For this camera" writes the config's `lenses` entry for the take's camera label (every clip from it follows);
-// "this clip only" keeps k1/k2 on the segment (`lens:`); "no correction" is `lens: off`. The live player can't
-// apply it, so a corrected still from GET /frame stands in.
-function lensModeOf(s) { return s.lens === 'off' ? 'off' : (s.lens && typeof s.lens === 'object') ? 'clip' : (s.cam ? 'camera' : 'clip'); }
+// "this clip only" keeps k1/k2 on the segment (`lens:`), "every clip in this vlog" writes the same onto all of them,
+// "no correction" is `lens: off`. The live player draws the result (VP.lensApply); a corrected still from GET /frame
+// shows the exact export. A clip with no camera label (imported, or recorded before the app kept camera names) can be
+// told which camera shot it (`cam`), so the camera's saved correction applies to it like to every take from it.
+const lensSame = (a, b) => !!a && !!b && typeof a === 'object' && typeof b === 'object' && Math.abs((a.k1 || 0) - (b.k1 || 0)) < 1e-6 && Math.abs((a.k2 || 0) - (b.k2 || 0)) < 1e-6;
+const allClips = () => P.timeline.filter(x => x.kind === 'clip');
+function lensModeOf(s) {
+  if (s.lens === 'off') return 'off';
+  if (s.lens && typeof s.lens === 'object') { const cs = allClips(); return cs.length > 1 && cs.every(x => lensSame(x.lens, s.lens)) ? 'all' : 'clip'; }
+  return s.cam ? 'camera' : 'clip';
+}
+// camera labels the app knows: this vlog's takes, the config's lens entries, the browser's cameras (labels only after a permission grant)
+async function knownCameras() {
+  const names = new Set();
+  for (const x of P.timeline) { if (x.cam) names.add(x.cam); if (x.pip && x.pip.cam) names.add(x.pip.cam); }
+  try { for (const l of (await api('GET', '/api/settings')).lenses || []) if (l.match) names.add(l.match); } catch { }
+  try { for (const d of await navigator.mediaDevices.enumerateDevices()) if (d.kind === 'videoinput' && d.label) names.add(d.label); } catch { }
+  return [...names];
+}
 function lensInspectorHtml(s) {
   const k = s.lens_effective || { k1: 0, k2: 0 }, mode = lensModeOf(s), cam = s.cam || '';
   const slider = (id, label, v) => `<div class="inline lens-k"><span class="muted" style="width:18px">${label}</span><input type="range" id="${id}" min="-0.5" max="0.5" step="0.005" value="${v}"><span id="${id}Lbl" class="lens-val">${(+v).toFixed(3)}</span></div>`;
   return `<div class="field" id="lensField"><label>Lens (wide-angle correction)</label>
-    <div class="muted lens-cam">${cam ? `Camera: ${esc(cam)}` : 'Camera unknown — an imported file, or recorded before the app kept camera names'}</div>
-    <select id="lensMode"><option value="camera" ${mode === 'camera' ? 'selected' : ''} ${cam ? '' : 'disabled'}>For this camera (every clip from it)</option><option value="clip" ${mode === 'clip' ? 'selected' : ''}>This clip only</option><option value="off" ${mode === 'off' ? 'selected' : ''}>No correction</option></select>
+    <div class="muted lens-cam">${cam ? `Camera: ${esc(cam)}` : `Camera unknown (an imported file, or recorded before the app kept camera names) · <select id="lensCamPick" title="Tell the clip which camera shot it: that camera's saved correction then applies here too"><option value="">shot with…</option></select>`}</div>
+    <select id="lensMode"><option value="camera" ${mode === 'camera' ? 'selected' : ''} ${cam ? '' : 'disabled'}>For this camera (every clip from it)</option><option value="all" ${mode === 'all' ? 'selected' : ''}>Every clip in this vlog</option><option value="clip" ${mode === 'clip' ? 'selected' : ''}>This clip only</option><option value="off" ${mode === 'off' ? 'selected' : ''}>No correction</option></select>
     <div id="lensK" class="${mode === 'off' ? 'hidden' : ''}">${slider('lensK1', 'k1', k.k1)}${slider('lensK2', 'k2', k.k2)}
       <div class="lens-prev"><img alt="corrected still"></div>
       <div class="muted lens-note">k1 below 0 straightens barrel distortion (a 0.1-step is a lot). The player, this still, previews and the export all apply it.</div>
@@ -1234,6 +1255,12 @@ function bindLensInspector(s) {
   let timer = 0;
   const onInput = () => { $('#lensK1Lbl').textContent = (+k1.value).toFixed(3); $('#lensK2Lbl').textContent = (+k2.value).toFixed(3); VP.lensOverride(s.id, modeEl.value === 'off' ? null : vals()); clearTimeout(timer); timer = setTimeout(preview, 250); };
   $('#lensCalib').onclick = () => openCalibration(s.cam || '');
+  const pick = $('#lensCamPick');
+  if (pick) {
+    knownCameras().then(names => { if (!pick.isConnected) return; for (const n of names) { const o = document.createElement('option'); o.value = o.textContent = n; pick.appendChild(o); } });
+    pick.onchange = () => { if (pick.value) patchSeg(s.id, { cam: pick.value }); };
+  }
+  const everyClip = () => allClips().map(x => x.id);
   const saveCamera = async v => {   // the config entry this camera matches (or a new one named after it)
     const cfg = await api('GET', '/api/settings'), lenses = (cfg.lenses || []).slice();
     const i = lenses.findIndex(l => l.match === s.lens_match);
@@ -1244,6 +1271,7 @@ function bindLensInspector(s) {
   const commit = () => guard(async () => {
     const v = vals();
     if (modeEl.value === 'camera' && s.cam) await saveCamera(v);
+    else if (modeEl.value === 'all') await patchSegs(everyClip(), { lens: v });
     else if (modeEl.value !== 'off') await patchSeg(s.id, { lens: v });
     VP.lensOverride(s.id, null);
   });
@@ -1252,6 +1280,7 @@ function bindLensInspector(s) {
     const m = modeEl.value;
     if (m === 'off') return patchSeg(s.id, { lens: 'off' });
     if (m === 'clip') return patchSeg(s.id, { lens: vals() });
+    if (m === 'all') { const ids = everyClip(); patchSegs(ids, { lens: vals() }); toast(`Lens set on all ${ids.length} clips`); return; }
     patchSeg(s.id, { lens: null });     // back to the camera's configured correction
   };
   if (modeEl.value !== 'off' && !s.missing) preview();
@@ -1327,7 +1356,8 @@ function renderMultiInspector(el, close) {
   const what = [segs.length ? `${segs.length} clip${segs.length > 1 ? 's' : ''}` : '', vos.length ? `${vos.length} sound${vos.length > 1 ? 's' : ''}` : ''].filter(Boolean).join(' + ');
   el.innerHTML = `<h3>${what} ${close}</h3><div class="muted" style="margin:-6px 0 12px">${fmt(dur)} together · ⇧-click a range, ⌘-click to add or take out</div>
     <div class="actions" style="flex-wrap:wrap;gap:4px 12px">${segs.length > 1 ? `<button class="link" id="mGroup" title="${allGrouped ? '⇧⌘G' : '⌘G'}">${allGrouped ? 'Ungroup' : 'Group'}</button>` : ''}${clips.length ? `<button class="link" id="mMute">${clips.every(s => s.mute) ? 'Unmute' : 'Mute'}</button>` : ''}${canUnlink.length ? `<button class="link" id="mUnlink" title="⌘L">Unlink sound</button>` : ''}${canLink.length ? `<button class="link" id="mLink" title="⌘L">Link sound back</button>` : ''}<span class="spacer"></span><button class="link danger" id="mDelete" title="⌫">Delete all</button></div>` +
-    (clips.length ? `<div class="sep"></div>` + field('Speed (every clip)', speedControl('mSpeed', clips[0].speed || 1)) + (clips.some(s => s.media && s.media.has_audio) ? field('Voice (every clip)', `<select id="mPolish"><option value="">— leave as is —</option>${polishOptions(null)}</select>`) : '') : '') +
+    (clips.length ? `<div class="sep"></div>` + field('Speed (every clip)', speedControl('mSpeed', clips[0].speed || 1)) + (clips.some(s => s.media && s.media.has_audio) ? field('Voice (every clip)', `<select id="mPolish"><option value="">— leave as is —</option>${polishOptions(null)}</select>`) : '') +
+      field('Lens (every clip)', `<select id="mLens"><option value="">— leave as is —</option><option value="same">Same as the first one (k1 ${((clips[0].lens_effective || {}).k1 || 0).toFixed(3)}, k2 ${((clips[0].lens_effective || {}).k2 || 0).toFixed(3)})</option><option value="camera">Each camera's own setting</option><option value="off">No correction</option></select>`) : '') +
     (segs.length ? field('Transition in (every segment)', `<select id="mTrans"><option value="">— leave as is —</option><option value="cut">cut</option><option value="fade">fade</option><option value="dip">dip</option><option value="default">default (${P.style.transition})</option></select>`) : '') +
     `<div class="sep"></div><div class="actions"><button class="link" id="mUp" title="[">← Move</button><button class="link" id="mDown" title="]">Move →</button></div>`;
   $('#inspClose').onclick = () => select(null);
@@ -1345,6 +1375,11 @@ function renderMultiInspector(el, close) {
     patchSegs(cids, { polish: val, force: true });
   };
   if ($('#mTrans')) $('#mTrans').onchange = e => { const val = e.target.value; if (val) patchSegs(ids, { transition: val === 'default' ? '' : val }); };
+  if ($('#mLens')) $('#mLens').onchange = e => {
+    const val = e.target.value; if (!val) return;
+    const k = clips[0].lens_effective || { k1: 0, k2: 0 };
+    patchSegs(cids, { lens: val === 'same' ? { k1: k.k1 || 0, k2: k.k2 || 0 } : val === 'off' ? 'off' : null });
+  };
   $('#mUp').onclick = () => moveSelection(-1); $('#mDown').onclick = () => moveSelection(1);
 }
 function renderStingInspector(el, m, close) {
@@ -2326,7 +2361,7 @@ async function openRecorder(mode = 'clip') {
       </div>
     </div>
     <div class="recgrid">
-      ${field('Camera', '<select id="recCam"></select>')}${field('Microphone', '<select id="recMic"></select>')}
+      ${field('Camera', '<select id="recCam"></select><div class="muted lens-cam" id="recLens"></div>')}${field('Microphone', '<select id="recMic"></select>')}
       ${field('Quality', '<select id="recQ"><option value="1080">1080p</option><option value="720">720p</option><option value="2160">4K (if supported)</option></select>')}
       ${field('Options', `<div class="inline"><label class="check" style="margin:0"><input type="checkbox" id="recMirror" checked> mirror</label><label class="check" style="margin:0"><input type="checkbox" id="recCover" ${portrait ? 'checked' : ''}> crop to fill</label></div>`)}
     </div>
