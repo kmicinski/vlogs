@@ -358,27 +358,31 @@ def _delay(seconds: float) -> str:
     return f"adelay={int(round(seconds * 1000))}:all=1,asetpts=N/SR/TB"
 
 
-def _lead_in(src_in: float, info) -> tuple[float, float]:
+def _lead_in(src_in: float, info, rate: float) -> tuple[float, float]:
     """Where to start reading a clip for a piece that begins at `src_in`, and how much lead-in that is: SEEK_BACK
-    before the in point, and never past the last frame (the sound of a take can outlast its picture), so that the
-    frame to show *at* the in point is always decoded even when the file has no frame right there."""
-    at = src_in - SEEK_BACK
-    if info is not None and getattr(info, "video_end", 0) and at > info.video_end - 1.0:
-        at = info.video_end - 1.0
-    at = max(0.0, at)
-    return at, src_in - at
+    before the in point (a whole number of frames of the `rate` grid, so the grid anchored at the in point lands on
+    whole ticks), and never past the last frame (the sound of a take can outlast its picture), so that the frame to
+    show *at* the in point is always decoded even when the file has no frame right there."""
+    back = SEEK_BACK
+    if info is not None and getattr(info, "video_end", 0) and src_in - back > info.video_end - 1.0:
+        back = src_in - (info.video_end - 1.0)
+    back = math.ceil(back * rate - 1e-6) / rate
+    if back > src_in:
+        back = src_in
+    return src_in - back, back
 
 
 def _grid_chain(fps: float, speed: float, back: float, src_len: float) -> list[str]:
-    """The head of a clip's video chain: the frame grid first (a faster clip is decimated *before* the costly
-    conversions, a slower one gets the frames its slow motion needs, and a gap between a take's frames is filled by
-    cloning), the last frame cloned on for as long as the piece needs if the footage stops short, then the lead-in
-    cut off again. fps leaves a coarse 1/rate timebase behind: settb restores a fine one before the speed change
-    divides the stamps."""
+    """The head of a clip's video chain: the frame grid first (anchored at the seek point; a gap between a take's
+    frames is filled by cloning, a faster clip is decimated *before* the costly conversions, a slower one gets the
+    frames its slow motion needs), the last frame cloned on for as long as the piece needs if the footage stops short
+    (even when it stopped before the in point), then the lead-in cut off on the grid: `back` is a whole number of
+    grid steps (_lead_in), so the in point is a tick and a shard's piece and the whole piece share the same frames.
+    fps leaves a coarse 1/rate timebase behind: settb restores a fine one before the speed change divides the stamps."""
     rate = fps / speed
     pad = int(math.ceil((back + src_len + 1.0) * rate)) + 2
     chain = [f"fps={rate:.6g}", f"tpad=stop={pad}:stop_mode=clone"]
-    chain.append(f"trim=start={back:.3f}:end={back + src_len:.3f}" if back > 0 else f"trim=end={src_len:.3f}")
+    chain.append(f"trim=start={back:.4f}:end={back + src_len:.3f}" if back > 0 else f"trim=end={src_len:.3f}")
     return chain + ["settb=AVTB", "setpts=PTS-STARTPTS"]
 
 
@@ -487,7 +491,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
             src = p.resolve(s.src)
             # read from SEEK_BACK before the in point so the frame shown *at* the in point is there even when the file
             # has no frame between (fps clones it across the gap); trim takes the lead-in off again on the frame grid
-            seek_at, back = _lead_in(pl.src_in, info) if want_v else (pl.src_in, 0.0)
+            seek_at, back = _lead_in(pl.src_in, info, FPS / s.speed) if want_v else (pl.src_in, 0.0)
             seek = ["-ss", f"{seek_at:.3f}"] if seek_at > 0 else []
             src_len = (pl.src_out - pl.src_in) + 0.25 * s.speed
             k = add_input(only + _hwdec(info, hdr_mode, want_v) + seek + ["-t", f"{src_len + back:.3f}", "-i", str(src)])
@@ -533,7 +537,7 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                 px, py, pw, ph = pip_rect(pip, pinfo, W, H)
                 rate = s.speed * (pip.speed or 1.0)        # the inset runs at its own speed on top of the clip's
                 pin = pip.time(pl.src_in)
-                pseek, pback = _lead_in(max(0.0, pin), pinfo) if want_v else (max(0.0, pin), 0.0)     # lead-in, as for the clip above
+                pseek, pback = _lead_in(max(0.0, pin), pinfo, FPS / rate) if want_v else (max(0.0, pin), 0.0)     # lead-in, as for the clip above
                 seek = ["-ss", f"{pseek:.3f}"] if pseek > 0 else []
                 psrc_len = (pl.src_out - pl.src_in) * (pip.speed or 1.0) + max(0.0, -pin) + 0.5
                 kp = add_input(only + _hwdec(pinfo, hdr_mode, want_v) + seek + ["-t", f"{psrc_len + pback:.3f}", "-i", str(ppath)])
