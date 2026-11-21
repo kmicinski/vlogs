@@ -119,6 +119,11 @@ for that spot (they're placed one after another from the marker), or jump betwee
 - **Voiceover**: the preview plays from the playhead while you talk. The narration becomes a
   layer on the *Narration* lane under the timeline, starting at that time; clip audio is
   ducked under your voice. Wear headphones. Narration layers are `voiceovers:` in the YAML.
+  A layer is handled like a clip's sound: a mic that only reached one channel is heard in both
+  ears (the inspector's *Channels* select overrides it), and **✂ Split at playhead** (in the
+  inspector, or the toolbar's ✂ with the layer selected) cuts it into two pieces that play on
+  from each other, so a piece can be dragged elsewhere, trimmed (*In → out*) or deleted. Any
+  layer may carry `in:`/`out:` (seconds in its file) and `channel:` in the YAML.
 
 Audio mixing: every clip and voiceover is measured (LUFS) on import and auto-gained toward
 a common level (*Match clip & voice levels*), music ducks under speech, and the final mix
@@ -277,7 +282,9 @@ vlog pip PROJ s3 [cam.mp4] [--layout corner|corner-large|stacked|hidden] [--pos 
                                            a clip in a box over s3 (picture in picture); --swap makes the inset the big one
 vlog frame PROJ clip.mp4 --at 0:32 --layout full [--in 0:05 --out 0:20] [--speed 4] [--sound 0.3]   B-roll: the video over the clip at 0:32 for its in→out part; the clip's sound carries on (--sound mixes its own in)
 vlog frame PROJ clip.mp4 --at 0:32 [--pos tl]      the same in a small frame (picture in picture)
-vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --at v1 to remove)
+vlog voiceover PROJ narration.m4a --at 0:12   (vlog voiceover PROJ rm --id v1 to remove)
+vlog voiceover PROJ split --id v1 --at 0:45    # two pieces that play on from each other; then vlog set PROJ v2 at=1:10
+vlog set PROJ v2 channel=right in=0:04 out=0:12   # a layer takes channel/in/out/at/volume/polish like a clip
 vlog sting PROJ song.mp3 --from s1 --to s3 [--start 0:06.5] [--volume 0.7] [--loop] [--credit "Music: …" --credit-pos tr]
 vlog sting PROJ song.mp3 --range 0:32 1:10 | --whole   music over that stretch (clips split at both ends) / the whole vlog
 vlog sting PROJ song.mp3 --continue --from s5   pick the song up where its last cue stopped  (`intro` = the configured song)

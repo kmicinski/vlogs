@@ -236,6 +236,20 @@ layers through `sound_chain` (`-ss in -t len` input). `edits.follow_content` kee
 edits. CLI `vlog group|ungroup PROJ s3 s4`, `vlog unlink PROJ s3`, `vlog link PROJ v2`; `vlog show` prints
 `group=g1` and `SOUND … (unlinked from s3)`. When Kris says "move these three together" → group them; "I want the
 sound of this clip under the next one" → unlink, drag the A2 block (or `PATCH at`).
+Every audio layer (narration too, since 2026-11-20) plays the part of its file `in`→`out` (None = the end) at `speed`
+(clip kind only) through its `channel` setting: `render.py` has one path for both kinds (`sound_chain(... v.channel,
+v.polish, v.mic)`), the layer JSON carries `in/out/duration/channel/one_sided/channel_effective/lufs/pregain` for both,
+`PATCH voiceovers/{vid}` takes `in`/`out`/`channel` for both (a channel change re-measures the loudness), and
+`media.ingest_recording` no longer downmixes narration to mono (`-ac 1` gone) so a receiver on one side is detected
+(`one_sided`) and sent to both ears like a clip's. `edits.split_voiceover(p, v, t, file_duration)` splits a layer at
+timeline time `t` into two pieces of the same file (`src_out` = cut / `src_in` = cut, same settings; `relink_audio`
+drops every piece of a clip's sound); `POST voiceovers/{vid}/split {at}` → `new_id`; GUI: inspector "✂ Split at
+playhead" (`splitVo`), the toolbar ✂ splits the selected layer when the playhead is inside it (`voUnderPlayhead`,
+`updateCtx`) and the clip otherwise, the inspector shows *In → out*, *Channels* and *Voice* for narration too, the
+player routes narration through `VP.route` from `in`; CLI `vlog voiceover PROJ split --id v2 --at 0:45`, `vlog set
+PROJ v2 channel=right|in=|out=|at=` (`_seg` resolves layer ids). Scratchpad tests: `test_vo.py`, `cdp_vo.py`. When
+Kris says "my voiceover is only in one ear" → it should already be auto; else `vlog set PROJ v1 channel=right`; "cut
+the narration here and move the rest later" → split at the playhead, drag the second piece (or `set v2 at=`).
 
 Parallel export (`render.render(p, mode, workers=)`, config `render_workers` 0 = one per core, `--workers` on
 preview/render, settings `render_workers`): `render_parallel` cuts the timeline into shards at safe points

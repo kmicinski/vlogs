@@ -454,7 +454,9 @@ def ingest_recording(p: Project, blob: Path, kind: str, stamp: str, container: s
     if kind == "voiceover":
         dst = p.audio_dir / f"VO_{stamp}.m4a"
         cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *_TOLERANT, *fmt, "-i", str(blob), "-vn",
-               "-af", "aresample=48000,highpass=f=70", "-c:a", "aac", "-b:a", "160k", "-ac", "1", "-movflags", "+faststart", str(dst)]
+               "-af", "aresample=48000,highpass=f=70", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(dst)]
+        # the channels stay as recorded (no mono downmix): a receiver that feeds one side only is detected
+        # like a clip's (audio_analysis one_sided) and that side goes to both ears
         r = subprocess.run(cmd, capture_output=True, text=True)
         if r.returncode != 0:
             raise RuntimeError(r.stderr[-500:])

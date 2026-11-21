@@ -396,26 +396,25 @@ def create_app(cfg: Config) -> FastAPI:
                 vinfo = None
             fdur = vinfo.duration if vinfo else 0
             vd["file_duration"] = fdur
+            # which part of the file plays (a split layer is two parts), its speed, where it plays from, and how it
+            # is heard (channel like a clip's: a one-sided take's live side to both ears)
+            a0 = max(0.0, min(v.src_in, fdur))
+            b0 = fdur if v.src_out is None else max(a0, min(v.src_out, fdur))
+            vd.update({"in": a0, "out": b0, "speed": v.speed, "channel": v.channel, "mic": v.mic, "file": v.file,
+                       "duration": (b0 - a0) / max(0.05, v.speed)})
             if v.kind == "clip":
-                # the sound of a clip, unlinked from its picture: which part of the file, its speed, where it plays from
-                a0 = max(0.0, min(v.src_in, fdur))
-                b0 = fdur if v.src_out is None else max(a0, min(v.src_out, fdur))
-                vd.update({"in": a0, "out": b0, "speed": v.speed, "channel": v.channel, "mic": v.mic, "from": v.from_seg,
-                           "duration": (b0 - a0) / max(0.05, v.speed), "file": v.file,
-                           "from_present": any(s.id == v.from_seg for s in p.timeline)})
+                vd.update({"from": v.from_seg, "from_present": any(s.id == v.from_seg for s in p.timeline)})
                 st = media.media_status(p, v.file)
                 vd["url"] = media_url(p, f"cache/{Path(v.file).name}.proxy.mp4") if st["proxy"] else (media_url(p, v.file) if media.browser_playable(vinfo) else None)
-                vd["channel_effective"] = media.effective_channel(f, p.cache_dir, v.channel, compute=False) if vinfo else "stereo"
-                vd["lufs"] = media.cached_loudness(f, p.cache_dir, v.channel) if vinfo else None
-                vd["pregain"] = 0.0
-                if vd["polished"] and vinfo:
-                    vs = media.voice_state(f, p.cache_dir, v.channel, p.audio.denoise)
-                    vd["pregain"] = vs["pregain"]
-                    if vs["lufs"] is not None:
-                        vd["lufs"] = vs["lufs"]
-            else:
-                vd["duration"] = fdur
-                vd["lufs"] = _cached_lufs(p, v.file)
+            vd["one_sided"] = media.one_sided(f, p.cache_dir) if vinfo else None
+            vd["channel_effective"] = media.effective_channel(f, p.cache_dir, v.channel, compute=False) if vinfo else "stereo"
+            vd["lufs"] = media.cached_loudness(f, p.cache_dir, v.channel) if vinfo else None
+            vd["pregain"] = 0.0
+            if vd["polished"] and vinfo:
+                vs = media.voice_state(f, p.cache_dir, v.channel, p.audio.denoise)
+                vd["pregain"] = vs["pregain"]
+                if vs["lufs"] is not None:
+                    vd["lufs"] = vs["lufs"]
             vos.append(vd)
         stings = []
         for m in p.stings:
@@ -679,7 +678,7 @@ def create_app(cfg: Config) -> FastAPI:
                     measure_voice_async(p, seg.src, seg.channel)
             for v in p.voiceovers:
                 if render.polish_on(p, v.polish) and p.resolve(v.file).exists():
-                    measure_voice_async(p, v.file, "stereo")
+                    measure_voice_async(p, v.file, v.channel)
         commit(p)
         return project_json(p)
 
@@ -1101,7 +1100,7 @@ def create_app(cfg: Config) -> FastAPI:
         marks = sorted(max(0.0, float(t)) for t in m.get("markers") or [])
         if m["kind"] == "voiceover":
             at0 = max(0.0, float(m.get("at") or 0))
-            new_id = p.add_voiceover(rel, at0).id
+            new_id = p.add_voiceover(rel, at0, mic=str(m.get("mic") or "")).id
             if marks:   # markers dropped while narrating go on the clips that were playing at the time
                 try:
                     layout = render.compute_layout(p)
@@ -1299,16 +1298,19 @@ def create_app(cfg: Config) -> FastAPI:
         if "polish" in body:
             v.polish = polish_value(body["polish"])
             if render.polish_on(p, v.polish, v.mic) and p.resolve(v.file).exists():
-                measure_voice_async(p, v.file, v.channel if v.kind == "clip" else "stereo")
-        if v.kind == "clip":
-            if "in" in body:
-                v.src_in = max(0.0, parse_time(body["in"]))
-            if "out" in body:
-                v.src_out = None if body["out"] in (None, "", "end") else max(v.src_in, parse_time(body["out"]))
-            if "speed" in body:
-                v.speed = max(0.05, float(body["speed"]))
-            if "channel" in body:
-                v.channel = body["channel"] if body["channel"] in CHANNELS else "auto"
+                measure_voice_async(p, v.file, v.channel)
+        if "in" in body:
+            v.src_in = max(0.0, parse_time(body["in"]))
+        if "out" in body:
+            v.src_out = None if body["out"] in (None, "", "end") else max(v.src_in, parse_time(body["out"]))
+        if "channel" in body:
+            v.channel = body["channel"] if body["channel"] in CHANNELS else "auto"
+            if p.resolve(v.file).exists():      # the level is measured on what will be heard
+                media.measure_loudness(p.resolve(v.file), p.cache_dir, v.channel)
+                if render.polish_on(p, v.polish, v.mic):
+                    measure_voice_async(p, v.file, v.channel)
+        if v.kind == "clip" and "speed" in body:
+            v.speed = max(0.05, float(body["speed"]))
         if "note" in body:
             v.note = str(body["note"])
         p.voiceovers.sort(key=lambda x: x.at)
@@ -1320,10 +1322,23 @@ def create_app(cfg: Config) -> FastAPI:
         p = load(name)
         v = p.voiceover(vid)
         p.voiceovers = [x for x in p.voiceovers if x.id != vid]
-        if remove_file:
+        if remove_file and not any(x.file == v.file for x in p.voiceovers):     # another piece of a split layer may still need it
             p.resolve(v.file).unlink(missing_ok=True)
         commit(p)
         return project_json(p)
+
+    @app.post("/api/projects/{name}/voiceovers/{vid}/split")
+    def split_voiceover_api(name: str, vid: str, body: dict):
+        """Split an audio layer (narration or unlinked clip sound) at timeline time `at` into two pieces that
+        play on from each other; returns the project and the new second piece's id."""
+        p = load(name)
+        v = p.voiceover(vid)
+        try:
+            v2 = edits.split_voiceover(p, v, float(parse_time(body.get("at", 0))), file_duration(p, v.file))
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        commit(p)
+        return project_json(p) | {"new_id": v2.id}
 
     def music_rel(p: Project, file: str) -> str:
         """A song as a project-relative path: 'intro' is the configured intro song, a path inside the

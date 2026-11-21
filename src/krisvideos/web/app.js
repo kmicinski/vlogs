@@ -158,12 +158,12 @@ const AUD = (() => {
   function sync(t, play) {
     let voActive = false, anyVoDuck = false;
     for (const { v, el } of vos) {
-      const snd = (v.kind || 'voice') === 'clip', spd = snd ? (v.speed || 1) : 1;      // a clip's sound unlinked from its picture
+      const spd = v.speed || 1;      // narration or a clip's sound unlinked from its picture: the part of its file from `in`, at its speed
       const active = t >= v.at && t < v.at + (v.duration || 0) && spd <= 16;
       if (active) { voActive = true; if (v.duck_clips) anyVoDuck = true; }
-      const want = (snd ? v.in || 0 : 0) + (t - v.at) * spd;
+      const want = (v.in || 0) + (t - v.at) * spd;
       if (play && active) {
-        if (snd) { VP.route(el, v.channel_effective, v.polished ? { pregain: v.pregain } : null); try { el.playbackRate = clamp(spd, 0.0625, 16); } catch { } }
+        VP.route(el, v.channel_effective, v.polished ? { pregain: v.pregain } : null); try { el.playbackRate = clamp(spd, 0.0625, 16); } catch { }
         el.volume = clamp(v.volume * gainFactor(v), 0, 1);
         if (el.paused || Math.abs(el.currentTime - want) > 0.35 * Math.max(1, spd)) { try { el.currentTime = Math.max(0, want); } catch { } el.play().catch(() => { }); }
       }
@@ -699,9 +699,9 @@ function renderLanes() {
     for (const v of items) {
       const d = document.createElement('div'); d.className = cls + (SELS.has(v.id) ? ' selected' : '') + (v.missing ? ' missing' : ''); d.dataset.id = v.id;
       const w = place(d, v.at, v.at + (v.duration || 1)); d.style.top = `${1 + rowOf.get(v.id) * 17}px`;
-      const q = kind === 'clip' ? `src=${encodeURIComponent(v.file)}&start=${v.in || 0}&end=${v.out}` : `src=${encodeURIComponent(v.file)}`;
+      const q = `src=${encodeURIComponent(v.file)}&start=${v.in || 0}&end=${v.out}`;
       d.innerHTML = `${v.url ? `<img src="/api/projects/${P.name}/wave?${q}&w=${Math.ceil(w / 50) * 50}&h=16&color=ffffff">` : ''}<span>${kind === 'clip' ? `⛓ ${esc(v.file.replace(/^clips\//, ''))}${(v.speed || 1) !== 1 ? ' ' + fmtSpeed(v.speed) : ''} · ` : ''}${fmt(v.duration || 0)}</span>`;
-      d.title = kind === 'clip' ? `The sound of ${v.from || 'a clip'}${v.from_present ? '' : ' (that clip is gone)'} · drag to move it · ⌘L links it back` : `Narration · ${fmt(v.duration || 0)} · drag to move it`;
+      d.title = kind === 'clip' ? `The sound of ${v.from || 'a clip'}${v.from_present ? '' : ' (that clip is gone)'} · drag to move it · ⌘L links it back · select it and ✂ splits it at the playhead` : `Narration · ${fmt(v.duration || 0)} · drag to move it · select it and ✂ splits it at the playhead`;
       voDrag(d, v);
       l.appendChild(d);
     }
@@ -753,9 +753,19 @@ function updatePlayhead() {
   if (MK.in != null && MK.out == null) renderMarks();   // an open range follows the playhead
   updateCtx();
 }
+// the selected audio layer when the playhead is inside it: ✂ then splits the layer rather than the clip
+function voUnderPlayhead() {
+  const v = (P.voiceovers || []).find(x => x.id === selVo);
+  return v && T > v.at + 0.1 && T < v.at + (v.duration || 0) - 0.1 ? v : null;
+}
+async function splitVo(v) {
+  if (!voUnderPlayhead() || voUnderPlayhead().id !== v.id) return toast('Put the playhead inside the sound to split it');
+  await guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/voiceovers/${v.id}/split`, { at: T })); renderTimeline(); renderInspector(); toast('Split: two pieces that play on from each other'); });
+}
 function updateCtx() {
   const L = locate(T); const overClip = L && L.seg.kind === 'clip' && L.off > 0.15 && L.seg.placed.duration - L.off > 0.15;
-  $('[data-act=split]').disabled = !overClip;
+  $('[data-act=split]').disabled = !overClip && !voUnderPlayhead();
+  $('[data-act=split]').title = voUnderPlayhead() ? 'Split the selected sound at the playhead' : 'Split the clip at the playhead';
   for (const a of ['title', 'markIn', 'markOut']) $(`[data-act=${a}]`).disabled = !P.timeline.length;
 }
 
@@ -915,7 +925,7 @@ function paintSelection() {
   $$('#track .block, #atrack .ablk, #lanes .vo, #lanes .snd').forEach(b => b.classList.toggle('selected', SELS.has(b.dataset.id)));
   $$('#lanes .st, #lanes .mu, #imgLane .imgblk').forEach(x => x.classList.remove('selected'));
 }
-function selectionChanged() { if (sel && !SELS.has(sel)) sel = (selSegs()[0] || {}).id || null; if (selVo && !SELS.has(selVo)) selVo = (selVos()[0] || {}).id || null; if (P) setTimeout(() => VP.sync(T), 0); paintSelection(); renderInspector(); }
+function selectionChanged() { if (sel && !SELS.has(sel)) sel = (selSegs()[0] || {}).id || null; if (selVo && !SELS.has(selVo)) selVo = (selVos()[0] || {}).id || null; if (P) setTimeout(() => VP.sync(T), 0); paintSelection(); renderInspector(); updateCtx(); }
 function select(id, { toggle = false, range = false } = {}) {
   selSting = selImg = null; selMusic = false;
   if (id == null) { SELS.clear(); sel = selVo = selAnchor = null; }
@@ -1099,7 +1109,7 @@ async function undo() { if (!P.can_undo) return; await guard(async () => { setPr
 async function redo() { if (!P.can_redo) return; await guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/redo`)); toast('Redo'); }); }
 $('#undoBtn').onclick = undo; $('#redoBtn').onclick = redo;
 const ctxActions = {
-  split: () => { if ($('[data-act=split]').disabled) return toast('Put the playhead inside a clip to split it'); guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/split`, { time: T })); }); },
+  split: () => { const v = voUnderPlayhead(); if (v) return splitVo(v); if ($('[data-act=split]').disabled) return toast('Put the playhead inside a clip (or select a sound it is inside) to split it'); guard(async () => { setProject(await api('POST', `/api/projects/${P.name}/split`, { time: T })); }); },
   markIn: () => setMark('in', T),
   markOut: () => setMark('out', T),
   keepRange: () => keepRange(),
@@ -1328,11 +1338,12 @@ function renderVoInspector(el, v, close) {
   const snd = (v.kind || 'voice') === 'clip';     // a clip's sound unlinked from its picture
   el.innerHTML = `<h3>${snd ? `Sound of ${esc(v.from || 'a clip')} <span class="sub" title="${esc(v.file)}">${esc(v.file.replace(/^clips\//, ''))}</span>` : 'Narration'} ${close}</h3><div class="muted" style="margin:-6px 0 12px">${fmt(v.duration || 0)}${v.lufs != null ? ` · ${v.lufs.toFixed(0)} LUFS` : ''}${snd ? ` · unlinked from its picture: it plays wherever you put it${v.from_present ? '' : ' (that clip is gone)'}` : ''}</div>` +
     field('Starts at', `<div class="inline"><input type="text" id="voAt" value="${fmt(v.at, 2)}"><button class="link" id="voAtPh" title="move to playhead">← playhead</button></div>`) +
-    (snd ? field('In → out (source time)', `<div class="inline"><input type="text" id="voIn" value="${fmt(v.in || 0, 2)}"><span class="muted">→</span><input type="text" id="voOut" value="${fmt(v.out || 0, 2)}"></div>`) + field('Speed', speedControl('voSpeed', v.speed || 1)) : '') +
+    field('In → out (in the recording)', `<div class="inline"><input type="text" id="voIn" value="${fmt(v.in || 0, 2)}"><span class="muted">→</span><input type="text" id="voOut" value="${fmt(v.out || 0, 2)}"></div>`) + (snd ? field('Speed', speedControl('voSpeed', v.speed || 1)) : '') +
     field('Volume', `<input type="range" id="voVol" min="0" max="2" step="0.1" value="${v.volume}">`) +
-    (snd ? field('Channels', `<select id="voChannel">${channelOptions(v)}</select>`) : `<div class="check"><input type="checkbox" id="voDuck" ${v.duck_clips ? 'checked' : ''}><label for="voDuck">Lower clip audio while this plays</label></div>`) +
+    field('Channels', `<select id="voChannel">${channelOptions(v)}</select>`) +
+    (snd ? '' : `<div class="check"><input type="checkbox" id="voDuck" ${v.duck_clips ? 'checked' : ''}><label for="voDuck">Lower clip audio while this plays</label></div>`) +
     field('Voice', `<select id="voPolish">${polishOptions(v.polish, v.mic, false)}</select>`) +
-    `<div class="sep"></div><div class="actions">${snd && v.from_present ? `<button class="link" id="voLink" title="⌘L">⛓ Link back to its clip</button>` : ''}<span class="spacer"></span><button class="link danger" id="voDel">Delete</button></div>`;
+    `<div class="sep"></div><div class="actions"><button class="link" id="voSplit" title="Split this sound at the playhead into two pieces that play on from each other, so each can be moved, trimmed or deleted on its own">✂ Split at playhead</button>${snd && v.from_present ? `<button class="link" id="voLink" title="⌘L">⛓ Link back to its clip</button>` : ''}<span class="spacer"></span><button class="link danger" id="voDel">Delete</button></div>`;
   $('#inspClose').onclick = () => select(null);
   const patch = body => patchVo(v.id, body);
   const enter = id => { const x = $(id); if (x) x.onkeydown = e => { if (e.key === 'Enter') e.target.blur(); }; };
@@ -1345,6 +1356,7 @@ function renderVoInspector(el, v, close) {
   if ($('#voChannel')) $('#voChannel').onchange = e => patch({ channel: e.target.value });
   $('#voPolish').onchange = e => patch({ polish: e.target.value });
   if ($('#voLink')) $('#voLink').onclick = () => linkVo(v.id);
+  $('#voSplit').onclick = () => splitVo(v);
   $('#voDel').onclick = () => guard(async () => { setProject(await api('DELETE', `/api/projects/${P.name}/voiceovers/${v.id}`)); SELS.delete(v.id); selVo = null; renderInspector(); });
 }
 // several things selected: what they can do together

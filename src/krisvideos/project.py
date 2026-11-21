@@ -75,9 +75,10 @@ class Overlay:
 
 @dataclass
 class Voiceover:
-    """An audio layer laid over the output timeline: narration (`kind: voice`, the whole file), or a clip's
-    own sound unlinked from its picture (`kind: clip`: the file is the clip, `in`/`out`/`speed`/`channel`
-    say which part and how, `from` is the clip segment it came from, so it can be linked back)."""
+    """An audio layer laid over the output timeline: narration (`kind: voice`), or a clip's own sound
+    unlinked from its picture (`kind: clip`: the file is the clip, `from` is the clip segment it came from, so
+    it can be linked back). Either kind plays the part of its file from `in` to `out` (default: all of it) —
+    splitting a layer makes two with the same file — at `speed` (clip kind only), hearing `channel`."""
     file: str                       # project-relative (audio/VO_....m4a, or clips/... for unlinked sound)
     at: float = 0.0                 # output-timeline seconds
     volume: float = 1.0
@@ -108,18 +109,18 @@ class Voiceover:
         d: dict[str, Any] = {"file": self.file, "at": round(self.at, 3)}
         if self.kind == "clip":
             d["kind"] = "clip"
-            if self.src_in:
-                d["in"] = round(self.src_in, 3)
-            if self.src_out is not None:
-                d["out"] = round(self.src_out, 3)
             if self.speed != 1.0:
                 d["speed"] = self.speed
-            if self.channel != "auto":
-                d["channel"] = self.channel
-            if self.mic:
-                d["mic"] = self.mic
             if self.from_seg:
                 d["from"] = self.from_seg
+        if self.src_in:
+            d["in"] = round(self.src_in, 3)
+        if self.src_out is not None:
+            d["out"] = round(self.src_out, 3)
+        if self.channel != "auto":
+            d["channel"] = self.channel
+        if self.mic:
+            d["mic"] = self.mic
         if self.volume != 1.0:
             d["volume"] = self.volume
         if self.duck_clips != (self.kind == "voice"):

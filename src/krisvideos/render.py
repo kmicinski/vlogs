@@ -330,7 +330,7 @@ def voice_jobs(p: Project, infos=None) -> list[tuple[Path, Path, str, float]]:
     out, seen = [], set()
     items = [(s.src, s.channel, s.polish, s.mic) for s in p.timeline
              if s.kind == "clip" and not s.mute and s.volume > 0 and s.speed <= MUTE_ABOVE]
-    items += [(v.file, v.channel if v.kind == "clip" else "stereo", v.polish, v.mic) for v in p.voiceovers if v.volume > 0]
+    items += [(v.file, v.channel, v.polish, v.mic) for v in p.voiceovers if v.volume > 0]
     for rel, channel, setting, mic in items:
         if not polish_on(p, setting, mic):
             continue
@@ -755,17 +755,15 @@ def build_plan(p: Project, mode: str = "final", hdr_mode: str = "vt", infos=None
                     continue
                 if not vinfo.has_audio or v.volume <= 0:
                     continue
-                if v.kind == "clip":        # a clip's sound unlinked from its picture: that part of the file, at its speed
-                    a0 = max(0.0, min(v.src_in, vinfo.duration))
-                    b0 = vinfo.duration if v.src_out is None else max(a0, min(v.src_out, vinfo.duration))
-                    if b0 - a0 < 0.05 or v.speed > MUTE_ABOVE:
-                        continue
-                    kv = add_input(["-vn"] + (["-ss", f"{a0:.3f}"] if a0 > 0 else []) + ["-t", f"{b0 - a0:.3f}", "-i", str(vf)])
-                    a_src, chain = sound_chain(p, vf, a0, b0, v.speed, v.volume, v.channel, v.polish, v.mic, add_input, f"{kv}:a")
-                    chain.append(f"atrim=duration={(b0 - a0) / v.speed:.3f}")      # ends at its out point (the inputs read a little spare)
-                else:
-                    kv = add_input(["-vn", "-i", str(vf)])
-                    a_src, chain = sound_chain(p, vf, 0.0, vinfo.duration, 1.0, v.volume, "stereo", v.polish, "", add_input, f"{kv}:a")
+                # narration or a clip's sound unlinked from its picture: the part of the file from in to out (a
+                # split layer is two such parts), at its speed, heard through its channel setting like a clip
+                a0 = max(0.0, min(v.src_in, vinfo.duration))
+                b0 = vinfo.duration if v.src_out is None else max(a0, min(v.src_out, vinfo.duration))
+                if b0 - a0 < 0.05 or v.speed > MUTE_ABOVE:
+                    continue
+                kv = add_input(["-vn"] + (["-ss", f"{a0:.3f}"] if a0 > 0 else []) + ["-t", f"{b0 - a0:.3f}", "-i", str(vf)])
+                a_src, chain = sound_chain(p, vf, a0, b0, v.speed, v.volume, v.channel, v.polish, v.mic, add_input, f"{kv}:a")
+                chain.append(f"atrim=duration={(b0 - a0) / v.speed:.3f}")      # ends at its out point (the inputs read a little spare)
                 chain += [_delay(v.at), f"atrim=duration={total:.3f}", f"apad=whole_dur={total:.3f}"]
                 filters.append(f"[{a_src}]{','.join(chain)}[vo{n}]")
                 labels.append(f"vo{n}")

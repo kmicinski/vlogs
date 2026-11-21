@@ -540,6 +540,31 @@ def detach_audio(p: Project, seg_id: str, layout: render.Layout | None = None) -
     return v
 
 
+def split_voiceover(p: Project, v: Voiceover, t: float, file_duration: float | None = None) -> Voiceover:
+    """Split an audio layer (narration, or a clip's unlinked sound) at output time `t` into two that play
+    on seamlessly: the first ends at that moment of the file and the second starts there, with the same
+    settings. Either can then be moved, trimmed or deleted on its own. Returns the new second piece."""
+    end = v.src_out if v.src_out is not None else file_duration
+    if end is None:
+        raise ValueError(f"cannot read {v.file}")
+    length = (end - v.src_in) / v.speed
+    off = t - v.at
+    if not (0.1 < off < length - 0.1):
+        raise ValueError("the playhead is not inside that sound")
+    cut = round(v.src_in + off * v.speed, 3)
+    ids = {x.id for x in p.voiceovers}
+    n = len(p.voiceovers) + 1
+    while f"v{n}" in ids:
+        n += 1
+    v2 = Voiceover(file=v.file, at=round(t, 3), volume=v.volume, duck_clips=v.duck_clips, polish=v.polish, kind=v.kind,
+                   src_in=cut, src_out=v.src_out, speed=v.speed, channel=v.channel, mic=v.mic, from_seg=v.from_seg,
+                   id=f"v{n}", note=v.note)
+    v.src_out = cut
+    p.voiceovers.append(v2)
+    p.voiceovers.sort(key=lambda x: x.at)
+    return v2
+
+
 def relink_audio(p: Project, vid: str) -> Segment | None:
     """Link an unlinked clip sound back to its picture: the clip plays its own sound again (with the
     layer's volume and polish) and the layer goes. Returns the clip, or None when it is gone (then the
@@ -553,7 +578,8 @@ def relink_audio(p: Project, vid: str) -> Segment | None:
     s.mute = False
     s.volume = v.volume
     s.polish = v.polish
-    p.voiceovers = [x for x in p.voiceovers if x.id != vid]
+    # every piece of that clip's sound goes (it may have been split): the clip plays the whole of it again
+    p.voiceovers = [x for x in p.voiceovers if not (x.kind == "clip" and x.from_seg == v.from_seg)]
     return s
 
 
